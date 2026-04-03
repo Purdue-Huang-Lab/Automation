@@ -58,7 +58,7 @@ from measurements.pl_trpl_power_voltage_config import (
     RAMP_DWELL_S,
     RAMP_STEP_V,
     READOUT_UNKNOWN,
-    ROOT_DIR,
+    DATA_DIR,
     SWEEP_SETTLE_MS,
     ZERO_V_DUMMY_FRAMES,
     ZERO_V_EPS,
@@ -1628,7 +1628,7 @@ class PLTRPLPowerVoltageWidget(QtWidgets.QWidget):
         if not name:
             name = self._default_save_name()
             self.saveNameEdit.setText(name)
-        base = os.path.join(ROOT_DIR, "measurements", name)
+        base = os.path.join(DATA_DIR, "measurements", name)
         os.makedirs(base, exist_ok=True)
         self._save_dir = base
         return base
@@ -2429,7 +2429,7 @@ class PLTRPLPowerVoltageWidget(QtWidgets.QWidget):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select calibration file",
-            os.path.join(ROOT_DIR, "measurements"),
+            os.path.join(DATA_DIR, "measurements"),
             "CSV Files (*.csv);;All Files (*)",
         )
         if path:

@@ -24,7 +24,7 @@ from measurements.config import (
     DEFAULT_STAGE_SCALE,
     DEFAULT_STAGE_SERIAL,
     POLL_MS,
-    ROOT_DIR,
+    DATA_DIR,
 )
 
 try:
@@ -99,7 +99,7 @@ __all__ = [
     "DEFAULT_STAGE_SCALE",
     "DEFAULT_STAGE_SERIAL",
     "POLL_MS",
-    "ROOT_DIR",
+    "DATA_DIR",
     "VISA_DLL",
     "DEFAULT_FRONT_RESOURCE",
     "DEFAULT_BACK_RESOURCE",
