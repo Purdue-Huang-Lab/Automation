@@ -10,8 +10,7 @@ try:
 except Exception:
     rot_cfg = None
 
-
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+from measurements.config import DATA_DIR
 
 DEFAULT_STAGE_A_SERIAL = ""
 DEFAULT_STAGE_B_SERIAL = ""

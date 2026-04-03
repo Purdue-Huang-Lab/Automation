@@ -13,6 +13,13 @@ except Exception:
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 
+# Directory where measurement data is saved. Override by setting the
+# AUTOMATION_DATA_DIR environment variable, e.g. in a .env file or shell profile.
+DATA_DIR = os.environ.get(
+    "AUTOMATION_DATA_DIR",
+    r"C:\Data\Minxue\260402gatedtrilayer",
+)
+
 DEFAULT_STAGE_SERIAL = "27600825"
 DEFAULT_STAGE_B_SERIAL = "27600915"
 DEFAULT_STAGE_SCALE = "PRM1-Z8"

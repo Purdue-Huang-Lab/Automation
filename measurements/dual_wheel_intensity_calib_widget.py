@@ -65,7 +65,7 @@ from measurements.dual_wheel_intensity_calib_config import (
     DEFAULT_TOTAL_POINTS_MAX,
     DEFAULT_TOTAL_POINTS_MIN,
     POLL_MS,
-    ROOT_DIR,
+    DATA_DIR,
 )
 from measurements.dual_wheel_intensity_workers import DualWheelFineSweepThread, DualWheelListThread
 from measurements.intensity_workers import IntensitySweepThread
@@ -1934,7 +1934,7 @@ class DualWheelIntensityCalibWidget(QtWidgets.QWidget):
         if not name:
             name = self._default_save_name()
             self.saveNameEdit.setText(name)
-        base = os.path.join(ROOT_DIR, "measurements", name)
+        base = os.path.join(DATA_DIR, "measurements", name)
         os.makedirs(base, exist_ok=True)
         self._save_dir = base
         return base
@@ -3398,7 +3398,7 @@ class DualWheelIntensityCalibWidget(QtWidgets.QWidget):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select calibration file",
-            os.path.join(ROOT_DIR, "measurements"),
+            os.path.join(DATA_DIR, "measurements"),
             "CSV Files (*.csv);;All Files (*)",
         )
         if path:
@@ -3569,7 +3569,7 @@ class DualWheelIntensityCalibWidget(QtWidgets.QWidget):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load session",
-            os.path.join(ROOT_DIR, "measurements"),
+            os.path.join(DATA_DIR, "measurements"),
             "JSON Files (*.json);;All Files (*)",
         )
         if not path:

@@ -35,7 +35,7 @@ from measurements.intensity_calib_config import (
     DEFAULT_STAGE_SCALE,
     DEFAULT_STAGE_SERIAL,
     POLL_MS,
-    ROOT_DIR,
+    DATA_DIR,
 )
 from measurements.intensity_workers import IntensitySweepThread
 from measurements.power_calibration import load_power_calibration
@@ -332,7 +332,7 @@ class IntensityCalibWidget(QtWidgets.QWidget):
         if not name:
             name = self._default_save_name()
             self.saveNameEdit.setText(name)
-        base = os.path.join(ROOT_DIR, "measurements", name)
+        base = os.path.join(DATA_DIR, "measurements", name)
         os.makedirs(base, exist_ok=True)
         self._save_dir = base
         return base
@@ -666,7 +666,7 @@ class IntensityCalibWidget(QtWidgets.QWidget):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select calibration file",
-            os.path.join(ROOT_DIR, "measurements"),
+            os.path.join(DATA_DIR, "measurements"),
             "CSV Files (*.csv);;All Files (*)",
         )
         if path:

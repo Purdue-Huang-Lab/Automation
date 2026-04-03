@@ -38,7 +38,7 @@ from measurements.config import (
     DEFAULT_STAGE_B_SERIAL,
     DEFAULT_STAGE_SERIAL,
     POLL_MS,
-    ROOT_DIR,
+    DATA_DIR,
 )
 from measurements.dual_wheel_power_calibration import (
     DualWheelPowerEntry,
@@ -488,7 +488,7 @@ class PLPowerWidget(QtWidgets.QWidget):
         if not name:
             name = self._default_save_name()
             self.saveNameEdit.setText(name)
-        base = os.path.join(ROOT_DIR, "measurements", name)
+        base = os.path.join(DATA_DIR, "measurements", name)
         os.makedirs(base, exist_ok=True)
         self._save_dir = base
         return base
@@ -851,7 +851,7 @@ class PLPowerWidget(QtWidgets.QWidget):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select calibration file",
-            os.path.join(ROOT_DIR, "measurements"),
+            os.path.join(DATA_DIR, "measurements"),
             "CSV Files (*.csv);;All Files (*)",
         )
         if path:
