@@ -19,9 +19,16 @@ Thumbs.db
 code by weijian/
 0402plgatetest/
 
-# Measurement data outputs
-spad23/*.csv
-spad23/*.sif
+# Measurement data outputs (anywhere in the project)
+*.sif
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.mat
+*.dat
+# CSV files are data by default — use 'git add -f file.csv' to force-add exceptions like IRF calibration files
+*.csv
 
 # Error/log files
 ___All_Errors.txt
