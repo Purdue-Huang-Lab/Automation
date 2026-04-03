@@ -1,0 +1,30 @@
+# Virtual environments
+.venv/
+__.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Excluded folders
+code by weijian/
+0402plgatetest/
+
+# Measurement data outputs
+spad23/*.csv
+spad23/*.sif
+
+# Error/log files
+___All_Errors.txt
+
+# Claude Code local settings
+.claude/
