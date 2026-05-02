@@ -291,6 +291,11 @@ class DevicePanel(QtWidgets.QGroupBox):
             self._poll_failures = 0
 
             try:
+                self.dev.set_compliance(float(self.icompSpin_nA.value()) * 1e-9)
+            except Exception:
+                pass
+
+            try:
                 self.dev.set_output(True)
                 self.outputChk.blockSignals(True)
                 self.outputChk.setChecked(True)

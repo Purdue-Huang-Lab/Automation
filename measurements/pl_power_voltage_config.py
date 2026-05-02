@@ -62,7 +62,7 @@ RAMP_DWELL_S = getattr(keithley_cfg, "RAMP_DWELL_S", 0.10)
 SWEEP_SETTLE_MS = 200
 ZERO_V_EPS = 1e-4
 ZERO_V_EXTRA_SETTLE_MS = 200
-ZERO_V_DUMMY_FRAMES = 2
+
 
 READOUT_UNKNOWN = getattr(keithley_cfg, "READOUT_UNKNOWN", "--")
 
@@ -108,6 +108,5 @@ __all__ = [
     "SWEEP_SETTLE_MS",
     "ZERO_V_EPS",
     "ZERO_V_EXTRA_SETTLE_MS",
-    "ZERO_V_DUMMY_FRAMES",
     "READOUT_UNKNOWN",
 ]

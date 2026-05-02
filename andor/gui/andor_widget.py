@@ -760,6 +760,12 @@ class AndorWidget(QtWidgets.QWidget):
             self.cam.stop_stream()
         except Exception:
             pass
+        # Clear any pending acquisition so the first frame after applying
+        # settings doesn't timeout (same issue as first frame after connect).
+        try:
+            self.cam._recover_after_timeout()
+        except Exception:
+            pass
         try:
             self._wait_idle(timeout_s=3.0)
         except Exception:
@@ -1018,8 +1024,8 @@ class AndorWidget(QtWidgets.QWidget):
         self._maybe_update_xaxis_label(w)
         self._update_image_wavelength_axis(w)
         raw = img
-        disp = np.flipud(raw)
-        disp8 = np.flipud(img8) if img8 is not None else None
+        disp = np.fliplr(np.flipud(raw))
+        disp8 = np.fliplr(np.flipud(img8)) if img8 is not None else None
         self._last_frame_raw = raw
         self._last_frame = disp
         self._last_frame8 = disp8
@@ -1100,11 +1106,12 @@ class AndorWidget(QtWidgets.QWidget):
         self._crosshair_v.set_visible(True)
 
         width = int(self.linecutWidthSpin.value())
+        x_raw = w - 1 - x  # display col x maps to physical col x_raw after fliplr
         hcut = self.cam.linecut_horizontal(self._last_frame_raw, y_raw, width=width, mode="sum")
-        vcut = self.cam.linecut_vertical(self._last_frame_raw, x, width=width, mode="sum")
+        vcut = self.cam.linecut_vertical(self._last_frame_raw, x_raw, width=width, mode="sum")
         if hcut is not None:
             x_axis = self._get_x_axis_data(w)
-            self.line_h.set_data(x_axis, hcut)
+            self.line_h.set_data(x_axis, hcut[::-1])  # reverse to match fliplr display
             self.ax_h.relim()
             self.ax_h.autoscale_view()
         if vcut is not None:

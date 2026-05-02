@@ -235,6 +235,15 @@ class KeithleySMU:
         try:
             if self.inst is not None:
                 try:
+                    self.drain_errors()
+                except Exception:
+                    pass
+                if self.is_2400:
+                    try:
+                        self.write(":SYST:LOC")
+                    except Exception:
+                        pass
+                try:
                     self.inst.close()
                 except Exception:
                     pass
@@ -282,15 +291,14 @@ class KeithleySMU:
     # ---- Basic configuration ----
 
     def init_voltage_source(self) -> None:
-        # Voltage source function
+        # Voltage source function + auto-range so any voltage within spec is reachable
         self._try_write(":SOUR:FUNC VOLT", "SOUR:FUNC VOLT")
+        self._try_write(":SOUR:VOLT:RANG:AUTO ON", "SOUR:VOLT:RANG:AUTO ON")
 
         if self.is_2400:
-            # source 0 V
-            self._try_write(":SOUR:VOLT 0", "SOUR:VOLT 0")
-
             # measure current
             self._try_write(':SENS:FUNC "CURR"', 'SENS:FUNC "CURR"')
+            self._try_write(":SENS:CURR:RANG:AUTO ON", "SENS:CURR:RANG:AUTO ON")
 
             # make READ? return VOLT,CURR
             self._try_write(":FORM:ELEM VOLT,CURR", "FORM:ELEM VOLT,CURR")
@@ -300,28 +308,18 @@ class KeithleySMU:
             except Exception:
                 pass
 
-            try:
-                self.write(":DISP:VIEW MEAS")
-            except Exception:
-                pass
-
-            # conservative default compliance
-            try:
-                self.write(":SENS:CURR:PROT 0.01")
-            except Exception:
-                pass
-
         else:
-            # 2450-ish examples in the user manual use SENS:FUNC "CURR", SOUR:FUNC VOLT, SOUR:VOLT ... :contentReference[oaicite:6]{index=6}
             self._try_write('SENS:FUNC "CURR"')
             self._try_write("SENS:CURR:RANG:AUTO ON")
             self._try_write("SOUR:FUNC VOLT")
-            self._try_write("SOUR:VOLT 0")
             self._try_write(":SENS:CURR:RANG:AUTO ON")
 
-            self.set_compliance(0.01)
-
-        self._last_set_v = 0.0
+        # Seed _last_set_v from the instrument's current source register
+        # so ramps always start from the actual programmed voltage, not 0.
+        try:
+            self._last_set_v = float(self.query(":SOUR:VOLT?").strip())
+        except Exception:
+            self._last_set_v = 0.0
 
     # ---- Output & compliance ----
 

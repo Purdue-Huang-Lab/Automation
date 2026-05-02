@@ -60,7 +60,6 @@ from measurements.pl_trpl_power_voltage_config import (
     READOUT_UNKNOWN,
     DATA_DIR,
     SWEEP_SETTLE_MS,
-    ZERO_V_DUMMY_FRAMES,
     ZERO_V_EPS,
     ZERO_V_EXTRA_SETTLE_MS,
     VISA_DLL,
@@ -197,6 +196,7 @@ class PLTRPLPowerVoltageWidget(QtWidgets.QWidget):
         self._stage_controller: Optional[MotionController] = None
         self._stage_busy = False
         self._busy = False
+        self._aborting = False
         self._live_active = False
 
         self._live_view = None
@@ -1819,6 +1819,7 @@ class PLTRPLPowerVoltageWidget(QtWidgets.QWidget):
         stage_b_ok = self.stage_b is not None
         spec_ok = self.cam.spec is not None
         busy = self._is_busy()
+        hard_busy = busy and not self._aborting
 
         sweep_power = self.sweepPowerChk.isChecked()
         sweep_voltage = self.sweepVoltageChk.isChecked()
@@ -1841,7 +1842,7 @@ class PLTRPLPowerVoltageWidget(QtWidgets.QWidget):
         sweep_ok = sweep_power or sweep_voltage
 
         self.initBtn.setEnabled(not busy)
-        self.disconnectBtn.setEnabled(not busy)
+        self.disconnectBtn.setEnabled(not hard_busy)
         self.takeCurrentBtn.setEnabled(cam_ok and not busy)
         self.stopLiveBtn.setEnabled(self._threads_running() and self._live_active)
         self.stopCountsBtn.setEnabled(True)
@@ -1863,8 +1864,8 @@ class PLTRPLPowerVoltageWidget(QtWidgets.QWidget):
 
         front_busy = self._front_ramp_thread is not None and self._front_ramp_thread.isRunning()
         back_busy = self._back_ramp_thread is not None and self._back_ramp_thread.isRunning()
-        self.frontApplyBtn.setEnabled(self.front_dev is not None and (not busy) and (not front_busy))
-        self.backApplyBtn.setEnabled(self.back_dev is not None and (not busy) and (not back_busy))
+        self.frontApplyBtn.setEnabled(self.front_dev is not None and (not hard_busy) and (not front_busy))
+        self.backApplyBtn.setEnabled(self.back_dev is not None and (not hard_busy) and (not back_busy))
 
     def _update_gate_sweep_controls(self) -> None:
         enabled = self.sweepVoltageChk.isChecked()
@@ -3053,7 +3054,6 @@ class PLTRPLPowerVoltageWidget(QtWidgets.QWidget):
             settle_ms=float(SWEEP_SETTLE_MS),
             zero_v_eps=float(ZERO_V_EPS),
             zero_v_extra_settle_ms=float(ZERO_V_EXTRA_SETTLE_MS),
-            zero_v_dummy_frames=int(ZERO_V_DUMMY_FRAMES),
             save_dir=self._save_dir,
             tcspc_host=self._spad_host,
             tcspc_port=self._spad_port,
@@ -3111,6 +3111,7 @@ class PLTRPLPowerVoltageWidget(QtWidgets.QWidget):
         except Exception:
             pass
         self._live_active = False
+        self._aborting = True
         self._set_busy(False)
         self.statusBar().showMessage("Aborted")
 
@@ -3267,6 +3268,7 @@ class PLTRPLPowerVoltageWidget(QtWidgets.QWidget):
             self._write_session_metadata()
 
     def on_sweep_done(self, status: str):
+        self._aborting = False
         self._set_busy(False)
         self._sweep_thread = None
         self._update_lifetime_tab()

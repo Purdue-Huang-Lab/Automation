@@ -1,7 +1,7 @@
 import csv
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 
@@ -151,3 +151,128 @@ def load_dual_wheel_calibration(path: str) -> DualWheelPowerData:
         scale=scale,
         entries=entries,
     )
+
+
+# ------------------------------------------------------------------ #
+# HWP + ND wheel calibration (wheel_hwp_power_calib format)           #
+# ------------------------------------------------------------------ #
+
+@dataclass
+class HWPNDCalibData:
+    path: str
+    hwp_angles:   List[float] = field(default_factory=list)
+    hwp_powers_w: List[float] = field(default_factory=list)
+    hwp_stds_w:   List[float] = field(default_factory=list)
+    nd_angles:    List[float] = field(default_factory=list)
+    nd_powers_w:  List[float] = field(default_factory=list)
+    nd_stds_w:    List[float] = field(default_factory=list)
+
+
+def is_hwp_nd_calibration(path: str) -> bool:
+    """Return True if the file is a wheel+HWP calibration (has [HWP_SWEEP] marker)."""
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", newline="") as f:
+            for line in f:
+                if line.strip() == "[HWP_SWEEP]":
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def load_hwp_nd_calibration(path: str) -> HWPNDCalibData:
+    """Load a wheel+HWP power calibration CSV (created by WheelHWPCalibWidget)."""
+    if not path:
+        raise ValueError("No path provided")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+
+    hwp_rows: List[List[float]] = []
+    nd_rows:  List[List[float]] = []
+    section = None
+
+    with open(path, newline="") as f:
+        for row in csv.reader(f):
+            if not row:
+                continue
+            cell = row[0].strip()
+            if cell.startswith("#"):
+                continue
+            if cell == "[HWP_SWEEP]":
+                section = "hwp"; continue
+            if cell == "[ND_SWEEP]":
+                section = "nd"; continue
+            if cell in ("hwp_angle_deg", "nd_angle_deg"):
+                continue
+            try:
+                vals = [float(c) for c in row[:3]]
+            except (ValueError, IndexError):
+                continue
+            if section == "hwp":
+                hwp_rows.append(vals)
+            elif section == "nd":
+                nd_rows.append(vals)
+
+    if not hwp_rows:
+        raise ValueError("No [HWP_SWEEP] data found in file")
+
+    return HWPNDCalibData(
+        path=path,
+        hwp_angles=[r[0] for r in hwp_rows],
+        hwp_powers_w=[r[1] for r in hwp_rows],
+        hwp_stds_w=[r[2] for r in hwp_rows],
+        nd_angles=[r[0] for r in nd_rows],
+        nd_powers_w=[r[1] for r in nd_rows],
+        nd_stds_w=[r[2] for r in nd_rows],
+    )
+
+
+def compute_hwp_nd_entries(
+    data: HWPNDCalibData, nd_angle: float
+) -> Tuple[List[DualWheelPowerEntry], str, float]:
+    """
+    Given a chosen ND wheel angle, return (entries, unit, scale) where each
+    entry has a_deg=HWP angle, b_deg=nd_angle (fixed), power_w=converted power.
+
+    unit / scale are chosen automatically from the max converted power.
+    """
+    hwp_p = data.hwp_powers_w
+    p_max = max(hwp_p) if hwp_p else 1.0
+
+    # Find matching ND power
+    p_nd = p_max  # fallback: same max power
+    if data.nd_angles and nd_angle in data.nd_angles:
+        idx = data.nd_angles.index(nd_angle)
+        p_nd = data.nd_powers_w[idx]
+    elif data.nd_angles:
+        # nearest
+        dists = [abs(a - nd_angle) for a in data.nd_angles]
+        idx = dists.index(min(dists))
+        p_nd = data.nd_powers_w[idx]
+
+    entries: List[DualWheelPowerEntry] = []
+    for i, (hwp_ang, pw) in enumerate(zip(data.hwp_angles, hwp_p)):
+        norm  = pw / p_max if p_max > 0 else 0.0
+        conv_w = norm * p_nd
+        entries.append(DualWheelPowerEntry(
+            a_deg=hwp_ang,
+            b_deg=nd_angle,
+            power_w=conv_w,
+            intensity=norm,
+            index=i,
+        ))
+
+    # Auto-select display unit from max converted power
+    max_p = p_nd if p_nd > 0 else 1e-9
+    if max_p < 1e-6:
+        unit, scale = "nW", 1e-9
+    elif max_p < 1e-3:
+        unit, scale = "uW", 1e-6
+    elif max_p < 1.0:
+        unit, scale = "mW", 1e-3
+    else:
+        unit, scale = "W", 1.0
+
+    return entries, unit, scale

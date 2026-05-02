@@ -35,3 +35,6 @@ ___All_Errors.txt
 
 # Claude Code local settings
 .claude/
+
+# VS Code editor history (local only)
+.history/
