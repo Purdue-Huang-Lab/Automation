@@ -198,14 +198,14 @@ class AndorLiveViewWidget(QtWidgets.QGroupBox):
         self._last_frame_full = raw
         self._last_raw_width = int(raw.shape[1])
         raw_crop = self._apply_crop(raw)
-        disp = np.flipud(raw_crop)
+        disp = np.fliplr(np.flipud(raw_crop))
         disp8 = None
         if img8 is not None:
             try:
                 raw8 = np.asarray(img8)
                 self._last_frame8_full = raw8
                 raw8_crop = self._apply_crop(raw8)
-                disp8 = np.flipud(raw8_crop)
+                disp8 = np.fliplr(np.flipud(raw8_crop))
             except Exception:
                 disp8 = None
                 self._last_frame8_full = None
@@ -292,7 +292,7 @@ class AndorLiveViewWidget(QtWidgets.QGroupBox):
         return a[top:y2, left:x2]
 
     def _prepare_display_image(self, raw):
-        return np.flipud(self._apply_crop(raw))
+        return np.fliplr(np.flipud(self._apply_crop(raw)))
 
     def _update_cursor_overlays(self, h: int, w: int) -> None:
         if self._cursor_rc is None or self._last_frame_raw is None:
@@ -311,8 +311,9 @@ class AndorLiveViewWidget(QtWidgets.QGroupBox):
             self._crosshair_v.set_visible(False)
             return
 
+        x_raw = w - 1 - x  # display col x maps to physical col x_raw after fliplr
         try:
-            val = float(self._last_frame_raw[y_raw, x])
+            val = float(self._last_frame_raw[y_raw, x_raw])
             self.cursorLbl.setText(f"Cursor: (row, col) = {y}, {x}, I = {val:g}")
         except Exception:
             self.cursorLbl.setText(f"Cursor: (row, col) = {y}, {x}")
@@ -328,13 +329,13 @@ class AndorLiveViewWidget(QtWidgets.QGroupBox):
         else:
             hcut = self._linecut_horizontal(self._last_frame_raw, y_raw, width=width)
         if self.cam is not None and hasattr(self.cam, "linecut_vertical"):
-            vcut = self.cam.linecut_vertical(self._last_frame_raw, x, width=width, mode="sum")
+            vcut = self.cam.linecut_vertical(self._last_frame_raw, x_raw, width=width, mode="sum")
         else:
-            vcut = self._linecut_vertical(self._last_frame_raw, x, width=width)
+            vcut = self._linecut_vertical(self._last_frame_raw, x_raw, width=width)
 
         if hcut is not None:
             x_axis = self._get_x_axis_data(w)
-            self.line_h.set_data(x_axis, hcut)
+            self.line_h.set_data(x_axis, hcut[::-1])  # reverse to match fliplr display
             self.ax_h.relim()
             self.ax_h.autoscale_view()
             if len(x_axis):

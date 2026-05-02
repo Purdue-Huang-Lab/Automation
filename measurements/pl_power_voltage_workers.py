@@ -102,8 +102,10 @@ class PowerVoltageSweepThread(QtCore.QThread):
         settle_ms: float,
         zero_v_eps: float,
         zero_v_extra_settle_ms: float,
-        zero_v_dummy_frames: int,
         save_dir: Optional[str],
+        readout_rate: Optional[str] = None,
+        preamp_gain: Optional[str] = None,
+        output_amp: Optional[str] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -133,8 +135,11 @@ class PowerVoltageSweepThread(QtCore.QThread):
         self.settle_ms = float(settle_ms)
         self.zero_v_eps = float(zero_v_eps)
         self.zero_v_extra_settle_ms = float(zero_v_extra_settle_ms)
-        self.zero_v_dummy_frames = int(zero_v_dummy_frames)
+
         self.save_dir = save_dir
+        self.readout_rate = readout_rate
+        self.preamp_gain = preamp_gain
+        self.output_amp = output_amp
         self._stop = False
         self._stage_controller = MotionController()
         self._gate_controller = SweepController()
@@ -175,7 +180,8 @@ class PowerVoltageSweepThread(QtCore.QThread):
         s = f"{v:.6g}"
         return s.replace("-", "m").replace(".", "p")
 
-    def _gate_ramp(self, dev: KeithleySMU, target_v: float, icomp_a: Optional[float]) -> VIReading:
+    def _gate_ramp(self, dev: KeithleySMU, target_v: float, icomp_a: Optional[float],
+                   on_microstep=None) -> VIReading:
         tag = self._gate_tag(dev)
         for attempt in range(2):
             try:
@@ -187,8 +193,8 @@ class PowerVoltageSweepThread(QtCore.QThread):
                     ramp_step_v=self.ramp_step_v,
                     ramp_dwell_s=self.ramp_dwell_s,
                     controller=self._gate_controller,
-                    micro_read=False,
-                    on_microstep=None,
+                    micro_read=on_microstep is not None,
+                    on_microstep=on_microstep,
                     verify=True,
                 )
             except Exception as exc:
@@ -271,10 +277,11 @@ class PowerVoltageSweepThread(QtCore.QThread):
             img = fr.get("image")
             if img is None:
                 return None, "error: acquire failed (no image)"
+            img = np.fliplr(np.asarray(img, dtype=np.float64))
             if sum_img is None:
-                sum_img = np.asarray(img, dtype=np.float64)
+                sum_img = img
             else:
-                sum_img += np.asarray(img, dtype=np.float64)
+                sum_img += img
             last_fr = fr
             fr_out = dict(fr)
             fr_out["image"] = sum_img
@@ -349,15 +356,6 @@ class PowerVoltageSweepThread(QtCore.QThread):
                     pass
             return None, f"error: acquire failed: {err}"
 
-    def _discard_frames(self, count: int):
-        for idx in range(int(count)):
-            if self._stop or self._gate_controller.is_aborted():
-                return "aborted"
-            self.status.emit(f"Discarding dummy frame {idx + 1}/{count}")
-            _, err = self._grab_frame()
-            if err:
-                return err
-        return None
 
     def _is_zero_step(self, v_front: Optional[float], v_back: Optional[float]) -> bool:
         eps = abs(float(self.zero_v_eps))
@@ -399,15 +397,24 @@ class PowerVoltageSweepThread(QtCore.QThread):
                 self.cam.set_trigger_mode("Internal")
                 self.cam.set_shutter("auto")
                 self.cam.set_exposure_ms(self.exposure_ms)
+                self.cam.set_baseline_clamp(True)
             except Exception:
                 pass
+
+            if self.output_amp and self.readout_rate and self.preamp_gain:
+                try:
+                    self.cam.set_amp_mode_by_labels(
+                        self.output_amp, self.readout_rate, self.preamp_gain, force_preamp=True
+                    )
+                except Exception:
+                    pass
 
             try:
                 prev_timeout_scale = getattr(self.cam, "_timeout_scale", None)
             except Exception:
                 prev_timeout_scale = None
             try:
-                timeout_scale = 2.0
+                timeout_scale = 5.0
                 if self.exposure_ms > 10000.0:
                     timeout_scale = max(timeout_scale, (self.exposure_ms / 10000.0) * 2.0)
                 self.cam._timeout_scale = timeout_scale
@@ -457,6 +464,19 @@ class PowerVoltageSweepThread(QtCore.QThread):
                     direction = "forward" if sweep_forward else "reverse"
                     self.status.emit(f"Voltage sweep ({direction})")
                 reverse_steps = bool(snake_voltage and not sweep_forward)
+                # Ramp both gates to V0 before touching the camera, so a slow
+                # GPIB ramp cannot cause Andor to timeout mid-acquisition.
+                if self.sweep_voltage:
+                    if self.front_dev is not None:
+                        self._gate_ramp(self.front_dev, float(self.front_v0), self.front_icomp_a,
+                                        on_microstep=lambda vi: self.vi_ready.emit({"v_front": vi.v, "i_front": vi.i}))
+                    if self.back_dev is not None:
+                        self._gate_ramp(self.back_dev, float(self.back_v0), self.back_icomp_a,
+                                        on_microstep=lambda vi: self.vi_ready.emit({"v_back": vi.v, "i_back": vi.i}))
+                    if self._stop or self._gate_controller.is_aborted():
+                        self.done.emit("aborted")
+                        return
+
                 for step_idx, v_front, v_back in self._iter_voltage_steps(reverse=reverse_steps):
                     if self._stop or self._gate_controller.is_aborted():
                         self.done.emit("aborted")
@@ -464,9 +484,11 @@ class PowerVoltageSweepThread(QtCore.QThread):
 
                     if self.sweep_voltage:
                         if v_front is not None and self.front_dev is not None:
-                            self._gate_ramp(self.front_dev, v_front, self.front_icomp_a)
+                            self._gate_ramp(self.front_dev, v_front, self.front_icomp_a,
+                                            on_microstep=lambda vi: self.vi_ready.emit({"v_front": vi.v, "i_front": vi.i}))
                         if v_back is not None and self.back_dev is not None:
-                            self._gate_ramp(self.back_dev, v_back, self.back_icomp_a)
+                            self._gate_ramp(self.back_dev, v_back, self.back_icomp_a,
+                                            on_microstep=lambda vi: self.vi_ready.emit({"v_back": vi.v, "i_back": vi.i}))
 
                         if self.settle_ms > 0:
                             time.sleep(max(0.0, self.settle_ms / 1000.0))
@@ -502,15 +524,6 @@ class PowerVoltageSweepThread(QtCore.QThread):
                     if self._is_zero_step(v_front, v_back):
                         if self.zero_v_extra_settle_ms > 0:
                             time.sleep(max(0.0, self.zero_v_extra_settle_ms / 1000.0))
-                        if self.zero_v_dummy_frames > 0:
-                            err = self._discard_frames(self.zero_v_dummy_frames)
-                            if err:
-                                if err == "aborted":
-                                    self.done.emit("aborted")
-                                else:
-                                    self.status.emit(err)
-                                    self.done.emit(err)
-                                return
 
                     try:
                         self._check_trip(i_read_f, self.front_icomp_a, "Front")

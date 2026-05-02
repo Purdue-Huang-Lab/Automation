@@ -203,6 +203,19 @@ class AndorSystem:
             except Exception:
                 exp_s = 0.05
             timeout_s = max(1.0, exp_s * 2.0 + 0.2)
+        # Extend timeout to account for readout time, which the SDK-reported cycle
+        # time may not include (seen on DU970P and similar CCDs).
+        try:
+            if cam is not None and hasattr(cam, "get_readout_time"):
+                rt = cam.get_readout_time()
+                if rt:
+                    exp_s = float(self._exposure_s or 0.05)
+                    timeout_s = max(timeout_s, float(rt) + exp_s + 0.5)
+        except Exception:
+            pass
+        # Global minimum floor: always allow at least 2 s regardless of which
+        # branch computed the timeout (prevents sub-200ms timeouts on short exposures).
+        timeout_s = max(timeout_s, 2.0)
         try:
             scale = float(getattr(self, "_timeout_scale", 1.0) or 1.0)
         except Exception:
@@ -279,6 +292,10 @@ class AndorSystem:
     # Defaults
     # -----------------
     def _apply_defaults_on_connect(self) -> None:
+        # Abort and clear any acquisition left running from a previous session.
+        # Without this, the first snap on DU970P (and similar CCDs) times out
+        # because the camera is still in a running state.
+        self._recover_after_timeout()
         try:
             self.set_frame_api("snap")
             self.set_acquisition_mode("single")
@@ -540,9 +557,25 @@ class AndorSystem:
             return False
         try:
             self.cam.set_amp_mode(channel=channel, oamp=oamp, hsspeed=hsspeed, preamp=preamp)
-            return True
         except Exception:
             return False
+        # pylablib's set_amp_mode() writes SDK registers but does not reliably update
+        # _cpar, so apply_settings() (called by start_acquisition / snap) would revert
+        # the amp mode to whatever was in _cpar before. Patch it here to keep them in sync.
+        try:
+            cpar = getattr(self.cam, "_cpar", None)
+            if isinstance(cpar, dict):
+                if channel is not None:
+                    cpar["channel"] = int(channel)
+                if oamp is not None:
+                    cpar["oamp"] = int(oamp)
+                if hsspeed is not None:
+                    cpar["hsspeed"] = int(hsspeed)
+                if preamp is not None:
+                    cpar["preamp"] = int(preamp)
+        except Exception:
+            pass
+        return True
 
     def _parse_amp_mode(self, m):
         if isinstance(m, dict):
@@ -1435,8 +1468,3 @@ class AndorSystem:
         else:
             header = "\n".join(header_lines)
             np.savetxt(filepath, a, fmt="%d", header=header)
-        try:
-            self.set_preamp_gain_default()
-            self.set_fastest_readout_default()
-        except Exception:
-            pass

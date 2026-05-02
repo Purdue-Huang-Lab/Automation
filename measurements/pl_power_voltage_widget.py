@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import types as _types
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -57,7 +58,6 @@ from measurements.pl_power_voltage_config import (
     READOUT_UNKNOWN,
     DATA_DIR,
     SWEEP_SETTLE_MS,
-    ZERO_V_DUMMY_FRAMES,
     ZERO_V_EPS,
     ZERO_V_EXTRA_SETTLE_MS,
     VISA_DLL,
@@ -65,8 +65,12 @@ from measurements.pl_power_voltage_config import (
 from measurements.dual_wheel_power_calibration import (
     DualWheelPowerEntry,
     DualWheelPowerData,
+    HWPNDCalibData,
     is_dual_wheel_calibration,
+    is_hwp_nd_calibration,
     load_dual_wheel_calibration,
+    load_hwp_nd_calibration,
+    compute_hwp_nd_entries,
 )
 from measurements.power_calibration import (
     PowerCalibEntry,
@@ -98,6 +102,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self._stage_controller: Optional[MotionController] = None
         self._stage_busy = False
         self._busy = False
+        self._aborting = False
         self._live_active = False
 
         self._live_view = None
@@ -109,6 +114,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
 
         self._calib_data = None
         self._dual_calib_data: Optional[DualWheelPowerData] = None
+        self._hwp_nd_calib_data: Optional[HWPNDCalibData] = None
         self._series_entries: Dict[str, List[PowerCalibEntry]] = {}
         self._dual_entries: List[DualWheelPowerEntry] = []
         self._power_display: Dict[float, dict] = {}
@@ -123,6 +129,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self._power_done_counts: Dict[float, int] = {}
         self._power_target_counts: Dict[float, int] = {}
         self._total_entries = 0
+        self._angle_list_mode = False
         self._session_saved = False
         self._file_counters: Dict[str, int] = {}
         self._save_dir = None
@@ -233,6 +240,11 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self.accumSpin.setValue(DEFAULT_ACQ_NUMBER)
         self.accumSpin.setFixedWidth(70)
 
+        self.readoutRateCombo = QtWidgets.QComboBox()
+        self.readoutRateCombo.setEditable(False)
+        self.readoutRateCombo.addItem(str(DEFAULT_READOUT_RATE))
+        self.readoutRateCombo.setFixedWidth(150)
+
         self.preampCombo = QtWidgets.QComboBox()
         self.preampCombo.setEditable(False)
         self.preampCombo.addItem(str(DEFAULT_PREAMP_GAIN))
@@ -249,6 +261,8 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         line1.addWidget(self.exposureSpin)
         line1.addWidget(QtWidgets.QLabel("Acq N:"))
         line1.addWidget(self.accumSpin)
+        line1.addWidget(QtWidgets.QLabel("Rate:"))
+        line1.addWidget(self.readoutRateCombo)
         line1.addWidget(QtWidgets.QLabel("Preamp:"))
         line1.addWidget(self.preampCombo)
         line1.addWidget(self.preampInfoLbl)
@@ -508,11 +522,16 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self.sweepBtn.setFixedWidth(140)
         self.abortBtn = QtWidgets.QPushButton("Abort")
         self.abortBtn.setFixedWidth(100)
+        self.homeBothBtn = QtWidgets.QPushButton("Home Both Gates")
+        self.homeBothBtn.setFixedWidth(150)
+        self.homeBothBtn.setEnabled(False)
 
         line5 = QtWidgets.QHBoxLayout()
         line5.addStretch()
         line5.addWidget(self.initBtn)
         line5.addWidget(self.disconnectBtn)
+        line5.addSpacing(10)
+        line5.addWidget(self.homeBothBtn)
         line5.addSpacing(10)
         line5.addWidget(self.takeCurrentBtn)
         line5.addWidget(self.stopLiveBtn)
@@ -543,6 +562,20 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self.seriesInfoLbl = QtWidgets.QLabel("Series: --")
         self.calibModeLbl = QtWidgets.QLabel("Mode: --")
 
+        self.ndWheelAngleLbl = QtWidgets.QLabel("ND wheel angle:")
+        self.ndWheelAngleCombo = QtWidgets.QComboBox()
+        self.ndWheelAngleCombo.setMinimumWidth(100)
+
+        self.hwpAngleLbl = QtWidgets.QLabel("HWP range:")
+        self.hwpMinSpin = QtWidgets.QDoubleSpinBox()
+        self.hwpMinSpin.setRange(0, 360); self.hwpMinSpin.setDecimals(2)
+        self.hwpMinSpin.setSingleStep(0.5); self.hwpMinSpin.setSuffix(" °")
+        self.hwpMinSpin.setFixedWidth(90)
+        self.hwpMaxSpin = QtWidgets.QDoubleSpinBox()
+        self.hwpMaxSpin.setRange(0, 360); self.hwpMaxSpin.setDecimals(2)
+        self.hwpMaxSpin.setSingleStep(0.5); self.hwpMaxSpin.setSuffix(" °")
+        self.hwpMaxSpin.setFixedWidth(90)
+
         self.cropTopSpin = QtWidgets.QSpinBox()
         self.cropBottomSpin = QtWidgets.QSpinBox()
         self.cropLeftSpin = QtWidgets.QSpinBox()
@@ -572,12 +605,19 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         grid.addWidget(self.seriesCombo, 3, 1)
         grid.addWidget(self.seriesInfoLbl, 3, 2, 1, 2)
 
-        grid.addWidget(QtWidgets.QLabel("Crop T/B/L/R:"), 4, 0)
-        grid.addWidget(self.cropTopSpin, 4, 1)
-        grid.addWidget(self.cropBottomSpin, 4, 2)
-        grid.addWidget(self.cropLeftSpin, 4, 3)
-        grid.addWidget(self.cropRightSpin, 4, 4)
-        grid.addWidget(self.cropApplyBtn, 4, 5)
+        grid.addWidget(self.ndWheelAngleLbl,   4, 0)
+        grid.addWidget(self.ndWheelAngleCombo, 4, 1)
+        grid.addWidget(self.hwpAngleLbl,       4, 2)
+        grid.addWidget(self.hwpMinSpin,        4, 3)
+        grid.addWidget(QtWidgets.QLabel("–"),  4, 4)
+        grid.addWidget(self.hwpMaxSpin,        4, 5)
+
+        grid.addWidget(QtWidgets.QLabel("Crop T/B/L/R:"), 5, 0)
+        grid.addWidget(self.cropTopSpin, 5, 1)
+        grid.addWidget(self.cropBottomSpin, 5, 2)
+        grid.addWidget(self.cropLeftSpin, 5, 3)
+        grid.addWidget(self.cropRightSpin, 5, 4)
+        grid.addWidget(self.cropApplyBtn, 5, 5)
 
         parent_layout.addWidget(box)
 
@@ -594,7 +634,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self.sweepVoltageChk.setChecked(False)
 
         self.sweepGateCombo = QtWidgets.QComboBox()
-        self.sweepGateCombo.addItems(["Front gate", "Back gate", "Dual gate"])
+        self.sweepGateCombo.addItems(["Dual gate", "Front gate", "Back gate"])
         self.sweepGateCombo.setEnabled(False)
 
         self.frontV0Spin = QtWidgets.QDoubleSpinBox()
@@ -638,17 +678,32 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         grid.addWidget(QtWidgets.QLabel("Skip N power points:"), 0, 4)
         grid.addWidget(self.powerSkipSpin, 0, 5)
 
-        grid.addWidget(QtWidgets.QLabel("Front V0 (V):"), 1, 0)
-        grid.addWidget(self.frontV0Spin, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("Front step (V):"), 1, 2)
-        grid.addWidget(self.frontStepSpin, 1, 3)
-        grid.addWidget(QtWidgets.QLabel("Steps:"), 1, 4)
-        grid.addWidget(self.sweepStepsSpin, 1, 5)
+        # Angle list row (stage A, no calibration file needed)
+        self.angleListChk = QtWidgets.QCheckBox("Use angle list (stage A)")
+        self.angleListEdit = QtWidgets.QLineEdit()
+        self.angleListEdit.setPlaceholderText("e.g.  0, 15.5, 30  (comma-separated °)")
+        self.angleListPreviewLbl = QtWidgets.QLabel("(0 angles)")
+        self.angleListPreviewLbl.setStyleSheet("color: #555; font-size: 8pt;")
+        grid.addWidget(self.angleListChk,        1, 0, 1, 2)
+        grid.addWidget(self.angleListEdit,        1, 2, 1, 3)
+        grid.addWidget(self.angleListPreviewLbl,  1, 5, 1, 2)
 
-        grid.addWidget(QtWidgets.QLabel("Back V0 (V):"), 2, 0)
-        grid.addWidget(self.backV0Spin, 2, 1)
-        grid.addWidget(QtWidgets.QLabel("Back step (V):"), 2, 2)
-        grid.addWidget(self.backStepSpin, 2, 3)
+        self.frontVendLbl = QtWidgets.QLabel("End: 0.000000 V")
+        self.backVendLbl = QtWidgets.QLabel("End: 0.000000 V")
+
+        grid.addWidget(QtWidgets.QLabel("Front V0 (V):"), 2, 0)
+        grid.addWidget(self.frontV0Spin, 2, 1)
+        grid.addWidget(QtWidgets.QLabel("Front step (V):"), 2, 2)
+        grid.addWidget(self.frontStepSpin, 2, 3)
+        grid.addWidget(QtWidgets.QLabel("Steps:"), 2, 4)
+        grid.addWidget(self.sweepStepsSpin, 2, 5)
+        grid.addWidget(self.frontVendLbl, 2, 6)
+
+        grid.addWidget(QtWidgets.QLabel("Back V0 (V):"), 3, 0)
+        grid.addWidget(self.backV0Spin, 3, 1)
+        grid.addWidget(QtWidgets.QLabel("Back step (V):"), 3, 2)
+        grid.addWidget(self.backStepSpin, 3, 3)
+        grid.addWidget(self.backVendLbl, 3, 6)
 
         parent_layout.addWidget(box)
     def _build_plots(self, parent_layout):
@@ -815,13 +870,29 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self.stageBDetectBtn.clicked.connect(self.on_stage_detect)
         self.stopLiveBtn.clicked.connect(self.on_stop_live)
         self.seriesCombo.currentIndexChanged.connect(self._update_series_info)
+        self.ndWheelAngleCombo.currentIndexChanged.connect(self._on_hwp_nd_angle_changed)
+        self.hwpMinSpin.valueChanged.connect(self._on_hwp_nd_angle_changed)
+        self.hwpMaxSpin.valueChanged.connect(self._on_hwp_nd_angle_changed)
+        for w in (self.ndWheelAngleLbl, self.ndWheelAngleCombo,
+                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpMaxSpin):
+            w.setVisible(False)
         self.cropApplyBtn.clicked.connect(self.on_apply_crop)
+        self.readoutRateCombo.currentIndexChanged.connect(self.on_preamp_change)
         self.preampCombo.currentIndexChanged.connect(self.on_preamp_change)
+        self.homeBothBtn.clicked.connect(self.on_home_both_gates)
         self.frontApplyBtn.clicked.connect(self.on_front_apply)
         self.backApplyBtn.clicked.connect(self.on_back_apply)
         self.sweepVoltageChk.toggled.connect(self._update_gate_sweep_controls)
         self.sweepPowerChk.toggled.connect(self._sync_controls)
+        self.angleListChk.toggled.connect(self._on_angle_list_changed)
+        self.angleListEdit.textChanged.connect(self._on_angle_list_changed)
         self.sweepGateCombo.currentIndexChanged.connect(self._update_gate_sweep_controls)
+        self.frontV0Spin.valueChanged.connect(self._update_vend_labels)
+        self.frontStepSpin.valueChanged.connect(self._update_vend_labels)
+        self.backV0Spin.valueChanged.connect(self._update_vend_labels)
+        self.backStepSpin.valueChanged.connect(self._update_vend_labels)
+        self.sweepStepsSpin.valueChanged.connect(self._update_vend_labels)
+        self._update_vend_labels()
         self.voltageSlider.valueChanged.connect(self._on_voltage_slider)
         self.powerSlider.valueChanged.connect(self._on_power_slider)
         self.mapCminEdit.editingFinished.connect(self._on_map_clim_changed)
@@ -857,7 +928,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         if not name:
             name = self._default_save_name()
             self.saveNameEdit.setText(name)
-        base = os.path.join(DATA_DIR, "measurements", name)
+        base = os.path.join(DATA_DIR, name)
         os.makedirs(base, exist_ok=True)
         self._save_dir = base
         return base
@@ -884,30 +955,41 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
     def _refresh_amp_choices(self) -> None:
         if self.cam is None or self.cam.cam is None:
             return
-        current = self.preampCombo.currentText().strip()
-        gains = []
+        current_gain = self.preampCombo.currentText().strip()
+        current_rate = self.readoutRateCombo.currentText().strip()
+        _, rates, gains = [], [], []
         try:
-            _, _, gains = self.cam.get_amp_mode_choices()
+            _, rates, gains = self.cam.get_amp_mode_choices()
         except Exception:
-            gains = []
-        if not gains:
-            return
-        self.preampCombo.blockSignals(True)
-        self.preampCombo.clear()
-        self.preampCombo.addItems(gains)
-        if str(DEFAULT_PREAMP_GAIN) in gains:
-            self.preampCombo.setCurrentText(str(DEFAULT_PREAMP_GAIN))
-        elif current and current in gains:
-            self.preampCombo.setCurrentText(current)
-        else:
-            self.preampCombo.setCurrentIndex(0)
-        self.preampCombo.blockSignals(False)
+            pass
+        if gains:
+            self.preampCombo.blockSignals(True)
+            self.preampCombo.clear()
+            self.preampCombo.addItems(gains)
+            if str(DEFAULT_PREAMP_GAIN) in gains:
+                self.preampCombo.setCurrentText(str(DEFAULT_PREAMP_GAIN))
+            elif current_gain and current_gain in gains:
+                self.preampCombo.setCurrentText(current_gain)
+            else:
+                self.preampCombo.setCurrentIndex(0)
+            self.preampCombo.blockSignals(False)
+        if rates:
+            self.readoutRateCombo.blockSignals(True)
+            self.readoutRateCombo.clear()
+            self.readoutRateCombo.addItems(rates)
+            if str(DEFAULT_READOUT_RATE) in rates:
+                self.readoutRateCombo.setCurrentText(str(DEFAULT_READOUT_RATE))
+            elif current_rate and current_rate in rates:
+                self.readoutRateCombo.setCurrentText(current_rate)
+            else:
+                self.readoutRateCombo.setCurrentIndex(0)
+            self.readoutRateCombo.blockSignals(False)
 
     def _apply_amp_settings(self) -> None:
         if self.cam is None or self.cam.cam is None:
             return
         req_gain = self.preampCombo.currentText().strip()
-        req_rate = self._readout_rate_label
+        req_rate = self.readoutRateCombo.currentText().strip() or self._readout_rate_label
         req_amp = self._output_amp_label
 
         def _gain_value(label: str):
@@ -950,6 +1032,11 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             self._readout_rate_label = info.get("rate_label") or self._readout_rate_label
             self._preamp_gain_label = info.get("gain_label") or self._preamp_gain_label
             self._output_amp_label = info.get("amp_label") or self._output_amp_label
+            rate_label = info.get("rate_label")
+            if rate_label:
+                self.readoutRateCombo.blockSignals(True)
+                self.readoutRateCombo.setCurrentText(str(rate_label))
+                self.readoutRateCombo.blockSignals(False)
             gain_label = info.get("gain_label")
             if gain_label:
                 self.preampCombo.blockSignals(True)
@@ -1030,6 +1117,35 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _parse_angle_list(self) -> List[float]:
+        """Parse the angle list text field into a sorted list of unique floats."""
+        vals: List[float] = []
+        for tok in self.angleListEdit.text().replace(";", ",").split(","):
+            tok = tok.strip()
+            if tok:
+                try:
+                    vals.append(float(tok))
+                except ValueError:
+                    pass
+        seen: set = set()
+        unique: List[float] = []
+        for v in vals:
+            if v not in seen:
+                seen.add(v)
+                unique.append(v)
+        return unique
+
+    def _on_angle_list_changed(self) -> None:
+        angles = self._parse_angle_list()
+        if angles:
+            preview = f"{len(angles)} angles: {[f'{a:.3g}' for a in angles[:5]]}"
+            if len(angles) > 5:
+                preview += " …"
+        else:
+            preview = "(0 angles)"
+        self.angleListPreviewLbl.setText(preview)
+        self._sync_controls()
+
     def _set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
         if self._is_busy():
@@ -1048,16 +1164,22 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         stage_b_ok = self.stage_b is not None
         spec_ok = self.cam.spec is not None
         busy = self._is_busy()
+        hard_busy = busy and not self._aborting
 
         sweep_power = self.sweepPowerChk.isChecked()
         sweep_voltage = self.sweepVoltageChk.isChecked()
-        need_dual = self._calib_mode == "dual"
+        need_dual = self._calib_mode in ("dual", "hwp_nd")
 
+        angle_list_mode = sweep_power and self.angleListChk.isChecked()
         calib_ok = True
         stages_ok = True
         if sweep_power:
-            calib_ok = self._dual_calib_data is not None if need_dual else self._calib_data is not None
-            stages_ok = stage_a_ok and (stage_b_ok if need_dual else True)
+            if angle_list_mode:
+                calib_ok = bool(self._parse_angle_list())
+                stages_ok = stage_a_ok
+            else:
+                calib_ok = bool(self._dual_entries) if need_dual else self._calib_data is not None
+                stages_ok = stage_a_ok and (stage_b_ok if need_dual else True)
 
         gate_ok = True
         if sweep_voltage:
@@ -1070,7 +1192,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         sweep_ok = sweep_power or sweep_voltage
 
         self.initBtn.setEnabled(not busy)
-        self.disconnectBtn.setEnabled(not busy)
+        self.disconnectBtn.setEnabled(not hard_busy)
         self.takeCurrentBtn.setEnabled(cam_ok and not busy)
         self.stopLiveBtn.setEnabled(self._threads_running() and self._live_active)
         self.sweepBtn.setEnabled(cam_ok and sweep_ok and stages_ok and calib_ok and gate_ok and not busy)
@@ -1080,14 +1202,18 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self.stageMoveBtn.setEnabled(stage_a_ok and not busy)
         self.stageBHomeBtn.setEnabled(stage_b_ok and not busy)
         self.stageBMoveBtn.setEnabled(stage_b_ok and not busy)
+        self.readoutRateCombo.setEnabled(cam_ok and not busy)
         self.preampCombo.setEnabled(cam_ok and not busy)
-        self.seriesCombo.setEnabled(sweep_power and (not need_dual) and calib_ok and not busy)
-        self.powerSkipSpin.setEnabled(sweep_power and not busy)
+        self.seriesCombo.setEnabled(sweep_power and (not need_dual) and (not angle_list_mode) and calib_ok and not busy)
+        self.powerSkipSpin.setEnabled(sweep_power and (not angle_list_mode) and not busy)
+        self.angleListEdit.setEnabled(sweep_power and self.angleListChk.isChecked() and not busy)
 
         front_busy = self._front_ramp_thread is not None and self._front_ramp_thread.isRunning()
         back_busy = self._back_ramp_thread is not None and self._back_ramp_thread.isRunning()
-        self.frontApplyBtn.setEnabled(self.front_dev is not None and (not busy) and (not front_busy))
-        self.backApplyBtn.setEnabled(self.back_dev is not None and (not busy) and (not back_busy))
+        self.frontApplyBtn.setEnabled(self.front_dev is not None and (not hard_busy) and (not front_busy))
+        self.backApplyBtn.setEnabled(self.back_dev is not None and (not hard_busy) and (not back_busy))
+        either_gate = (self.front_dev is not None) or (self.back_dev is not None)
+        self.homeBothBtn.setEnabled(either_gate and (not hard_busy) and (not front_busy) and (not back_busy))
 
     def _update_gate_sweep_controls(self) -> None:
         enabled = self.sweepVoltageChk.isChecked()
@@ -1130,6 +1256,8 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         key = self._power_view_keys[idx]
         if key is None or not np.isfinite(float(key)):
             return "--"
+        if self._angle_list_mode:
+            return f"{key:.3f} °"
         return f"{key:.6g} {self._calib_unit}"
 
     @staticmethod
@@ -1242,11 +1370,15 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
                 float(entry.b_deg),
                 int(getattr(entry, "index", 0)),
             )
+        if entry.power_w is None:  # angle-list SimpleNamespace entries
+            return (entry.series, entry.position_deg)
         return (entry.series, power_key(entry.power_w, scale=self._calib_scale), entry.position_deg)
 
     def _entry_rank(self, entry):
         if isinstance(entry, DualWheelPowerEntry) or hasattr(entry, "a_deg"):
             return int(getattr(entry, "index", 0))
+        if not hasattr(entry, "is_base"):  # angle-list SimpleNamespace entries
+            return 0
         return entry_priority(entry)
 
     def _format_power(self, power_w: float) -> str:
@@ -1462,6 +1594,20 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         try:
             dev = KeithleySMU(self.rm, resource, timeout_ms=20000, query_delay_s=0.0, verbose=False)
             idn = dev.open()
+            icomp_spin = self.frontIcompSpin if which == "front" else self.backIcompSpin
+            try:
+                dev.set_compliance(float(icomp_spin.value()) * 1e-9)
+            except Exception:
+                pass
+            # Sync the Vset spinbox to the instrument's actual source voltage
+            vset_spin = self.frontVsetSpin if which == "front" else self.backVsetSpin
+            try:
+                v_now = float(dev.query(":SOUR:VOLT?").strip())
+                vset_spin.blockSignals(True)
+                vset_spin.setValue(v_now)
+                vset_spin.blockSignals(False)
+            except Exception:
+                pass
             output_on = False
             try:
                 dev.set_output(True)
@@ -1584,7 +1730,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select calibration file",
-            os.path.join(DATA_DIR, "measurements"),
+            DATA_DIR,
             "CSV Files (*.csv);;All Files (*)",
         )
         if path:
@@ -1593,7 +1739,10 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
     def on_load_calib(self):
         path = self.calibPathEdit.text().strip()
         try:
-            if is_dual_wheel_calibration(path):
+            if is_hwp_nd_calibration(path):
+                data = load_hwp_nd_calibration(path)
+                self._load_hwp_nd_calibration(data)
+            elif is_dual_wheel_calibration(path):
                 data = load_dual_wheel_calibration(path)
                 self._load_dual_calibration(data)
             else:
@@ -1609,7 +1758,11 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self._calib_mode = "single"
         self._calib_data = data
         self._dual_calib_data = None
+        self._hwp_nd_calib_data = None
         self._dual_entries = []
+        for w in (self.ndWheelAngleLbl, self.ndWheelAngleCombo,
+                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpMaxSpin):
+            w.setVisible(False)
         self._calib_unit = data.unit
         self._calib_scale = data.scale
         self._series_entries.clear()
@@ -1634,9 +1787,13 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
     def _load_dual_calibration(self, data: DualWheelPowerData):
         self._calib_mode = "dual"
         self._dual_calib_data = data
+        self._hwp_nd_calib_data = None
         self._calib_data = None
         self._series_entries.clear()
         self._dual_entries = list(data.entries)
+        for w in (self.ndWheelAngleLbl, self.ndWheelAngleCombo,
+                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpMaxSpin):
+            w.setVisible(False)
         self._calib_unit = data.unit
         self._calib_scale = data.scale
 
@@ -1652,9 +1809,79 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self._reset_sweep_data()
         self._update_series_info()
 
+    def _load_hwp_nd_calibration(self, data: HWPNDCalibData) -> None:
+        self._calib_mode = "hwp_nd"
+        self._hwp_nd_calib_data = data
+        self._dual_calib_data = None
+        self._calib_data = None
+        self._series_entries.clear()
+
+        # Populate ND angle selector
+        self.ndWheelAngleCombo.blockSignals(True)
+        self.ndWheelAngleCombo.clear()
+        for a in data.nd_angles:
+            self.ndWheelAngleCombo.addItem(f"{a:.2f}°")
+        self.ndWheelAngleCombo.blockSignals(False)
+        # Set HWP angle limits to full range of measured angles
+        if data.hwp_angles:
+            lo, hi = min(data.hwp_angles), max(data.hwp_angles)
+            self.hwpMinSpin.blockSignals(True)
+            self.hwpMaxSpin.blockSignals(True)
+            self.hwpMinSpin.setValue(lo)
+            self.hwpMaxSpin.setValue(hi)
+            self.hwpMinSpin.blockSignals(False)
+            self.hwpMaxSpin.blockSignals(False)
+
+        for w in (self.ndWheelAngleLbl, self.ndWheelAngleCombo,
+                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpMaxSpin):
+            w.setVisible(True)
+
+        self.seriesCombo.blockSignals(True)
+        self.seriesCombo.clear()
+        self.seriesCombo.addItem("hwp_nd")
+        self.seriesCombo.setCurrentIndex(0)
+        self.seriesCombo.blockSignals(False)
+
+        self.calibModeLbl.setText(
+            f"Mode: HWP+ND  |  {len(data.hwp_angles)} HWP steps"
+            + (f", {len(data.nd_angles)} ND angles" if data.nd_angles else "")
+        )
+
+        # Compute entries for first ND angle (or default to first)
+        self._apply_hwp_nd_angle()
+
+    def _on_hwp_nd_angle_changed(self) -> None:
+        if self._calib_mode == "hwp_nd":
+            self._apply_hwp_nd_angle()
+
+    def _apply_hwp_nd_angle(self) -> None:
+        data = self._hwp_nd_calib_data
+        if data is None:
+            return
+        idx = self.ndWheelAngleCombo.currentIndex()
+        if idx < 0:
+            return
+        nd_angle = data.nd_angles[idx] if data.nd_angles else 0.0
+        entries, unit, scale = compute_hwp_nd_entries(data, nd_angle)
+
+        # Apply HWP angle range filter
+        lo = self.hwpMinSpin.value()
+        hi = self.hwpMaxSpin.value()
+        entries = [e for e in entries if lo - 1e-9 <= e.a_deg <= hi + 1e-9]
+
+        self._dual_entries = entries
+        self._calib_unit = unit
+        self._calib_scale = scale
+
+        self._build_power_display()
+        self._total_entries = len(entries)
+        self._reset_sweep_data()
+        self._update_series_info()
+        self._sync_controls()
+
     def _build_power_display(self):
         self._power_display.clear()
-        if self._calib_mode == "dual":
+        if self._calib_mode in ("dual", "hwp_nd"):
             if not self._dual_entries:
                 return
             for entry in self._dual_entries:
@@ -1679,9 +1906,10 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self._update_power_slider()
 
     def _update_series_info(self):
-        if self._calib_mode == "dual":
+        if self._calib_mode in ("dual", "hwp_nd"):
             n = len(self._dual_entries)
-            self.seriesInfoLbl.setText(f"dual_wheel ({n} entries)")
+            label = "hwp_nd" if self._calib_mode == "hwp_nd" else "dual_wheel"
+            self.seriesInfoLbl.setText(f"{label} ({n} entries)")
             return
         series = self.seriesCombo.currentText().strip()
         n = len(self._series_entries.get(series, []))
@@ -1788,6 +2016,11 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             self._readout_rate_label = info.get("rate_label") or self._readout_rate_label
             self._preamp_gain_label = info.get("gain_label") or self._preamp_gain_label
             self._output_amp_label = info.get("amp_label") or self._output_amp_label
+            rate_label = info.get("rate_label")
+            if rate_label:
+                self.readoutRateCombo.blockSignals(True)
+                self.readoutRateCombo.setCurrentText(str(rate_label))
+                self.readoutRateCombo.blockSignals(False)
 
         self._refresh_amp_choices()
         self._apply_amp_settings()
@@ -1882,7 +2115,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
                 self.backGateStatusLbl.setText(status)
         self._sync_controls()
 
-    def _start_gate_ramp(self, which: str) -> None:
+    def _start_gate_ramp(self, which: str, target_v: Optional[float] = None) -> None:
         dev = self.front_dev if which == "front" else self.back_dev
         if dev is None:
             if self._gate_auto_reconnect_armed:
@@ -1892,7 +2125,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Gate", f"{which} gate not connected.")
             return
 
-        vset = float(self.frontVsetSpin.value() if which == "front" else self.backVsetSpin.value())
+        vset = target_v if target_v is not None else float(self.frontVsetSpin.value() if which == "front" else self.backVsetSpin.value())
         icomp_nA = float(self.frontIcompSpin.value() if which == "front" else self.backIcompSpin.value())
         icomp_a = icomp_nA * 1e-9
 
@@ -1915,6 +2148,19 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
 
         thread.start()
         self._sync_controls()
+
+    def _update_vend_labels(self) -> None:
+        n = int(self.sweepStepsSpin.value())
+        front_end = float(self.frontV0Spin.value()) + (n - 1) * float(self.frontStepSpin.value())
+        back_end = float(self.backV0Spin.value()) + (n - 1) * float(self.backStepSpin.value())
+        self.frontVendLbl.setText(f"End: {front_end:.6g} V")
+        self.backVendLbl.setText(f"End: {back_end:.6g} V")
+
+    def on_home_both_gates(self):
+        if self.front_dev is not None:
+            self._start_gate_ramp("front", target_v=0.0)
+        if self.back_dev is not None:
+            self._start_gate_ramp("back", target_v=0.0)
 
     def on_front_apply(self):
         self._start_gate_ramp("front")
@@ -2075,12 +2321,32 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             if mode in ("back", "dual") and not _check_v_limits(back_v0, back_step, nsteps, "Back gate"):
                 return
 
+        self._angle_list_mode = sweep_power and self.angleListChk.isChecked()
+
         plan = []
         entries: List[PowerCalibEntry] = []
-        if sweep_power:
-            if self._calib_mode == "dual":
-                if self._dual_calib_data is None:
-                    QtWidgets.QMessageBox.warning(self, "Sweep", "Load a dual-wheel calibration file first.")
+        if sweep_power and self._angle_list_mode:
+            angles = self._parse_angle_list()
+            if not angles:
+                QtWidgets.QMessageBox.warning(self, "Sweep", "Enter at least one angle in the angle list.")
+                return
+            if self.stage is None:
+                QtWidgets.QMessageBox.warning(self, "Sweep", "Stage A must be connected for angle list sweep.")
+                return
+            for angle in angles:
+                a_label = f"{angle:.3f}".replace(".", "p").replace("-", "m")
+                base = f"PL_A{a_label}deg"
+                entry = _types.SimpleNamespace(position_deg=angle, power_w=None, series="angle_list")
+                plan.append({"entry": entry, "base": base})
+            # use angles as pseudo-power keys for map display
+            self._power_target_counts = {a: 1 for a in angles}
+            self._power_done_counts = {a: 0 for a in angles}
+            self._total_entries = len(angles)
+            self._power_view_keys = list(angles)
+        elif sweep_power:
+            if self._calib_mode in ("dual", "hwp_nd"):
+                if not self._dual_entries:
+                    QtWidgets.QMessageBox.warning(self, "Sweep", "Load a calibration file first.")
                     return
                 if self.stage is None or self.stage_b is None:
                     QtWidgets.QMessageBox.warning(self, "Sweep", "Both stages must be connected for dual sweep.")
@@ -2122,15 +2388,16 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             plan = [{"entry": None, "base": "PL_manual"}]
             self._power_view_keys = [0.0]
 
-        self._power_target_counts.clear()
-        if sweep_power:
-            for entry in entries:
-                key = power_key(entry.power_w, scale=self._calib_scale)
-                self._power_target_counts[key] = self._power_target_counts.get(key, 0) + 1
-        self._power_done_counts = {k: 0 for k in self._power_target_counts}
-        self._total_entries = len(entries) if sweep_power else 0
-        if sweep_power:
-            self._power_view_keys = sorted(self._power_target_counts.keys())
+        if not self._angle_list_mode:
+            self._power_target_counts.clear()
+            if sweep_power:
+                for entry in entries:
+                    key = power_key(entry.power_w, scale=self._calib_scale)
+                    self._power_target_counts[key] = self._power_target_counts.get(key, 0) + 1
+            self._power_done_counts = {k: 0 for k in self._power_target_counts}
+            self._total_entries = len(entries) if sweep_power else 0
+            if sweep_power:
+                self._power_view_keys = sorted(self._power_target_counts.keys())
 
 
         self._voltage_keys = []
@@ -2199,8 +2466,10 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             settle_ms=float(SWEEP_SETTLE_MS),
             zero_v_eps=float(ZERO_V_EPS),
             zero_v_extra_settle_ms=float(ZERO_V_EXTRA_SETTLE_MS),
-            zero_v_dummy_frames=int(ZERO_V_DUMMY_FRAMES),
             save_dir=self._save_dir,
+            readout_rate=self._readout_rate_label,
+            preamp_gain=self._preamp_gain_label,
+            output_amp=self._output_amp_label,
         )
         self._sweep_thread.frame_ready.connect(self.on_sweep_frame)
         self._sweep_thread.vi_ready.connect(self.on_sweep_vi)
@@ -2247,6 +2516,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         except Exception:
             pass
         self._live_active = False
+        self._aborting = True
         self._set_busy(False)
         self.statusBar().showMessage("Aborted")
 
@@ -2329,7 +2599,10 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         power_key_val = 0.0
         if entry is not None:
             try:
-                power_key_val = power_key(entry.power_w, scale=self._calib_scale)
+                if self._angle_list_mode and hasattr(entry, "position_deg"):
+                    power_key_val = float(entry.position_deg)
+                else:
+                    power_key_val = power_key(entry.power_w, scale=self._calib_scale)
             except Exception:
                 power_key_val = 0.0
 
@@ -2359,7 +2632,10 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         if entry is None:
             return
 
-        key = power_key(entry.power_w, scale=self._calib_scale)
+        if self._angle_list_mode and hasattr(entry, "position_deg"):
+            key = float(entry.position_deg)
+        else:
+            key = power_key(entry.power_w, scale=self._calib_scale)
         self._taken_entries.add(self._entry_key(entry))
         count = self._power_done_counts.get(key, 0) + 1
         self._power_done_counts[key] = count
@@ -2370,6 +2646,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             self._write_session_metadata()
 
     def on_sweep_done(self, status: str):
+        self._aborting = False
         self._set_busy(False)
         self._sweep_thread = None
         if status == "ok":
@@ -2385,7 +2662,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
     # Image handling
     # -----------------
     def _prepare_display_image(self, raw):
-        disp = np.flipud(np.asarray(raw))
+        disp = np.fliplr(np.flipud(np.asarray(raw)))
         h, w = disp.shape
         top = max(0, min(self._crop_top, h - 1))
         bottom = max(0, min(self._crop_bottom, h - 1))
@@ -2669,15 +2946,16 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             y1 = float(width)
             ylabel = "Pixel"
 
-        title = "Linecut vs Power"
+        x_label = "Stage A angle (°)" if self._angle_list_mode else (f"Power ({self._calib_unit})" if self._calib_unit else "Power")
+        title = f"Linecut vs {x_label.split(' (')[0]}"
         vlabel = self._voltage_label_for_key(voltage_key)
         if vlabel and vlabel != "--":
-            title = f"Linecut vs Power at {vlabel}"
+            title = f"{title} at {vlabel}"
 
         self.map_artist.set_data(data)
         self.map_artist.set_extent((pmin, pmax, y0, y1))
         self.ax_map.set_title(title)
-        self.ax_map.set_xlabel(f"Power ({self._calib_unit})" if self._calib_unit else "Power")
+        self.ax_map.set_xlabel(x_label)
         self.ax_map.set_ylabel(ylabel)
         self._apply_map_clim(data, self.map_artist, self.mapCminEdit, self.mapCmaxEdit)
         self.canvas_map.draw_idle()

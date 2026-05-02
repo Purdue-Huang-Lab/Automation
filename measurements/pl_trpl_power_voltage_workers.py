@@ -134,7 +134,6 @@ class PowerVoltageSweepThread(QtCore.QThread):
         settle_ms: float,
         zero_v_eps: float,
         zero_v_extra_settle_ms: float,
-        zero_v_dummy_frames: int,
         save_dir: Optional[str],
         tcspc_host: str,
         tcspc_port: int,
@@ -170,7 +169,7 @@ class PowerVoltageSweepThread(QtCore.QThread):
         self.settle_ms = float(settle_ms)
         self.zero_v_eps = float(zero_v_eps)
         self.zero_v_extra_settle_ms = float(zero_v_extra_settle_ms)
-        self.zero_v_dummy_frames = int(zero_v_dummy_frames)
+
         self.save_dir = save_dir
         self.tcspc_host = str(tcspc_host)
         self.tcspc_port = int(tcspc_port)
@@ -408,15 +407,6 @@ class PowerVoltageSweepThread(QtCore.QThread):
                     pass
             return None, f"error: acquire failed: {err}"
 
-    def _discard_frames(self, count: int):
-        for idx in range(int(count)):
-            if self._stop or self._gate_controller.is_aborted():
-                return "aborted"
-            self.status.emit(f"Discarding dummy frame {idx + 1}/{count}")
-            _, err = self._grab_frame()
-            if err:
-                return err
-        return None
 
     def _is_zero_step(self, v_front: Optional[float], v_back: Optional[float]) -> bool:
         eps = abs(float(self.zero_v_eps))
@@ -561,15 +551,6 @@ class PowerVoltageSweepThread(QtCore.QThread):
                     if self._is_zero_step(v_front, v_back):
                         if self.zero_v_extra_settle_ms > 0:
                             time.sleep(max(0.0, self.zero_v_extra_settle_ms / 1000.0))
-                        if self.zero_v_dummy_frames > 0:
-                            err = self._discard_frames(self.zero_v_dummy_frames)
-                            if err:
-                                if err == "aborted":
-                                    self.done.emit("aborted")
-                                else:
-                                    self.status.emit(err)
-                                    self.done.emit(err)
-                                return
 
                     try:
                         self._check_trip(i_read_f, self.front_icomp_a, "Front")
