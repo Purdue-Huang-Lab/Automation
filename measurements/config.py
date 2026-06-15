@@ -17,7 +17,7 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 # AUTOMATION_DATA_DIR environment variable, e.g. in a .env file or shell profile.
 DATA_DIR = os.environ.get(
     "AUTOMATION_DATA_DIR",
-    r"C:\Data\Minxue\260402gatedtrilayer",
+    r"TMDC Gated\260402gatedtrilayer",
 )
 
 DEFAULT_STAGE_SERIAL = "27600825"

@@ -23,7 +23,7 @@ os.environ.setdefault("PYQTGRAPH_QT_LIB", "PyQt5")
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 try:
     from scipy.signal import savgol_filter as _savgol
@@ -1273,8 +1273,8 @@ class MapPlotWidget(QtWidgets.QGroupBox):
         # Horizontal selection line — draggable, selects y/energy row
         self._hline = pg.InfiniteLine(
             angle=0, movable=True,
-            pen=pg.mkPen("w", width=0.8),
-            hoverPen=pg.mkPen("w", width=1.5),
+            pen=pg.mkPen("k", width=0.8),
+            hoverPen=pg.mkPen("k", width=1.5),
         )
         self._mapPlot.addItem(self._hline)
         self._hline.sigPositionChangeFinished.connect(self._on_hline_moved)
@@ -1717,6 +1717,14 @@ class PLViewerV2(QtWidgets.QMainWindow):
         self.fixedLbl = QtWidgets.QLabel("--")
         slider_grid.addWidget(self.fixedLbl, 1, 4)
 
+        self.saveGifBtn = QtWidgets.QPushButton("Save GIF…")
+        self.saveGifBtn.setFixedWidth(110)
+        self.saveGifBtn.setToolTip(
+            "Animate the linecut colormap over all values of the fixed axis\n"
+            "and save as an animated GIF (requires Pillow)."
+        )
+        slider_grid.addWidget(self.saveGifBtn, 2, 0, 1, 2)
+
         right.addLayout(slider_grid)
 
         # Compact misc grid — 4 rows
@@ -1836,6 +1844,7 @@ class PLViewerV2(QtWidgets.QMainWindow):
         self.dipSmoothSpin.valueChanged.connect(lambda _: self._on_dip_smooth_changed())
         self.lockAxesCheck.toggled.connect(self._on_lock_axes_toggled)
         self.loadAngleCalibBtn.clicked.connect(self._on_load_angle_calib)
+        self.saveGifBtn.clicked.connect(self._on_save_gif)
         # liveView signals connected later in _build_ui() after liveView is created
 
         return box
@@ -2731,6 +2740,138 @@ class PLViewerV2(QtWidgets.QMainWindow):
                                      x_smooth=fit.get("x_smooth"),
                                      y_smooth=fit.get("y_smooth"))
 
+    # ── GIF export ────────────────────────────────────────────────────
+
+    def _on_save_gif(self) -> None:
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            QtWidgets.QMessageBox.critical(
+                self, "Missing dependency",
+                "Pillow is required to save GIFs.\n"
+                "Install it with:  pip install Pillow"
+            )
+            return
+
+        import io as _io
+
+        ch = self._primary_ch()
+        if not ch.has_data:
+            QtWidgets.QMessageBox.warning(self, "Save GIF", "No data loaded.")
+            return
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save animated GIF", "", "GIF (*.gif)"
+        )
+        if not path:
+            return
+
+        fps, ok = QtWidgets.QInputDialog.getDouble(
+            self, "GIF Settings", "Frames per second:", 2.0, 0.1, 30.0, 1
+        )
+        if not ok:
+            return
+
+        if self._current_mode == self.MODE_GATE:
+            fixed_values = ch.powers
+            def _fmt(v: float) -> str:
+                if ch.angle_mode:
+                    if ch._angle_calib_angles is not None:
+                        pw = float(np.interp(v, ch._angle_calib_angles,
+                                             ch._angle_calib_powers_w) * 1e6)
+                        return f"P = {pw:.4g} µW"
+                    return f"A = {v:.4g}°"
+                return f"P = {v * 1e6:.4g} µW"
+        else:
+            fixed_values = ch.gates
+            def _fmt(v: float) -> str:
+                return f"Vf = {v:.4g} V"
+
+        n = fixed_values.size
+        if n == 0:
+            QtWidgets.QMessageBox.warning(self, "Save GIF", "No fixed-axis values.")
+            return
+
+        try:
+            font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 15)
+        except Exception:
+            font = ImageFont.load_default()
+
+        original_fixed = self._fixed_idx
+        progress = QtWidgets.QProgressDialog("Generating GIF…", "Cancel", 0, n, self)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.show()
+
+        frames: List[Image.Image] = []
+        try:
+            for i in range(n):
+                if progress.wasCanceled():
+                    break
+                progress.setValue(i)
+                QtWidgets.QApplication.processEvents()
+
+                self._fixed_idx = i
+                self._update_maps()
+                QtWidgets.QApplication.processEvents()
+
+                # Grab the full graphics widget then crop to the colormap PlotItem only
+                glw = self.mapView._glw
+                full_pixmap = glw.grab()
+                scene_rect = self.mapView._mapPlot.sceneBoundingRect()
+                tl = glw.mapFromScene(scene_rect.topLeft())
+                br = glw.mapFromScene(scene_rect.bottomRight())
+                crop_rect = QtCore.QRect(
+                    max(0, int(tl.x())), max(0, int(tl.y())),
+                    max(1, int(br.x() - tl.x())), max(1, int(br.y() - tl.y()))
+                )
+                pixmap = full_pixmap.copy(crop_rect)
+
+                buf = QtCore.QBuffer()
+                buf.open(QtCore.QIODevice.WriteOnly)
+                pixmap.save(buf, "PNG")
+                buf.close()
+                pil_img = Image.open(_io.BytesIO(bytes(buf.data()))).convert("RGB")
+
+                # Text overlay in top-right corner
+                label = _fmt(float(fixed_values[i]))
+                draw = ImageDraw.Draw(pil_img)
+                img_w = pil_img.width
+                pad, margin = 3, 8
+                if hasattr(draw, "textbbox"):
+                    bb = draw.textbbox((0, 0), label, font=font)
+                    tw, th = bb[2] - bb[0], bb[3] - bb[1]
+                    x0 = img_w - tw - margin - pad * 2
+                    y0 = margin
+                    draw.rectangle(
+                        [x0 - pad, y0 - pad, x0 + tw + pad, y0 + th + pad],
+                        fill="white"
+                    )
+                else:
+                    tw = len(label) * 9
+                    x0 = img_w - tw - margin - pad * 2
+                    y0 = margin
+                    draw.rectangle([x0 - pad, y0 - pad, x0 + tw + pad, y0 + 20], fill="white")
+                draw.text((x0, y0), label, fill="black", font=font)
+
+                frames.append(pil_img)
+        finally:
+            progress.close()
+            self._fixed_idx = original_fixed
+            self._update_maps()
+
+        if not frames:
+            return
+
+        duration_ms = max(1, int(1000.0 / fps))
+        frames[0].save(
+            path, save_all=True, append_images=frames[1:],
+            loop=0, duration=duration_ms, optimize=False
+        )
+        QtWidgets.QMessageBox.information(
+            self, "GIF Saved",
+            f"Saved {len(frames)} frame(s) to:\n{path}"
+        )
+
 
 # ── tiny helper ───────────────────────────────────────────────────────
 
@@ -2744,7 +2885,9 @@ def _bold_label(text: str) -> QtWidgets.QLabel:
 # ══════════════════════════════════════════════════════════════════════
 
 def main() -> None:
+    pg.setConfigOptions(background="w", foreground="k", useOpenGL=False)
     app = QtWidgets.QApplication(sys.argv)
+    app.setFont(QtGui.QFont("Arial", 9))
     win = PLViewerV2()
     win.show()
     sys.exit(app.exec_())

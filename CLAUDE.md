@@ -69,10 +69,14 @@ Use `pyqtgraph` for all live and interactive plots. Never use `matplotlib` in a 
 **Required initialization at the top of every entry-point file**, before any widget is created:
 
 ```python
-from PyQt5 import QtWidgets          # PyQt5 must come before pyqtgraph
+from PyQt5 import QtWidgets  # PyQt5 must come before pyqtgraph
 import pyqtgraph as pg
-pg.setConfigOptions(imageAxisOrder='row-major', background='w', foreground='k')
+pg.setConfigOptions(imageAxisOrder='row-major', background='w', foreground='k', useOpenGL=False)
 ```
+
+HiDPI fix is handled globally by `.venv/Lib/site-packages/sitecustomize.py` — do not add DPI env vars or `AA_EnableHighDpiScaling` to entry-point files.
+
+**Root cause**: `QScreen::devicePixelRatio()` returns the fractional display scale (e.g. 1.75 at 175%) regardless of Qt env vars. PyQtGraph reads it directly when allocating its graphics backing store, causing axes (logical pixels) and image items (physical pixels) to misalign. **Fix**: `sitecustomize.py` calls `ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_ssize_t(-1))` (`DPI_AWARENESS_CONTEXT_UNAWARE`) before Qt is imported, making Windows report DPR=1.0 and handle scaling via bitmap upscale. Combined with `QT_ENABLE_HIGHDPI_SCALING=0` and `QT_SCALE_FACTOR=1`. The newer `SetProcessDpiAwarenessContext` (Win10 1607+) is used instead of the older `shcore.SetProcessDpiAwareness` because the latter returns `E_ACCESSDENIED` silently when the VS Code launcher or Python launcher has already set a DPI awareness level — the newer API succeeds in that case. **If the venv is rebuilt, recreate `sitecustomize.py` from this note.**
 
 For `PlotWidget` instances created later, also set axis pens explicitly so labels stay black on the white background:
 
