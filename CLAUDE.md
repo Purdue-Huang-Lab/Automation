@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Repository
+
+- **GitHub**: [Purdue-Huang-Lab/Automation](https://github.com/Purdue-Huang-Lab/Automation) (transferred from `moonriver366/Automation` on 2026-06-16)
+- **History note**: All commit authorship was unified to `moonriver366 <wang6560@purdue.edu>` on 2026-06-16 via `git filter-repo`. Any clone made before that date has stale SHAs — re-clone from the org URL above.
+
 ## Environment
 
 - **Python**: 3.10 (strictly required — hardware SDKs are version-pinned)
