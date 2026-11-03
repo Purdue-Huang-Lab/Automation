@@ -59,6 +59,17 @@ Submodule measurements (`pump_probe_gate_dep/`, `trpl_gate_power_dep/`) follow t
 
 Offline data viewers (`*_viewer*.py`) load `.csv`/`.txt`/`.npy` files from disk and do no hardware access.
 
+## Data Processing (`data processing/`)
+
+Standalone offline analysis viewers — large single-file pyqtgraph apps that load measurement data from disk and do **no** hardware access. They follow the same pyqtgraph conventions as v2 GUIs (`imageAxisOrder='row-major'`, white background, black axis pens; the DPI-awareness fix is applied inline at the top of each file rather than via `sitecustomize.py`, since these run outside the venv's site-packages hook in some setups). Each is launched directly: `python "data processing/<script>.py" [folder]`.
+
+| Script | Analyzes |
+|--------|----------|
+| `260623_mose2_polaron_pl.py` | MoSe₂ polaron PL power/gate-dependence viewer (v2). Per-row baseline subtraction over a chosen λ range, data − substrate, LH/RH/LH−RH polarization modes. Carries a single-spot sample calibration mapping front-gate V → E_F (meV) and (gate, power) → n_ex/η, shown as calibrated top x-axes on the 1D trend plots. |
+| `polaron_ta_viewer.py` | Gate/power-dependent transient absorption. Tracks two spectral features (feature intensity = −min ΔT/T = max bleach) over time delay; 2×2 panel of spectrum, spatial profile, cursor dynamics, and both features' dynamics. |
+| `polarization_dep_ta_qiushi.py` | Spin/polarization TA subtraction: spin contrast = (Left − Right)/(Left + Right + eps) with denominator masking. PySide6/PyQt5 fallback. |
+| `tam_viewer_pg_qiushi.py` | TAM (transient absorption microscopy) viewer — fast single-file pyqtgraph replacement for the Matplotlib TAM GUI. Loads sum/para `.txt` frames, uniform-filter smoothing, Gaussian fits. |
+
 ### 3. Launch Scripts (`run_*.ps1`)
 
 Every script activates the venv and calls either `python -m module.gui_entry` (simple) or `python path/to/gui_integrated.py` (submodule). They are the canonical way to start any GUI.

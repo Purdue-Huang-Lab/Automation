@@ -758,8 +758,20 @@ def _corrected_image(
     sub_img:  Optional[np.ndarray], sub_wl: Optional[np.ndarray],
     *,
     use_baseline: bool, lo: float, hi: float,
-    use_sub: bool,
+    use_sub: bool, contrast: bool = False,
 ) -> np.ndarray:
+    """Combine a data frame with its substrate.
+
+    contrast=False → plain difference   R − R_sub
+    contrast=True  → reflectance contrast (R − R_sub) / R_sub
+
+    Both branches share the same numerator, so the RC numerator is exactly the
+    difference the other mode shows; RC just divides it by the (processed)
+    substrate. Pixels where the substrate is ~0 are set to NaN (RC undefined).
+    Note: with baseline correction ON, the denominator is the baseline-subtracted
+    substrate — keep the baseline window off the signal, or turn baseline OFF, so
+    the denominator stays the true substrate reflectance.
+    """
     d = np.array(data_img, dtype=float)
     if use_baseline and data_wl is not None:
         d = _baseline_correct(d, data_wl, lo, hi)
@@ -768,7 +780,15 @@ def _corrected_image(
         if use_baseline and sub_wl is not None:
             s = _baseline_correct(s, sub_wl, lo, hi)
         if s.shape == d.shape:
-            d = d - s
+            if contrast:
+                scale = float(np.nanmax(np.abs(s))) if np.isfinite(s).any() else 0.0
+                floor = max(1e-12, 1e-6 * scale)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    rc = (d - s) / s
+                rc[np.abs(s) < floor] = np.nan
+                d = rc
+            else:
+                d = d - s
     return d
 
 
@@ -836,8 +856,22 @@ def _load_frames(data_dir: Path) -> List[PLFrame]:
         except Exception:
             continue
         p_m  = _parse_float(meta, "power_w")
-        vf_m = _parse_float(meta, "front_v_set")
-        vb_m = _parse_float(meta, "back_v_set")
+        # Gate voltage from metadata: prefer the *commanded setpoint*
+        # (front_vset / back_vset) over the *measured readback*
+        # (front_v_set / back_v_set). The readback carries µV-level noise, so at
+        # a nominally-fixed gate every frame reads a slightly different value; a
+        # power-only sweep (no Vf/Vb token in the filename, so this fallback is
+        # what supplies the gate) then gets one distinct gate key per frame and
+        # is misread as a multi-point gate dependence. The setpoint is exact
+        # (e.g. 0.0 V), collapsing such a sweep to a single gate. Real gate
+        # sweeps embed clean Vf/Vb tokens in the filename and use those
+        # (vf_n / vb_n) in preference to this metadata, so they are unaffected.
+        vf_m = _parse_float(meta, "front_vset")
+        if vf_m is None:
+            vf_m = _parse_float(meta, "front_v_set")
+        vb_m = _parse_float(meta, "back_vset")
+        if vb_m is None:
+            vb_m = _parse_float(meta, "back_v_set")
         p_n, vf_n, vb_n = _parse_from_name(path.name)
         angle_n = _parse_angle_from_name(path.name)
         true_power = p_n if p_n is not None else p_m
@@ -1669,6 +1703,19 @@ class PLViewerV2(QtWidgets.QMainWindow):
         cl.addWidget(self.bgHiSpin)
         self.subCheck = QtWidgets.QCheckBox("Subtract substrate")
         cl.addWidget(self.subCheck)
+        self.subModeCombo = QtWidgets.QComboBox()
+        self.subModeCombo.addItem("(R−R_sub)/R_sub  (contrast)", "contrast")
+        self.subModeCombo.addItem("R−R_sub  (difference)",       "difference")
+        self.subModeCombo.setCurrentIndex(0)   # default: reflectance contrast
+        self.subModeCombo.setFixedWidth(200)
+        self.subModeCombo.setEnabled(False)    # only relevant when subtract is on
+        self.subModeCombo.setToolTip(
+            "How to combine data with substrate when 'Subtract substrate' is on:\n"
+            "  • contrast   → reflectance contrast  (R − R_sub) / R_sub\n"
+            "  • difference → plain  R − R_sub\n"
+            "Tip: for reflectance-contrast data, turn Baseline correction OFF so the\n"
+            "denominator is the true substrate reflectance.")
+        cl.addWidget(self.subModeCombo)
         self.lockAxesCheck = QtWidgets.QCheckBox("Lock axes")
         self.lockAxesCheck.setToolTip(
             "Freeze all axis ranges and colour scales so switching\n"
@@ -1827,6 +1874,8 @@ class PLViewerV2(QtWidgets.QMainWindow):
         self.bgLoSpin.valueChanged.connect(lambda _: self._clear_caches_and_refresh())
         self.bgHiSpin.valueChanged.connect(lambda _: self._clear_caches_and_refresh())
         self.subCheck.toggled.connect(lambda _: self._refresh_all())
+        self.subCheck.toggled.connect(self.subModeCombo.setEnabled)
+        self.subModeCombo.currentIndexChanged.connect(lambda _: self._refresh_all())
         self.modeCombo.currentTextChanged.connect(self._on_mode_changed)
         self.mainSlider.valueChanged.connect(self._on_main_changed)
         self.fixedSlider.valueChanged.connect(self._on_fixed_changed)
@@ -2007,16 +2056,27 @@ class PLViewerV2(QtWidgets.QMainWindow):
         if not chosen:
             return
         folder = Path(chosen)
+        if not self.load_data_folder(folder, key=key):
+            QtWidgets.QMessageBox.warning(self, "No data", f"No .asc files found in:\n{folder}")
+
+    def load_data_folder(self, folder, key: str = "") -> bool:
+        """Load a data folder into channel ``key`` without a file dialog.
+
+        Returns True on success, False if no ``.asc`` frames were found. Shared
+        by the Browse button and the optional command-line folder argument.
+        """
+        folder = Path(folder)
         frames = _load_frames(folder)
         if not frames:
-            QtWidgets.QMessageBox.warning(self, "No data", f"No .asc files found in:\n{folder}")
-            return
+            return False
+        ch = self._ch[key]
         ch.clear_cache()
         ch.data_dir = folder
         _build_channel(ch, frames)
         self._update_data_label(key)
         self._reconfigure_sliders()
         self._refresh_all()
+        return True
 
     def _browse_sub_file(self, key: str) -> None:
         ch = self._ch[key]
@@ -2257,6 +2317,21 @@ class PLViewerV2(QtWidgets.QMainWindow):
             self.mainSlider.setRange(0, 0)
             self.fixedSlider.setRange(0, 0)
             return
+        # Resolve the mode FIRST — auto-selecting the only viable axis when just
+        # one is available — so the slider ranges below are sized for the final
+        # mode. (Previously the ranges were set before this block could flip the
+        # mode, and because the combo signal is blocked nothing re-sized them:
+        # a gate-dependent set would switch to Gate mode but leave the main
+        # slider ranged over the single power, so the voltage axis — the main
+        # axis in Gate mode — could not be scrolled.)
+        if ch.can_gate_mode and not ch.can_power_mode:
+            self._current_mode = self.MODE_GATE
+        elif ch.can_power_mode and not ch.can_gate_mode:
+            self._current_mode = self.MODE_POWER
+        self.modeCombo.blockSignals(True)
+        self.modeCombo.setCurrentText(self._current_mode)
+        self.modeCombo.blockSignals(False)
+
         if self._current_mode == self.MODE_GATE:
             n_main  = ch.gates.size
             n_fixed = ch.powers.size
@@ -2273,19 +2348,6 @@ class PLViewerV2(QtWidgets.QMainWindow):
             setattr(self, attr, max(0, min(getattr(self, attr), max(0, n - 1))))
             slider.setValue(getattr(self, attr))
             slider.blockSignals(False)
-
-        # auto-select mode if only one is available
-        combo_was = self._current_mode
-        if ch.can_gate_mode and not ch.can_power_mode:
-            self._current_mode = self.MODE_GATE
-            self.modeCombo.blockSignals(True)
-            self.modeCombo.setCurrentText(self.MODE_GATE)
-            self.modeCombo.blockSignals(False)
-        elif ch.can_power_mode and not ch.can_gate_mode:
-            self._current_mode = self.MODE_POWER
-            self.modeCombo.blockSignals(True)
-            self.modeCombo.setCurrentText(self.MODE_POWER)
-            self.modeCombo.blockSignals(False)
 
     # ── Per-frame helpers ─────────────────────────────────────────────
 
@@ -2308,6 +2370,7 @@ class PLViewerV2(QtWidgets.QMainWindow):
         img, wl = self._get_cropped_raw(ch, fr)
         do_bl  = self.baselineCheck.isChecked()
         do_sub = self.subCheck.isChecked() and ch.has_substrate
+        contrast = self.subModeCombo.currentData() == "contrast"
         if not do_bl and not do_sub:
             return img, wl
         sub_fr = _ch_substrate_for(ch, fr) if do_sub else None
@@ -2327,6 +2390,7 @@ class PLViewerV2(QtWidgets.QMainWindow):
             img, wl, sub_img, sub_wl,
             use_baseline=do_bl, lo=lo, hi=hi,
             use_sub=do_sub and sub_img is not None,
+            contrast=contrast,
         )
         return corrected, wl
 
@@ -2890,6 +2954,11 @@ def main() -> None:
     app.setFont(QtGui.QFont("Arial", 9))
     win = PLViewerV2()
     win.show()
+    # Optional: pass a data folder on the command line to auto-load it.
+    for arg in sys.argv[1:]:
+        if Path(arg).is_dir():
+            win.load_data_folder(Path(arg))
+            break
     sys.exit(app.exec_())
 
 
