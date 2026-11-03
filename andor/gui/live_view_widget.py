@@ -198,14 +198,18 @@ class AndorLiveViewWidget(QtWidgets.QGroupBox):
         self._last_frame_full = raw
         self._last_raw_width = int(raw.shape[1])
         raw_crop = self._apply_crop(raw)
-        disp = np.fliplr(np.flipud(raw_crop))
+        # Only flip vertically (spatial axis). The horizontal axis is the
+        # dispersive/wavelength axis and is left in native detector order so it
+        # stays aligned with the wavelength calibration (wavelength increases
+        # left-to-right).
+        disp = np.flipud(raw_crop)
         disp8 = None
         if img8 is not None:
             try:
                 raw8 = np.asarray(img8)
                 self._last_frame8_full = raw8
                 raw8_crop = self._apply_crop(raw8)
-                disp8 = np.fliplr(np.flipud(raw8_crop))
+                disp8 = np.flipud(raw8_crop)
             except Exception:
                 disp8 = None
                 self._last_frame8_full = None
@@ -292,7 +296,7 @@ class AndorLiveViewWidget(QtWidgets.QGroupBox):
         return a[top:y2, left:x2]
 
     def _prepare_display_image(self, raw):
-        return np.fliplr(np.flipud(self._apply_crop(raw)))
+        return np.flipud(self._apply_crop(raw))
 
     def _update_cursor_overlays(self, h: int, w: int) -> None:
         if self._cursor_rc is None or self._last_frame_raw is None:
@@ -311,7 +315,7 @@ class AndorLiveViewWidget(QtWidgets.QGroupBox):
             self._crosshair_v.set_visible(False)
             return
 
-        x_raw = w - 1 - x  # display col x maps to physical col x_raw after fliplr
+        x_raw = x  # no horizontal flip: display col == physical (dispersive) col
         try:
             val = float(self._last_frame_raw[y_raw, x_raw])
             self.cursorLbl.setText(f"Cursor: (row, col) = {y}, {x}, I = {val:g}")
@@ -335,13 +339,15 @@ class AndorLiveViewWidget(QtWidgets.QGroupBox):
 
         if hcut is not None:
             x_axis = self._get_x_axis_data(w)
-            self.line_h.set_data(x_axis, hcut[::-1])  # reverse to match fliplr display
+            self.line_h.set_data(x_axis, hcut)  # native order: intensity aligns with wavelength axis
             self.ax_h.relim()
             self.ax_h.autoscale_view()
             if len(x_axis):
                 self.ax_h.set_xlim(float(x_axis[0]), float(x_axis[-1]))
         if vcut is not None:
-            self.line_v.set_data(vcut, np.arange(vcut.size))
+            # Reverse to match the vertically-flipped (flipud) image display, so
+            # the spatial profile lines up with the 2-D image row-for-row.
+            self.line_v.set_data(vcut[::-1], np.arange(vcut.size))
             self.ax_v.relim()
             self.ax_v.autoscale_view()
 

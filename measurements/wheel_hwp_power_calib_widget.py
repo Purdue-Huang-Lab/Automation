@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import os
+import time
 from datetime import datetime
 from typing import List, Optional
 
@@ -82,6 +83,13 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         self._running    = False
         self._sweep_type: Optional[str] = None   # "hwp" or "nd"
         self._queue_nd   = False                 # chain ND after HWP in "Run both"
+
+        # PM dark adjust — polled from the GUI thread (TLPM thread affinity)
+        self._zeroing       = False
+        self._zero_deadline = 0.0
+        self._zero_timer    = QtCore.QTimer(self)
+        self._zero_timer.setInterval(200)
+        self._zero_timer.timeout.connect(self._poll_pm_zero)
 
         # HWP sweep results
         self._hwp_angles: List[float] = []
@@ -266,6 +274,8 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         self._pmSetAvgBtn  = QtWidgets.QPushButton("Set"); self._pmSetAvgBtn.setFixedWidth(BTN_W)
         self._pmReadBtn    = QtWidgets.QPushButton("Read power"); self._pmReadBtn.setFixedWidth(BTN_W)
         self._pmReadLbl    = QtWidgets.QLabel("---")
+        self._pmZeroBtn    = QtWidgets.QPushButton("Zero"); self._pmZeroBtn.setFixedWidth(BTN_W)
+        self._pmZeroLbl    = QtWidgets.QLabel("not zeroed")
         mono = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
         self._pmReadLbl.setFont(mono)
 
@@ -277,11 +287,14 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         layout.addWidget(self._pmSetAvgBtn,               1, 2)
         layout.addWidget(self._pmReadBtn,                 2, 0)
         layout.addWidget(self._pmReadLbl,                 2, 1, 1, 2)
+        layout.addWidget(self._pmZeroBtn,                 3, 0)
+        layout.addWidget(self._pmZeroLbl,                 3, 1, 1, 2)
         layout.setColumnStretch(1, 1)
 
         self._pmSetWaveBtn.clicked.connect(self._pm_set_wavelength)
         self._pmSetAvgBtn.clicked.connect(self._pm_set_averaging)
         self._pmReadBtn.clicked.connect(self._pm_read_power)
+        self._pmZeroBtn.clicked.connect(self._pm_zero)
         return box
 
     # --- Sweep parameters box ---
@@ -668,6 +681,46 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
             self._pmReadLbl.setText("err")
             QtWidgets.QMessageBox.critical(self, "PM read", str(e))
 
+    def _pm_zero(self) -> None:
+        if self._pm is None or self._zeroing: return
+        reply = QtWidgets.QMessageBox.question(
+            self, "Zero power meter",
+            "Block all light to the sensor, then press OK to zero.",
+            QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel,
+        )
+        if reply != QtWidgets.QMessageBox.Ok: return
+        try:
+            self._pm.start_dark_adjust()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "PM zero", str(e))
+            return
+        self._zeroing       = True
+        self._zero_deadline = time.monotonic() + 30.0
+        self._pmZeroLbl.setText("zeroing…")
+        self._statusLbl.setText("Zeroing power meter…")
+        self._zero_timer.start()
+        self._sync_controls()
+
+    def _poll_pm_zero(self) -> None:
+        error = None
+        try:
+            if self._pm.is_dark_adjust_busy():
+                if time.monotonic() < self._zero_deadline: return
+                error = "Dark adjust timed out"
+        except Exception as e:
+            error = str(e)
+        self._zero_timer.stop()
+        self._zeroing = False
+        if error is None:
+            stamp = datetime.now().strftime("%H:%M:%S")
+            self._pmZeroLbl.setText(f"zeroed {stamp}")
+            self._statusLbl.setText("Power meter zeroed — unblock the beam.")
+        else:
+            self._pmZeroLbl.setText("zero failed")
+            self._statusLbl.setText(f"PM zero failed: {error}")
+            QtWidgets.QMessageBox.critical(self, "PM zero", error)
+        self._sync_controls()
+
     # ------------------------------------------------------------------ #
     # Position readout                                                     #
     # ------------------------------------------------------------------ #
@@ -691,7 +744,7 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         nd_ok  = self._nd_stage  is not None
         hwp_ok = self._hwp_stage is not None
         pm_ok  = self._pm        is not None
-        busy   = self._running
+        busy   = self._running or self._zeroing
         nd_moving  = self._nd_mover  is not None
         hwp_moving = self._hwp_mover is not None
 
@@ -712,12 +765,13 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         self._pmSetWaveBtn.setEnabled(pm_ok and not busy)
         self._pmSetAvgBtn.setEnabled(pm_ok and not busy)
         self._pmReadBtn.setEnabled(pm_ok and not busy)
+        self._pmZeroBtn.setEnabled(pm_ok and not busy)
 
         all_ready = nd_ok and hwp_ok and pm_ok
         self._runHwpBtn.setEnabled(all_ready and not busy)
         self._runNdBtn.setEnabled(all_ready and not busy)
         self._runBothBtn.setEnabled(all_ready and not busy)
-        self._stopBtn.setEnabled(busy)
+        self._stopBtn.setEnabled(self._running)
 
         has_data = bool(self._hwp_angles or self._nd_angles)
         self._saveBtn.setEnabled(has_data and not busy)
@@ -963,6 +1017,7 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
                 w.writerow([f"# PM averaging:   {self._pmAvgSpin.value()}"])
                 w.writerow([f"# Readings/step:  {self._nReadingsSpin.value()}"])
                 w.writerow([f"# Wavelength (nm):{self._pmWaveSpin.value()}"])
+                w.writerow([f"# PM zero:        {self._pmZeroLbl.text()}"])
 
                 if self._hwp_angles:
                     hwp_p = np.asarray(self._hwp_powers)

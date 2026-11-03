@@ -138,7 +138,7 @@ class Spad23TcspcClient:
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 9999,
+        port: int = 9998,
         timeout_s: float = 5.0,
         quiet_timeout_s: float = 0.05,
         recv_bytes: int = 2_097_152,

@@ -235,6 +235,14 @@ class RotationStage:
         except Exception:
             return None
 
+    def get_velocity(self) -> Optional[tuple]:
+        """(min velocity, acceleration, max velocity) in stage units, or None if unavailable."""
+        try:
+            min_v, acc, max_v = self._call(self._stage.get_velocity_parameters)
+            return float(min_v), float(acc), float(max_v)
+        except Exception:
+            return None
+
     def set_velocity(self, *, accel: Optional[float] = None, max_vel: Optional[float] = None) -> None:
         def _set():
             try:

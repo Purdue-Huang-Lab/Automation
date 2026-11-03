@@ -85,7 +85,7 @@ class Spad23CountClient:
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 9999,
+        port: int = 9998,
         timeout_s: float = 2.0,
         quiet_timeout_s: float = 0.05,
         pixel_limit_mcps: float = PIXEL_LIMIT_MCPS_23G,

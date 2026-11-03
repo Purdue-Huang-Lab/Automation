@@ -17,6 +17,7 @@ from .config import (
     STATUS_W,
     DEFAULT_ICOMP_NA,
     DEFAULT_SWEEP_ICOMP_NA,
+    LEAKAGE_V_DECIMALS,
     RAMP_STEP_V,
     RAMP_DWELL_S,
     SWEEP_SETTLE_MS,
@@ -24,17 +25,24 @@ from .config import (
     POLL_ERROR_LIMIT,
     POLL_TIMEOUT_MS,
 )
+from .leakage import LeakageRecorder
 from .plots import PlotWidget
 from .workers import RampThread, SingleSweepThread, HomeThread
 
 
 class DevicePanel(QtWidgets.QGroupBox):
-    def __init__(self, title: str, rm, default_resource: str, main_ref_callable):
+    def __init__(self, title: str, rm, default_resource: str, main_ref_callable, tag: str = ""):
         super().__init__(title)
         self.rm = rm
         self._get_main = main_ref_callable
+        self.tag = tag
+        self._base_title = title
 
         self.dev: Optional[KeithleySMU] = None
+
+        # Leakage test
+        self.leak = LeakageRecorder(decimals=LEAKAGE_V_DECIMALS)
+        self.leak_recording = False
 
         self.sweep_thread: Optional[SingleSweepThread] = None
         self.home_thread: Optional[HomeThread] = None
@@ -244,8 +252,39 @@ class DevicePanel(QtWidgets.QGroupBox):
             self.ireadVal.setText(f"{iA*1e9:.6g}")
             if plot:
                 self.plot.add_point(v, iA)
+                self._leak_record(v, iA)
         if status is not None:
             self.statusLbl.setText(status)
+
+    # ---- Leakage test ----
+
+    def _leak_record(self, v: float, iA: float) -> None:
+        """Bin one sample during a leakage test. GUI thread only.
+
+        Called from _set_readouts, which is the single choke point every V/I
+        value passes through -- including the ramp/home worker microsteps,
+        which is the whole point: polling is paused for the duration of every
+        ramp, so hooking the poll timer alone would miss the measurement.
+        """
+        if not self.leak_recording:
+            return
+        # A sweep is a separate experiment; its points must not merge in.
+        if self.sweeping:
+            return
+        # poll_once never consults outputChk, so after a software OC trip kills
+        # the output every further poll would feed zero-bias readings into the bins.
+        if not self.outputChk.isChecked():
+            return
+        if not (math.isfinite(v) and math.isfinite(iA)):
+            return
+
+        src = "ramp" if self.ramping else ("home" if self.homing else "poll")
+        if self.leak.add(v, iA):
+            self._get_main().write_leakage_row(self.tag, v, iA, src)
+
+    def set_leakage_recording(self, on: bool) -> None:
+        self.leak_recording = bool(on)
+        self.setTitle(self._base_title + ("  ● REC" if self.leak_recording else ""))
 
     def _sync_controls(self) -> None:
         if self._controls_locked:

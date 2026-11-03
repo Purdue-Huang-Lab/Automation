@@ -34,6 +34,10 @@ KEITHLEY_V_LIMIT = 210.0  # absolute max |V| enforced in wrapper
 VERIFY_TOL_FRACTION = 0.005   # 0.5% of setpoint
 VERIFY_TOL_ABS = 2e-3         # 2 mV floor
 VERIFY_ATTEMPTS = 6
+# No 2400 / 2450 sources more than ~1 A or 210 V: a larger reading is a reply out of step
+# (a late answer to a timed-out query read as the answer to the next one: V read as I, ...).
+I_PLAUSIBLE_A = 1.5
+V_PLAUSIBLE_V = 250.0
 VERIFY_SLEEP_S = 0.20
 
 # ramp defaults (your requested values)
@@ -50,6 +54,16 @@ DEFAULT_DRAIN_ERR_READS = 8
 
 class KeithleyError(RuntimeError):
     pass
+
+
+class SetpointError(KeithleyError):
+    """The output did not reach the setpoint after a ramp (e.g. held at the current compliance)."""
+
+    def __init__(self, msg: str, v_set: float, v_read: float, i_read: float):
+        super().__init__(msg)
+        self.v_set = float(v_set)
+        self.v_read = float(v_read)
+        self.i_read = float(i_read)
 
 
 class ComplianceTrip(RuntimeError):
@@ -260,7 +274,54 @@ class KeithleySMU:
         if self.inst is None:
             raise KeithleyError("Instrument not open")
         with self._io_lock:
-            return self.inst.query(cmd)
+            try:
+                return self.inst.query(cmd)
+            except Exception:
+                self.resync()  # a late reply would otherwise answer the next query
+                raise
+
+    def resync(self, timeout_s: float = 10.0) -> bool:
+        """Line the replies up again after a timeout or an implausible reading.
+
+        A query that timed out can still be answered later; that reply stays in the buffer and
+        becomes the answer to the next query, so every reading after it is shifted by one.
+        Clear the session, send *IDN? and read (discarding stale replies) until it comes back.
+        """
+        inst = self.inst
+        if inst is None:
+            return False
+        marker = (self.idn.split(",")[0].strip() if self.idn else "") or "KEITHLEY"
+        with self._io_lock:
+            prev_timeout = getattr(inst, "timeout", None)
+            try:
+                try:
+                    inst.clear()
+                except Exception:
+                    pass
+                inst.write("*IDN?")
+                t_end = time.monotonic() + float(timeout_s)
+                while True:
+                    left = t_end - time.monotonic()
+                    if left <= 0:
+                        return False
+                    try:
+                        inst.timeout = int(max(200, left * 1000))
+                        line = inst.read()
+                    except Exception:
+                        return False
+                    if marker.upper() in str(line).upper():
+                        return True
+            except Exception:
+                return False
+            finally:
+                try:
+                    if prev_timeout is not None:
+                        inst.timeout = prev_timeout
+                except Exception:
+                    pass
+
+    def _plausible(self, vi: "VIReading") -> bool:
+        return not (abs(vi.i) > I_PLAUSIBLE_A or abs(vi.v) > V_PLAUSIBLE_V)
 
     def _try_write(self, *cmds: str) -> bool:
         for cmd in cmds:
@@ -345,7 +406,18 @@ class KeithleySMU:
         Read both voltage and current.
         - 2400: single READ? returns "V,I,..." when configured with FORM:ELEM VOLT,CURR.
         - 2450: use separate measure queries.
+        An impossible reading (replies out of step) resynchronizes and reads again.
         """
+        vi = self._read_vi_once()
+        if self._plausible(vi):
+            return vi
+        self.resync()
+        vi = self._read_vi_once()
+        if not self._plausible(vi):
+            raise KeithleyError(f"Implausible reading V={vi.v:.6g} V, I={vi.i:.6g} A (replies out of step)")
+        return vi
+
+    def _read_vi_once(self) -> VIReading:
         if self.is_2400:
             ans = self.query("READ?").strip()
             parts = [p.strip() for p in ans.split(",")]
@@ -376,16 +448,57 @@ class KeithleySMU:
                     parts = [p.strip() for p in ans.split(",")]
                     v = float(parts[0]) if len(parts) >= 1 and parts[0] else float("nan")
                     i = float(parts[1]) if len(parts) >= 2 and parts[1] else float("nan")
-                    return VIReading(v=v, i=i)
-                v = float(inst.query(":MEAS:VOLT?").strip())
-                i = float(inst.query(":MEAS:CURR?").strip())
-                return VIReading(v=v, i=i)
+                    vi = VIReading(v=v, i=i)
+                else:
+                    v = float(inst.query(":MEAS:VOLT?").strip())
+                    i = float(inst.query(":MEAS:CURR?").strip())
+                    vi = VIReading(v=v, i=i)
+            except Exception:
+                if prev_timeout is not None:
+                    try:
+                        inst.timeout = prev_timeout
+                    except Exception:
+                        pass
+                self.resync()
+                raise
+            try:
+                if not self._plausible(vi):
+                    self.resync()
+                    raise KeithleyError(f"Implausible reading V={vi.v:.6g} V, I={vi.i:.6g} A (replies out of step)")
+                return vi
             finally:
                 if prev_timeout is not None:
                     try:
                         inst.timeout = prev_timeout
                     except Exception:
                         pass
+
+    def read_source_setpoint(self) -> float:
+        """The programmed source voltage (no measurement); ``_last_set_v`` if it cannot be read."""
+        try:
+            v = float(self.query(":SOUR:VOLT?").strip().split(",")[0])
+            if math.isfinite(v) and abs(v) <= V_PLAUSIBLE_V:
+                return v
+        except Exception:
+            pass
+        return float(self._last_set_v)
+
+    def ramp_start_voltage(self, step_v: float) -> float:
+        """Where a ramp starts: the programmed voltage, cross-checked with the last value set here.
+
+        They differ only if a reply is out of step (or the voltage was changed on the front panel):
+        resynchronize and read again; if they still differ, refuse to ramp rather than jump.
+        """
+        tol = max(2.0 * abs(float(step_v)), 1e-3)
+        start = self.read_source_setpoint()
+        if abs(start - self._last_set_v) <= tol:
+            return start
+        self.resync()
+        start = self.read_source_setpoint()
+        if abs(start - self._last_set_v) <= tol:
+            return start
+        raise KeithleyError(f"Source reads {start:.6g} V but {self._last_set_v:.6g} V was set last: not ramping "
+                            f"(check the instrument, then reconnect it)")
 
     def read_voltage(self) -> float:
         # Keep API, but do not double-query on 2400: we measure VI once and split.
@@ -419,10 +532,13 @@ class KeithleySMU:
         micro_read: bool = True,
         on_microstep: Optional[Callable[[VIReading], None]] = None,
         verify: bool = True,
+        sync_each_step: bool = False,
     ) -> VIReading:
         """
         Safe ramp to target voltage.
         If micro_read=True: after each microstep, sleep dwell then read V&I and emit on_microstep(vi).
+        If sync_each_step=True (without micro_read): wait for "*OPC?" after each set, before the dwell,
+        so set commands never queue up in the instrument and a dead link fails at once.
         """
         target = float(target_v)
         if abs(target) > KEITHLEY_V_LIMIT + 1e-12:
@@ -431,17 +547,17 @@ class KeithleySMU:
         step_v = max(1e-6, float(abs(ramp_step_v)))
         dwell_s = max(0.0, float(ramp_dwell_s))
 
-        # start estimate
-        try:
-            start = float(self.read_voltage())
-            if math.isnan(start):
-                start = self._last_set_v
-        except Exception:
-            start = self._last_set_v
+        # start from the programmed source voltage, not a measurement: a measured value that is
+        # wrong (replies out of step, output at the current compliance) would make the first step a jump
+        start = self.ramp_start_voltage(step_v)
+
+        sync = bool(sync_each_step) and not micro_read
 
         # already close
         if abs(target - start) <= step_v:
             self._set_voltage_instant(target)
+            if sync:
+                self.query("*OPC?")
             if dwell_s > 0:
                 time.sleep(dwell_s)
             vi = self.read_vi() if micro_read else VIReading(v=target, i=float("nan"))
@@ -468,6 +584,8 @@ class KeithleySMU:
                 v = target
 
             self._set_voltage_instant(v)
+            if sync:
+                self.query("*OPC?")
 
             if dwell_s > 0:
                 time.sleep(dwell_s)
@@ -485,6 +603,8 @@ class KeithleySMU:
             if controller is not None and controller.is_aborted():
                 return last_vi
             self._set_voltage_instant(target)
+            if sync:
+                self.query("*OPC?")
             if dwell_s > 0:
                 time.sleep(dwell_s)
             if micro_read:
@@ -528,7 +648,8 @@ class KeithleySMU:
                 return vi
             time.sleep(VERIFY_SLEEP_S)
 
-        raise KeithleyError(f"Cannot reach setpoint: Vset={target:.6g} V, Vread={v_read:.6g} V")
+        raise SetpointError(f"Cannot reach setpoint: Vset={target:.6g} V, Vread={v_read:.6g} V, "
+                            f"I={i_read * 1e9:.4g} nA", target, v_read, i_read)
 
     # ---- Home (ramp to 0) ----
 
@@ -547,13 +668,8 @@ class KeithleySMU:
         """
         tol_v = float(abs(tol_v))
 
-        # If already close, still do a final set to 0 and emit one reading
-        try:
-            v_now = float(self.read_voltage())
-            if math.isnan(v_now):
-                v_now = self._last_set_v
-        except Exception:
-            v_now = self._last_set_v
+        # If already close, still do a final set to 0 and emit one reading (programmed voltage, see ramp_to_voltage)
+        v_now = self.read_source_setpoint()
 
         if abs(v_now) <= tol_v:
             vi0 = self.ramp_to_voltage(

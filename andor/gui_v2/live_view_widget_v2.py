@@ -1,13 +1,24 @@
 from typing import Optional, Tuple
 
 import numpy as np
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from .config import DEFAULT_LINECUT_WIDTH
 
 
 class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
+    """Live CCD view with crosshair and horizontal/vertical linecuts (pyqtgraph).
+
+    ``match_v1=True`` reproduces ``andor/gui/live_view_widget.py`` exactly:
+    rows are flipped but columns stay in native detector (wavelength) order,
+    the horizontal linecut is drawn in native order against the wavelength
+    axis, the vertical linecut is reversed so it lines up with the displayed
+    rows, any mouse button sets the cursor and the view is static (v1 has no
+    toolbar).  The default keeps the left-right mirrored view of the Andor v2
+    GUI, whose saved frames use the same orientation.
+    """
+
     linecut_changed = QtCore.pyqtSignal(int)
     cursor_changed = QtCore.pyqtSignal(int, int)
 
@@ -17,10 +28,12 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
         *,
         title: str = "Live View",
         default_linecut_width: int = DEFAULT_LINECUT_WIDTH,
+        match_v1: bool = False,
         parent=None,
     ):
         super().__init__(title, parent)
         self.cam = cam
+        self._match_v1 = bool(match_v1)
 
         self._last_frame_raw = None
         self._last_frame = None
@@ -90,6 +103,9 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
         self.glw.ci.layout.setRowStretchFactor(0, 4)
         self.glw.ci.layout.setRowStretchFactor(1, 1)
 
+        if self._match_v1:
+            self._setup_v1_style()
+
         layout.addWidget(self.glw, 0, 0, 2, 1)
 
         # Side panel
@@ -107,6 +123,59 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
         layout.addWidget(side_widget, 0, 1)
 
         self.img_plot.scene().sigMouseClicked.connect(self._on_mouse_click)
+
+    def _setup_v1_style(self) -> None:
+        """v1 look and interaction: static plots, C0-blue linecuts, aligned panels."""
+        for plot in (self.img_plot, self.vcut_plot, self.hcut_plot):
+            plot.setMouseEnabled(x=False, y=False)
+            plot.setMenuEnabled(False)
+            plot.hideButtons()
+        # matplotlib autoscale margins (5%) on the free axis of each linecut
+        self.hcut_plot.getViewBox().setDefaultPadding(0.05)
+        self.vcut_plot.getViewBox().setDefaultPadding(0.05)
+        self.hcut_curve.setPen(pg.mkPen("#1f77b4", width=1))
+        self.vcut_curve.setPen(pg.mkPen("#1f77b4", width=1))
+        # an (empty) label lets pyqtgraph show the "(x1e+06)" scale like matplotlib's
+        # offset text, instead of long tick labels that overlap in the narrow panel
+        self.vcut_plot.setLabel("bottom", " ")
+        self.img_plot.getAxis("bottom").setHeight(44)
+        self.vcut_plot.getAxis("bottom").setHeight(44)
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        self._top_axis.setStyle(tickFont=font)
+        # Line the linecut panels up with the image, as v1's gridspec does: the
+        # image and the horizontal linecut share a left-axis width, and the vertical
+        # linecut gets the image's title row and a matching (blank) top axis.
+        for plot in (self.img_plot, self.hcut_plot):
+            plot.getAxis("left").setWidth(56)
+        self.vcut_plot.setTitle("")
+        self.vcut_plot.showAxis("top")
+        self._vcut_top_axis = self.vcut_plot.getAxis("top")
+        self._vcut_top_axis.setStyle(showValues=False)
+        # same fixed height as the image's top axis (ticks + label) so both panels start level
+        self._top_axis.setHeight(40)
+        self._vcut_top_axis.setHeight(40)
+        self._vcut_top_axis.hide()
+
+    def _set_top_axis_visible(self, visible: bool) -> None:
+        if visible:
+            self._top_axis.show()
+        else:
+            self._top_axis.hide()
+        if self._match_v1:
+            self._vcut_top_axis.setVisible(bool(visible))
+
+    def _display(self, a: np.ndarray) -> np.ndarray:
+        """Display orientation of a cropped raw frame."""
+        if self._match_v1:
+            return np.flipud(a)
+        return np.fliplr(np.flipud(a))
+
+    def _set_hcut_xrange(self, x0: float, x1: float) -> None:
+        # matplotlib's set_xlim(a, b) with a > b shows an inverted axis
+        self.hcut_plot.invertX(x0 > x1)
+        lo, hi = (x0, x1) if x0 <= x1 else (x1, x0)
+        self.hcut_plot.setXRange(lo, hi, padding=0)
 
     # -----------------
     # Public API
@@ -195,6 +264,27 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
             self._update_image_wavelength_axis(w)
             self._update_cursor_overlays(h, w)
 
+    def set_wavelength_axis_data(self, wl) -> None:
+        """Use a wavelength axis read elsewhere (e.g. in a worker thread); ``None`` disables it.
+
+        Same effect as ``set_wavelength_axis_enabled`` without calling the camera here
+        (``AndorSystem.get_wavelength_axis(force=True)`` reconnects the spectrograph).
+        """
+        arr = None
+        if wl is not None:
+            try:
+                arr = np.asarray(wl, dtype=float).ravel()
+            except Exception:
+                arr = None
+            if arr is not None and (arr.size == 0 or np.allclose(arr, 0.0)):
+                arr = None
+        self._wl_axis = arr
+        if self._last_frame is not None:
+            h, w = self._last_frame.shape
+            self._maybe_update_xaxis_label(w)
+            self._update_image_wavelength_axis(w)
+            self._update_cursor_overlays(h, w)
+
     def update_frame(self, fr: dict):
         img = fr.get("image")
         img8 = fr.get("image8")
@@ -206,14 +296,14 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
         self._last_frame_full = raw
         self._last_raw_width = int(raw.shape[1])
         raw_crop = self._apply_crop(raw)
-        disp = np.fliplr(np.flipud(raw_crop))
+        disp = self._display(raw_crop)
         disp8 = None
         if img8 is not None:
             try:
                 raw8 = np.asarray(img8)
                 self._last_frame8_full = raw8
                 raw8_crop = self._apply_crop(raw8)
-                disp8 = np.fliplr(np.flipud(raw8_crop))
+                disp8 = self._display(raw8_crop)
             except Exception:
                 disp8 = None
                 self._last_frame8_full = None
@@ -246,11 +336,15 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
 
         self.img_plot.setXRange(0, w, padding=0)
         self.img_plot.setYRange(0, h, padding=0)
-        self.hcut_plot.setXRange(
-            float(self._get_x_axis_data(w)[0]),
-            float(self._get_x_axis_data(w)[-1]),
-            padding=0,
-        )
+        if self._match_v1:
+            # v1: pixel range here; _update_cursor_overlays switches it to the linecut axis
+            self._set_hcut_xrange(0.0, float(w))
+        else:
+            self.hcut_plot.setXRange(
+                float(self._get_x_axis_data(w)[0]),
+                float(self._get_x_axis_data(w)[-1]),
+                padding=0,
+            )
         self.vcut_plot.setYRange(0, h, padding=0)
         self._update_cursor_overlays(h, w)
         self._update_roi_overlay()
@@ -259,7 +353,7 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
     # Events
     # -----------------
     def _on_mouse_click(self, event):
-        if event.button() != QtCore.Qt.LeftButton:
+        if event.button() != QtCore.Qt.LeftButton and not self._match_v1:
             return
         if self._last_frame is None or self._last_frame_raw is None:
             return
@@ -301,7 +395,7 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
         return a[top:y2, left:x2]
 
     def _prepare_display_image(self, raw):
-        return np.fliplr(np.flipud(self._apply_crop(raw)))
+        return self._display(self._apply_crop(raw))
 
     def _update_cursor_overlays(self, h: int, w: int) -> None:
         if self._cursor_rc is None or self._last_frame_raw is None:
@@ -320,7 +414,8 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
             self._crosshair_v.setVisible(False)
             return
 
-        x_raw = w - 1 - x  # display col x maps to physical col x_raw after fliplr
+        # display col x maps to physical col w-1-x after fliplr (v1: no horizontal flip)
+        x_raw = x if self._match_v1 else w - 1 - x
         try:
             val = float(self._last_frame_raw[y_raw, x_raw])
             self.cursorLbl.setText(f"Cursor: (row, col) = {y}, {x}, I = {val:g}")
@@ -344,9 +439,19 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
 
         if hcut is not None:
             x_axis = self._get_x_axis_data(w)
-            self.hcut_curve.setData(x_axis, hcut[::-1])  # reverse to match fliplr display
+            if self._match_v1:
+                # native order: intensity aligns with the wavelength axis
+                self.hcut_curve.setData(x_axis, hcut)
+                if len(x_axis):
+                    self._set_hcut_xrange(float(x_axis[0]), float(x_axis[-1]))
+            else:
+                self.hcut_curve.setData(x_axis, hcut[::-1])  # reverse to match fliplr display
         if vcut is not None:
-            self.vcut_curve.setData(vcut, np.arange(vcut.size))
+            if self._match_v1:
+                # reversed to match the flipud display, row for row
+                self.vcut_curve.setData(vcut[::-1], np.arange(vcut.size))
+            else:
+                self.vcut_curve.setData(vcut, np.arange(vcut.size))
 
     def _update_roi_overlay(self) -> None:
         if self._last_frame is None:
@@ -462,12 +567,12 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
     def _update_image_wavelength_axis(self, width: int) -> None:
         wl = getattr(self, "_wl_axis", None)
         if wl is None:
-            self._top_axis.hide()
+            self._set_top_axis_visible(False)
             return
         try:
             arr = np.asarray(wl, dtype=float).ravel()
         except Exception:
-            self._top_axis.hide()
+            self._set_top_axis_visible(False)
             return
         if self._last_raw_width is not None and arr.size == self._last_raw_width:
             _, _, left, right = self._crop
@@ -476,7 +581,7 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
             if left > 0:
                 arr = arr[left:]
         if arr.size != width or np.allclose(arr, 0.0):
-            self._top_axis.hide()
+            self._set_top_axis_visible(False)
             return
 
         n_ticks = 6
@@ -484,4 +589,4 @@ class AndorLiveViewWidgetV2(QtWidgets.QGroupBox):
         pix_int = np.unique(np.clip(np.round(pix).astype(int), 0, width - 1))
         ticks = [(float(i), f"{arr[i]:.1f}") for i in pix_int]
         self._top_axis.setTicks([ticks, []])
-        self._top_axis.show()
+        self._set_top_axis_visible(True)

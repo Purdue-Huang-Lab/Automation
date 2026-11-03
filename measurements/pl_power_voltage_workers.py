@@ -103,6 +103,10 @@ class PowerVoltageSweepThread(QtCore.QThread):
         zero_v_eps: float,
         zero_v_extra_settle_ms: float,
         save_dir: Optional[str],
+        sweep_order: str = "power_outer",
+        grid_sweep: bool = False,
+        nsteps_a: int = 1,
+        nsteps_b: int = 1,
         readout_rate: Optional[str] = None,
         preamp_gain: Optional[str] = None,
         output_amp: Optional[str] = None,
@@ -135,8 +139,11 @@ class PowerVoltageSweepThread(QtCore.QThread):
         self.settle_ms = float(settle_ms)
         self.zero_v_eps = float(zero_v_eps)
         self.zero_v_extra_settle_ms = float(zero_v_extra_settle_ms)
-
         self.save_dir = save_dir
+        self.sweep_order = sweep_order  # "power_outer" or "voltage_outer"
+        self.grid_sweep = bool(grid_sweep)
+        self.nsteps_a = int(nsteps_a)
+        self.nsteps_b = int(nsteps_b)
         self.readout_rate = readout_rate
         self.preamp_gain = preamp_gain
         self.output_amp = output_amp
@@ -268,7 +275,7 @@ class PowerVoltageSweepThread(QtCore.QThread):
 
         for j in range(1, accum_n + 1):
             if self._stop or self._gate_controller.is_aborted():
-                return None, None
+                return None, "aborted"
             fr, err = self._grab_frame()
             if err:
                 if err == "aborted":
@@ -277,7 +284,10 @@ class PowerVoltageSweepThread(QtCore.QThread):
             img = fr.get("image")
             if img is None:
                 return None, "error: acquire failed (no image)"
-            img = np.fliplr(np.asarray(img, dtype=np.float64))
+            # Keep the raw camera (native detector) orientation. The dispersive
+            # axis is stored in native order so it stays aligned with the
+            # wavelength calibration; display paths only flip vertically.
+            img = np.asarray(img, dtype=np.float64)
             if sum_img is None:
                 sum_img = img
             else:
@@ -315,8 +325,11 @@ class PowerVoltageSweepThread(QtCore.QThread):
                 "front_i_read": i_front,
                 "back_i_read": i_back,
                 "sweep_mode": self.sweep_mode,
+                "sweep_order": self.sweep_order,
             })
             try:
+                # Native detector column order, matching the wavelength axis
+                # (column i <-> wavelength_axis_nm[i]) and the on-screen display.
                 self.cam.save_ascii(filepath, sum_img, metadata=meta, wavelength_axis_nm=self.wavelength_axis_nm)
             except Exception as exc:
                 return None, f"error: save failed: {exc}"
@@ -356,7 +369,6 @@ class PowerVoltageSweepThread(QtCore.QThread):
                     pass
             return None, f"error: acquire failed: {err}"
 
-
     def _is_zero_step(self, v_front: Optional[float], v_back: Optional[float]) -> bool:
         eps = abs(float(self.zero_v_eps))
         if v_front is not None and abs(float(v_front)) <= eps:
@@ -380,6 +392,301 @@ class PowerVoltageSweepThread(QtCore.QThread):
                 vb = float(self.back_v0 + k * self.back_step)
             steps.append((k, vf, vb))
         return steps
+
+    def _voltage_suffix(self, v_front: Optional[float], v_back: Optional[float]) -> str:
+        if not self.sweep_voltage:
+            return ""
+        if self.sweep_mode == "front":
+            return f"_Vf{self._fmt_v_label(v_front)}"
+        elif self.sweep_mode == "back":
+            return f"_Vb{self._fmt_v_label(v_back)}"
+        else:
+            return f"_Vf{self._fmt_v_label(v_front)}_Vb{self._fmt_v_label(v_back)}"
+
+    def _voltage_key_from_step(self, v_front: Optional[float], v_back: Optional[float]) -> Optional[float]:
+        if self.grid_sweep:
+            # Grid: linecut-vs-voltage is against gate B, with gate A held fixed.
+            return v_back
+        if self.sweep_mode == "front":
+            return v_front
+        elif self.sweep_mode == "back":
+            return v_back
+        return v_front
+
+    def _iter_grid_steps(self):
+        """Grid sweep: fix gate A at each of its steps, sweep gate B through its
+        full list, then advance A. B is snaked (reversed on odd A rows) to reduce
+        back-gate travel; A always advances forward. Yields (counter, vf, vb)."""
+        na = max(1, int(self.nsteps_a))
+        nb = max(1, int(self.nsteps_b))
+        counter = 0
+        for ai in range(na):
+            vf = float(self.front_v0 + ai * self.front_step)
+            b_indices = range(nb - 1, -1, -1) if (ai % 2 == 1) else range(nb)
+            for bi in b_indices:
+                vb = float(self.back_v0 + bi * self.back_step)
+                yield counter, vf, vb
+                counter += 1
+
+    def _move_stage_for_entry(self, entry, idx: int, total: int) -> bool:
+        """Move stage to the position for this entry. Returns False and emits done on error."""
+        if not (self.sweep_power and entry is not None):
+            return True
+        if isinstance(entry, DualWheelPowerEntry) or hasattr(entry, "a_deg"):
+            if self.stage_a is None or self.stage_b is None:
+                self.done.emit("error: stage not connected")
+                return False
+            self.status.emit(
+                f"Move to A={entry.a_deg:.3f}, B={entry.b_deg:.3f} deg ({idx}/{total})"
+            )
+            try:
+                self.stage_a.move_to(entry.a_deg, step_deg=self.ramp_step_deg, controller=self._stage_controller)
+                self.stage_b.move_to(entry.b_deg, step_deg=self.ramp_step_deg, controller=self._stage_controller)
+            except Exception as exc:
+                self.status.emit(f"Stage move failed: {exc}")
+                self.done.emit(f"error: stage move failed: {exc}")
+                return False
+        else:
+            if self.stage_a is None:
+                self.done.emit("error: stage not connected")
+                return False
+            self.status.emit(f"Move to {entry.position_deg:.3f} deg ({idx}/{total})")
+            try:
+                self.stage_a.move_to(entry.position_deg, step_deg=self.ramp_step_deg, controller=self._stage_controller)
+            except Exception as exc:
+                self.status.emit(f"Stage move failed: {exc}")
+                self.done.emit(f"error: stage move failed: {exc}")
+                return False
+        return True
+
+    def _emit_point(self, entry, result: dict, step_idx: int, voltage_key: Optional[float],
+                    v_read_f: Optional[float], i_read_f: Optional[float],
+                    v_read_b: Optional[float], i_read_b: Optional[float],
+                    a_voltage: Optional[float] = None, b_voltage: Optional[float] = None) -> None:
+        payload = {
+            "entry": entry,
+            "image": result["image"],
+            "accum_n": result["accum_n"],
+            "filepath": result["filepath"],
+            "step_idx": step_idx,
+            "voltage_key": voltage_key,
+            "grid": self.grid_sweep,
+            "a_voltage": a_voltage,
+            "b_voltage": b_voltage,
+            "v_front": v_read_f,
+            "i_front": i_read_f,
+            "v_back": v_read_b,
+            "i_back": i_read_b,
+        }
+        self.point_done.emit(payload)
+
+    def _acquire_at_step(self, entry, base: str, step_idx: int,
+                         v_front: Optional[float], v_back: Optional[float]) -> bool:
+        """Read VI, check trip, acquire image, emit point_done. Returns False on error/abort."""
+        v_read_f, i_read_f = (
+            self._read_vi(self.front_dev, target_v=v_front, icomp_a=self.front_icomp_a)
+            if self.front_dev is not None else (None, None)
+        )
+        v_read_b, i_read_b = (
+            self._read_vi(self.back_dev, target_v=v_back, icomp_a=self.back_icomp_a)
+            if self.back_dev is not None else (None, None)
+        )
+
+        self.vi_ready.emit({
+            "v_front": v_read_f,
+            "i_front": i_read_f,
+            "v_back": v_read_b,
+            "i_back": i_read_b,
+            "step_idx": step_idx,
+            "entry": entry,
+        })
+
+        try:
+            self._check_trip(i_read_f, self.front_icomp_a, "Front")
+            self._check_trip(i_read_b, self.back_icomp_a, "Back")
+        except ComplianceTrip:
+            self.done.emit("trip")
+            return False
+
+        vsuffix = self._voltage_suffix(v_front, v_back)
+        base_step = f"{base}{vsuffix}" if vsuffix else base
+        result, err = self._acquire_image(entry, v_read_f, v_read_b, i_read_f, i_read_b, base_step)
+        if err:
+            if err == "aborted":
+                self.done.emit("aborted")
+            else:
+                self.status.emit(err)
+                self.done.emit(err)
+            return False
+
+        voltage_key = self._voltage_key_from_step(v_front, v_back)
+        self._emit_point(entry, result, step_idx, voltage_key, v_read_f, i_read_f, v_read_b, i_read_b,
+                         a_voltage=v_front, b_voltage=v_back)
+        return True
+
+    def _run_power_outer(self, power_plan: List[dict]) -> bool:
+        """Outer loop = powers, inner loop = voltages (with snake). Current default behavior."""
+        snake_voltage = bool(self.sweep_power and self.sweep_voltage and max(1, int(self.nsteps)) > 1)
+        sweep_forward = True
+
+        for idx, item in enumerate(power_plan, start=1):
+            if self._stop or self._gate_controller.is_aborted():
+                self.done.emit("aborted")
+                return False
+
+            entry = item.get("entry")
+            base = item.get("base") or "PL"
+
+            if not self._move_stage_for_entry(entry, idx, len(power_plan)):
+                return False
+
+            if snake_voltage:
+                direction = "forward" if sweep_forward else "reverse"
+                self.status.emit(f"Voltage sweep ({direction})")
+            reverse_steps = bool(snake_voltage and not sweep_forward)
+
+            # Pre-ramp only the gate(s) that this mode actually sweeps to their
+            # V0 before the voltage loop. In single-gate mode the other gate is
+            # left untouched.
+            if self.sweep_voltage:
+                if self.sweep_mode in ("front", "dual") and self.front_dev is not None:
+                    self._gate_ramp(self.front_dev, float(self.front_v0), self.front_icomp_a,
+                                    on_microstep=lambda vi: self.vi_ready.emit({"v_front": vi.v, "i_front": vi.i}))
+                if self.sweep_mode in ("back", "dual") and self.back_dev is not None:
+                    self._gate_ramp(self.back_dev, float(self.back_v0), self.back_icomp_a,
+                                    on_microstep=lambda vi: self.vi_ready.emit({"v_back": vi.v, "i_back": vi.i}))
+                if self._stop or self._gate_controller.is_aborted():
+                    self.done.emit("aborted")
+                    return False
+
+            for step_idx, v_front, v_back in self._iter_voltage_steps(reverse=reverse_steps):
+                if self._stop or self._gate_controller.is_aborted():
+                    self.done.emit("aborted")
+                    return False
+
+                if self.sweep_voltage:
+                    if v_front is not None and self.front_dev is not None:
+                        self._gate_ramp(self.front_dev, v_front, self.front_icomp_a,
+                                        on_microstep=lambda vi: self.vi_ready.emit({"v_front": vi.v, "i_front": vi.i}))
+                    if v_back is not None and self.back_dev is not None:
+                        self._gate_ramp(self.back_dev, v_back, self.back_icomp_a,
+                                        on_microstep=lambda vi: self.vi_ready.emit({"v_back": vi.v, "i_back": vi.i}))
+                    if self.settle_ms > 0:
+                        time.sleep(max(0.0, self.settle_ms / 1000.0))
+
+                if self._is_zero_step(v_front, v_back) and self.zero_v_extra_settle_ms > 0:
+                    time.sleep(max(0.0, self.zero_v_extra_settle_ms / 1000.0))
+
+                if not self._acquire_at_step(entry, base, step_idx, v_front, v_back):
+                    return False
+
+            if self.sweep_power and entry is not None:
+                self.power_done.emit({"entry": entry})
+            if snake_voltage:
+                sweep_forward = not sweep_forward
+
+        return True
+
+    def _run_voltage_outer(self, power_plan: List[dict]) -> bool:
+        """Outer loop = voltages, inner loop = powers. No snake — voltage steps in fixed order."""
+        for step_idx, v_front, v_back in self._iter_voltage_steps():
+            if self._stop or self._gate_controller.is_aborted():
+                self.done.emit("aborted")
+                return False
+
+            if self.sweep_voltage:
+                if v_front is not None and self.front_dev is not None:
+                    self._gate_ramp(self.front_dev, v_front, self.front_icomp_a,
+                                    on_microstep=lambda vi: self.vi_ready.emit({"v_front": vi.v, "i_front": vi.i}))
+                if v_back is not None and self.back_dev is not None:
+                    self._gate_ramp(self.back_dev, v_back, self.back_icomp_a,
+                                    on_microstep=lambda vi: self.vi_ready.emit({"v_back": vi.v, "i_back": vi.i}))
+                if self._stop or self._gate_controller.is_aborted():
+                    self.done.emit("aborted")
+                    return False
+                if self.settle_ms > 0:
+                    time.sleep(max(0.0, self.settle_ms / 1000.0))
+                if self._is_zero_step(v_front, v_back) and self.zero_v_extra_settle_ms > 0:
+                    time.sleep(max(0.0, self.zero_v_extra_settle_ms / 1000.0))
+
+            n_voltages = max(1, int(self.nsteps)) if self.sweep_voltage else 1
+            self.status.emit(f"Voltage step {step_idx + 1}/{n_voltages}" if self.sweep_voltage else "Acquiring")
+
+            for pidx, item in enumerate(power_plan, start=1):
+                if self._stop or self._gate_controller.is_aborted():
+                    self.done.emit("aborted")
+                    return False
+
+                entry = item.get("entry")
+                base = item.get("base") or "PL"
+
+                if not self._move_stage_for_entry(entry, pidx, len(power_plan)):
+                    return False
+
+                if not self._acquire_at_step(entry, base, step_idx, v_front, v_back):
+                    return False
+
+        # Emit power_done once per power entry after all voltage steps complete
+        if self.sweep_power:
+            for item in power_plan:
+                entry = item.get("entry")
+                if entry is not None:
+                    self.power_done.emit({"entry": entry})
+
+        return True
+
+    def _run_grid(self, power_plan: List[dict]) -> bool:
+        """Grid sweep: for each power, hold gate A at each step while sweeping
+        gate B through its full list, then advance A. Gate A only re-ramps when
+        its target changes between steps."""
+        for idx, item in enumerate(power_plan, start=1):
+            if self._stop or self._gate_controller.is_aborted():
+                self.done.emit("aborted")
+                return False
+
+            entry = item.get("entry")
+            base = item.get("base") or "PL"
+
+            if not self._move_stage_for_entry(entry, idx, len(power_plan)):
+                return False
+
+            # Pre-ramp both gates to their starting values
+            if self.front_dev is not None:
+                self._gate_ramp(self.front_dev, float(self.front_v0), self.front_icomp_a,
+                                on_microstep=lambda vi: self.vi_ready.emit({"v_front": vi.v, "i_front": vi.i}))
+            if self.back_dev is not None:
+                self._gate_ramp(self.back_dev, float(self.back_v0), self.back_icomp_a,
+                                on_microstep=lambda vi: self.vi_ready.emit({"v_back": vi.v, "i_back": vi.i}))
+            if self._stop or self._gate_controller.is_aborted():
+                self.done.emit("aborted")
+                return False
+
+            prev_vf = None
+            for step_idx, v_front, v_back in self._iter_grid_steps():
+                if self._stop or self._gate_controller.is_aborted():
+                    self.done.emit("aborted")
+                    return False
+
+                # Ramp gate A only when its value changes (once per A row)
+                if self.front_dev is not None and (prev_vf is None or v_front != prev_vf):
+                    self._gate_ramp(self.front_dev, v_front, self.front_icomp_a,
+                                    on_microstep=lambda vi: self.vi_ready.emit({"v_front": vi.v, "i_front": vi.i}))
+                    prev_vf = v_front
+                if self.back_dev is not None:
+                    self._gate_ramp(self.back_dev, v_back, self.back_icomp_a,
+                                    on_microstep=lambda vi: self.vi_ready.emit({"v_back": vi.v, "i_back": vi.i}))
+                if self.settle_ms > 0:
+                    time.sleep(max(0.0, self.settle_ms / 1000.0))
+                if self._is_zero_step(v_front, v_back) and self.zero_v_extra_settle_ms > 0:
+                    time.sleep(max(0.0, self.zero_v_extra_settle_ms / 1000.0))
+
+                if not self._acquire_at_step(entry, base, step_idx, v_front, v_back):
+                    return False
+
+            if self.sweep_power and entry is not None:
+                self.power_done.emit({"entry": entry})
+
+        return True
 
     def run(self):
         prev_timeout_scale = None
@@ -422,177 +729,24 @@ class PowerVoltageSweepThread(QtCore.QThread):
                 pass
 
             power_plan = self.plan if self.sweep_power else [{"entry": None, "base": "PL_manual"}]
-            snake_voltage = bool(self.sweep_power and self.sweep_voltage and max(1, int(self.nsteps)) > 1)
-            sweep_forward = True
 
-            for idx, item in enumerate(power_plan, start=1):
-                if self._stop or self._gate_controller.is_aborted():
-                    self.done.emit("aborted")
-                    return
+            if self.grid_sweep:
+                ok = self._run_grid(power_plan)
+            elif self.sweep_order == "voltage_outer":
+                ok = self._run_voltage_outer(power_plan)
+            else:
+                ok = self._run_power_outer(power_plan)
 
-                entry = item.get("entry")
-                base = item.get("base") or "PL"
-
-                if self.sweep_power and entry is not None:
-                    if isinstance(entry, DualWheelPowerEntry) or hasattr(entry, "a_deg"):
-                        if self.stage_a is None or self.stage_b is None:
-                            self.done.emit("error: stage not connected")
-                            return
-                        self.status.emit(
-                            f"Move to A={entry.a_deg:.3f}, B={entry.b_deg:.3f} deg ({idx}/{len(power_plan)})"
-                        )
-                        try:
-                            self.stage_a.move_to(entry.a_deg, step_deg=self.ramp_step_deg, controller=self._stage_controller)
-                            self.stage_b.move_to(entry.b_deg, step_deg=self.ramp_step_deg, controller=self._stage_controller)
-                        except Exception as exc:
-                            self.status.emit(f"Stage move failed: {exc}")
-                            self.done.emit(f"error: stage move failed: {exc}")
-                            return
-                    else:
-                        if self.stage_a is None:
-                            self.done.emit("error: stage not connected")
-                            return
-                        self.status.emit(f"Move to {entry.position_deg:.3f} deg ({idx}/{len(power_plan)})")
-                        try:
-                            self.stage_a.move_to(entry.position_deg, step_deg=self.ramp_step_deg, controller=self._stage_controller)
-                        except Exception as exc:
-                            self.status.emit(f"Stage move failed: {exc}")
-                            self.done.emit(f"error: stage move failed: {exc}")
-                            return
-
-                if snake_voltage:
-                    direction = "forward" if sweep_forward else "reverse"
-                    self.status.emit(f"Voltage sweep ({direction})")
-                reverse_steps = bool(snake_voltage and not sweep_forward)
-                # Ramp both gates to V0 before touching the camera, so a slow
-                # GPIB ramp cannot cause Andor to timeout mid-acquisition.
-                if self.sweep_voltage:
-                    if self.front_dev is not None:
-                        self._gate_ramp(self.front_dev, float(self.front_v0), self.front_icomp_a,
-                                        on_microstep=lambda vi: self.vi_ready.emit({"v_front": vi.v, "i_front": vi.i}))
-                    if self.back_dev is not None:
-                        self._gate_ramp(self.back_dev, float(self.back_v0), self.back_icomp_a,
-                                        on_microstep=lambda vi: self.vi_ready.emit({"v_back": vi.v, "i_back": vi.i}))
-                    if self._stop or self._gate_controller.is_aborted():
-                        self.done.emit("aborted")
-                        return
-
-                for step_idx, v_front, v_back in self._iter_voltage_steps(reverse=reverse_steps):
-                    if self._stop or self._gate_controller.is_aborted():
-                        self.done.emit("aborted")
-                        return
-
-                    if self.sweep_voltage:
-                        if v_front is not None and self.front_dev is not None:
-                            self._gate_ramp(self.front_dev, v_front, self.front_icomp_a,
-                                            on_microstep=lambda vi: self.vi_ready.emit({"v_front": vi.v, "i_front": vi.i}))
-                        if v_back is not None and self.back_dev is not None:
-                            self._gate_ramp(self.back_dev, v_back, self.back_icomp_a,
-                                            on_microstep=lambda vi: self.vi_ready.emit({"v_back": vi.v, "i_back": vi.i}))
-
-                        if self.settle_ms > 0:
-                            time.sleep(max(0.0, self.settle_ms / 1000.0))
-
-                    v_read_f, i_read_f = (
-                        self._read_vi(
-                            self.front_dev,
-                            target_v=v_front,
-                            icomp_a=self.front_icomp_a,
-                        )
-                        if self.front_dev is not None
-                        else (None, None)
-                    )
-                    v_read_b, i_read_b = (
-                        self._read_vi(
-                            self.back_dev,
-                            target_v=v_back,
-                            icomp_a=self.back_icomp_a,
-                        )
-                        if self.back_dev is not None
-                        else (None, None)
-                    )
-
-                    self.vi_ready.emit({
-                        "v_front": v_read_f,
-                        "i_front": i_read_f,
-                        "v_back": v_read_b,
-                        "i_back": i_read_b,
-                        "step_idx": step_idx,
-                        "entry": entry,
-                    })
-
-                    if self._is_zero_step(v_front, v_back):
-                        if self.zero_v_extra_settle_ms > 0:
-                            time.sleep(max(0.0, self.zero_v_extra_settle_ms / 1000.0))
-
-                    try:
-                        self._check_trip(i_read_f, self.front_icomp_a, "Front")
-                        self._check_trip(i_read_b, self.back_icomp_a, "Back")
-                    except ComplianceTrip:
-                        self.done.emit("trip")
-                        return
-
-                    voltage_suffix = ""
-                    if self.sweep_voltage:
-                        if self.sweep_mode == "front":
-                            voltage_suffix = f"_Vf{self._fmt_v_label(v_front)}"
-                        elif self.sweep_mode == "back":
-                            voltage_suffix = f"_Vb{self._fmt_v_label(v_back)}"
-                        else:
-                            voltage_suffix = f"_Vf{self._fmt_v_label(v_front)}_Vb{self._fmt_v_label(v_back)}"
-
-                    base_step = f"{base}{voltage_suffix}" if voltage_suffix else base
-                    result, err = self._acquire_image(entry, v_read_f, v_read_b, i_read_f, i_read_b, base_step)
-                    if err:
-                        if err == "aborted":
-                            self.done.emit("aborted")
-                        else:
-                            self.status.emit(err)
-                            self.done.emit(err)
-                        return
-
-                    voltage_key = None
-                    if self.sweep_mode == "front":
-                        voltage_key = v_front
-                    elif self.sweep_mode == "back":
-                        voltage_key = v_back
-                    elif self.sweep_mode == "dual":
-                        voltage_key = v_front
-
-                    payload = {
-                        "entry": entry,
-                        "image": result["image"],
-                        "accum_n": result["accum_n"],
-                        "filepath": result["filepath"],
-                        "step_idx": step_idx,
-                        "voltage_key": voltage_key,
-                        "v_front": v_read_f,
-                        "i_front": i_read_f,
-                        "v_back": v_read_b,
-                        "i_back": i_read_b,
-                    }
-                    self.point_done.emit(payload)
-
-                if self.sweep_power and entry is not None:
-                    self.power_done.emit({"entry": entry})
-                if snake_voltage:
-                    sweep_forward = not sweep_forward
-
-            try:
-                if prev_timeout_scale is not None:
-                    self.cam._timeout_scale = prev_timeout_scale
-                else:
-                    self.cam._timeout_scale = 1.0
-            except Exception:
-                pass
-            self.done.emit("ok")
+            if ok:
+                self.done.emit("ok")
         except Exception as exc:
-            try:
-                if prev_timeout_scale is not None:
-                    self.cam._timeout_scale = prev_timeout_scale
-                else:
-                    self.cam._timeout_scale = 1.0
-            except Exception:
-                pass
             self.status.emit(f"Unexpected sweep error: {exc}")
             self.done.emit(f"error: {exc}")
+        finally:
+            try:
+                if prev_timeout_scale is not None:
+                    self.cam._timeout_scale = prev_timeout_scale
+                else:
+                    self.cam._timeout_scale = 1.0
+            except Exception:
+                pass

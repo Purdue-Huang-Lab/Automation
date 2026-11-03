@@ -36,12 +36,12 @@ VISA_DLL = getattr(keithley_cfg, "VISA_DLL", r"C:\\Windows\\System32\\visa64.dll
 
 DEFAULT_FRONT_RESOURCE = getattr(
     keithley_cfg,
-    "DEFAULT_A_RESOURCE",
+    "DEFAULT_B_RESOURCE",
     "TCPIP0::10.164.14.233::5025::SOCKET",
 )
 DEFAULT_BACK_RESOURCE = getattr(
     keithley_cfg,
-    "DEFAULT_B_RESOURCE",
+    "DEFAULT_A_RESOURCE",
     "TCPIP0::169.254.153.76::5025::SOCKET",
 )
 
@@ -50,18 +50,18 @@ POLL_TIMEOUT_MS = getattr(keithley_cfg, "POLL_TIMEOUT_MS", 1000)
 POLL_ERROR_LIMIT = getattr(keithley_cfg, "POLL_ERROR_LIMIT", 3)
 
 DEFAULT_GATE_VSET = 0.0
-DEFAULT_GATE_ICOMP_NA = getattr(keithley_cfg, "DEFAULT_ICOMP_NA", 10.0)
+DEFAULT_GATE_ICOMP_NA = getattr(keithley_cfg, "DEFAULT_ICOMP_NA", 1.0)
 
 DEFAULT_SWEEP_V0 = 0.0
-DEFAULT_SWEEP_STEP = 0.01
+DEFAULT_SWEEP_STEP = 0.05
 DEFAULT_SWEEP_STEPS = 10
-DEFAULT_SWEEP_ICOMP_NA = getattr(keithley_cfg, "DEFAULT_SWEEP_ICOMP_NA", 10.0)
+DEFAULT_SWEEP_ICOMP_NA = getattr(keithley_cfg, "DEFAULT_SWEEP_ICOMP_NA", 1.0)
 
 RAMP_STEP_V = getattr(keithley_cfg, "RAMP_STEP_V", 0.01)
 RAMP_DWELL_S = getattr(keithley_cfg, "RAMP_DWELL_S", 0.10)
-SWEEP_SETTLE_MS = 200
+SWEEP_SETTLE_MS = 50
 ZERO_V_EPS = 1e-4
-ZERO_V_EXTRA_SETTLE_MS = 200
+ZERO_V_EXTRA_SETTLE_MS = 100
 
 
 READOUT_UNKNOWN = getattr(keithley_cfg, "READOUT_UNKNOWN", "--")

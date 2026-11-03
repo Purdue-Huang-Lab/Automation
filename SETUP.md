@@ -1,7 +1,7 @@
 # Setup & Workflow Guide
 
 ## Repository
-- **GitHub**: https://github.com/moonriver366/Automation
+- **GitHub**: https://github.com/Purdue-Huang-Lab/Automation (public)
 - **Main branch**: `main`
 - **Python version**: 3.10
 
@@ -61,12 +61,13 @@ git push
 ### Step 1 — Clone the repo
 
 ```powershell
-git clone https://YOUR_USERNAME:YOUR_TOKEN@github.com/moonriver366/Automation.git
+git clone https://github.com/Purdue-Huang-Lab/Automation.git
 cd Automation
 ```
 
-Replace `YOUR_USERNAME` and `YOUR_TOKEN` with your GitHub username and Personal Access Token (PAT).
-To generate a PAT: GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic) → check `repo` scope.
+The repo is public, so cloning needs no login. Pushing requires write access to the repo in the
+Purdue-Huang-Lab organization; on the first `git push`, Git Credential Manager (bundled with Git for
+Windows) opens a browser to sign in to GitHub. Never put a token in the remote URL.
 
 ### Step 2 — Create and activate the virtual environment
 

@@ -1,5 +1,6 @@
 from collections import deque
 
+import numpy as np
 from PyQt5 import QtCore, QtWidgets
 import pyqtgraph as pg
 
@@ -58,3 +59,67 @@ class PlotWidget(QtWidgets.QWidget):
         x = list(range(len(self.vs)))
         self.curveV.setData(x, list(self.vs))
         self.curveI.setData(x, list(self.is_nA))
+
+
+class LeakageIVPlot(QtWidgets.QWidget):
+    """Mean current +/- std per voltage bin, for the leakage test.
+
+    Redrawn on demand (Update button / auto-update timer), never per sample.
+    No log-|I| mode: pg.ErrorBarItem is a raw GraphicsObject that ignores
+    setLogMode, so the bars would land in the wrong place.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        vbox = QtWidgets.QVBoxLayout(self)
+        vbox.setContentsMargins(0, 0, 0, 0)
+
+        self.pw = pg.PlotWidget(background="w")
+        self.pw.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        vbox.addWidget(self.pw)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+        self.pw.setLabel("bottom", "V", units="V")
+        self.pw.setLabel("left", "I (nA)")
+        self.pw.showGrid(x=True, y=True, alpha=0.25)
+        for ax in ("bottom", "left"):
+            self.pw.getAxis(ax).setPen(pg.mkPen("k"))
+            self.pw.getAxis(ax).setTextPen(pg.mkPen("k"))
+
+        self.errItem = pg.ErrorBarItem(pen=pg.mkPen("k", width=1))
+        self.pw.addItem(self.errItem)
+
+        self.meanCurve = self.pw.plot(pen=pg.mkPen("tomato", width=1.2))
+        self.meanScatter = pg.ScatterPlotItem(pen=None, brush=pg.mkBrush("tomato"), size=6)
+        self.pw.addItem(self.meanScatter)
+
+    def set_data(self, v_volts, mean_amps, std_amps):
+        # ErrorBarItem.setData interweaves arrays internally: lists break it.
+        v = np.asarray(v_volts, dtype=float)
+        m = np.asarray(mean_amps, dtype=float) * 1e9
+        e = np.asarray(std_amps, dtype=float) * 1e9
+
+        if v.size == 0:
+            self.clear()
+            return
+
+        ok = np.isfinite(v) & np.isfinite(m) & np.isfinite(e)
+        v, m, e = v[ok], m[ok], e[ok]
+        if v.size == 0:
+            self.clear()
+            return
+
+        # Beam width tracks the bin width so caps stay proportionate.
+        beam = 0.005
+        if v.size > 1:
+            spacing = float(np.median(np.diff(v)))
+            beam = max(1e-3, 0.25 * spacing)
+
+        self.errItem.setData(x=v, y=m, top=e, bottom=e, beam=beam)
+        self.meanCurve.setData(v, m)
+        self.meanScatter.setData(v, m)
+
+    def clear(self):
+        self.errItem.setData(x=None, y=None)
+        self.meanCurve.setData([], [])
+        self.meanScatter.setData([], [])

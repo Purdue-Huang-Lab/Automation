@@ -31,11 +31,11 @@ Measurement output goes to `DATA_DIR`, configured in [measurements/config.py](me
 
 This is a PyQt5 lab automation framework. Code is organized in three layers:
 
-### 1. Hardware Wrappers (`andor/`, `keithley/`, `ph300/`, `PM100A/`, `rot/`, `spad23/`)
+### 1. Hardware Wrappers (`andor/`, `flipper/`, `keithley/`, `ph300/`, `PM100A/`, `rot/`, `spad23/`, `spad93/`)
 
 Each device module exposes a single wrapper class with a consistent interface: `open()` / `close()`, configuration setters, acquisition methods, and optional `verbose` logging. Wrappers are thread-safe via `RLock`. They do not import Qt and have no GUI dependency.
 
-Key classes: `AndorSystem`, `KeithleySMU`, `PicoHarp300`, `PM100ADevice`, `MotionController`.
+Key classes: `AndorSystem`, `FilterFlipper`, `KeithleySMU`, `PicoHarp300`, `PM100ADevice`, `MotionController`.
 
 ### 2. Measurement Modules (`measurements/`)
 

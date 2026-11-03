@@ -302,11 +302,11 @@ class TrplAcquireWorker(QThread):
 
 
 class Spad23MainWindow(QMainWindow):
-    def __init__(self, host: str = "127.0.0.1", port: int = 9999):
+    def __init__(self, host: str = "127.0.0.1", port: int = 9998):
         super().__init__()
         self.host = host
         self.port = int(port)
-
+''
         self.count_client = Spad23CountClient(host=self.host, port=self.port, pixel_limit_mcps=PIXEL_LIMIT_MCPS_23G)
         self.latest_count_snapshot: Optional[CountSnapshot] = None
         self.latest_trpl_snapshot: Optional[TrplSnapshot] = None
@@ -1584,7 +1584,7 @@ class Spad23MainWindow(QMainWindow):
 def main() -> None:
     parser = argparse.ArgumentParser(description="SPAD23 Counts + TRPL GUI")
     parser.add_argument("--host", default="127.0.0.1", help="TCP host of the LabVIEW server")
-    parser.add_argument("--port", type=int, default=9999, help="TCP port of the LabVIEW server")
+    parser.add_argument("--port", type=int, default=9998, help="TCP port of the LabVIEW server")
     args = parser.parse_args()
 
     app = QApplication([])

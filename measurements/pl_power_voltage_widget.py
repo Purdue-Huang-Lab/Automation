@@ -124,6 +124,14 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self._voltage_keys: List[float] = []
         self._voltage_labels: List[str] = []
         self._voltage_pairs: Dict[float, Tuple[Optional[float], Optional[float]]] = {}
+        # Grid (fix-A, sweep-B) sweep state
+        self._grid_active = False
+        self._a_keys: List[float] = []
+        self._a_labels: List[str] = []
+        self._b_keys: List[float] = []
+        self._b_labels: List[str] = []
+        # power -> a_key -> b_key -> {"rank", "raw"}
+        self._grid_images: Dict[float, Dict[float, Dict[float, dict]]] = {}
         self._taken_powers = set()
         self._taken_entries = set()
         self._power_done_counts: Dict[float, int] = {}
@@ -666,6 +674,19 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self.sweepStepsSpin.setValue(int(DEFAULT_SWEEP_STEPS))
         self.sweepStepsSpin.setFixedWidth(90)
 
+        self.backStepsSpin = QtWidgets.QSpinBox()
+        self.backStepsSpin.setRange(1, 100000)
+        self.backStepsSpin.setValue(int(DEFAULT_SWEEP_STEPS))
+        self.backStepsSpin.setFixedWidth(90)
+
+        self.gridSweepChk = QtWidgets.QCheckBox("Grid (fix A, sweep B)")
+        self.gridSweepChk.setChecked(False)
+        self.gridSweepChk.setToolTip(
+            "Dual gate only: hold gate A at each step while sweeping gate B "
+            "through its full list, then advance A. Uses separate step counts "
+            "for A (Steps) and B (B steps)."
+        )
+
         self.powerSkipSpin = QtWidgets.QSpinBox()
         self.powerSkipSpin.setRange(0, 100000)
         self.powerSkipSpin.setValue(0)
@@ -677,6 +698,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         grid.addWidget(self.sweepGateCombo, 0, 3)
         grid.addWidget(QtWidgets.QLabel("Skip N power points:"), 0, 4)
         grid.addWidget(self.powerSkipSpin, 0, 5)
+        grid.addWidget(self.gridSweepChk, 0, 6)
 
         # Angle list row (stage A, no calibration file needed)
         self.angleListChk = QtWidgets.QCheckBox("Use angle list (stage A)")
@@ -695,7 +717,8 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         grid.addWidget(self.frontV0Spin, 2, 1)
         grid.addWidget(QtWidgets.QLabel("Front step (V):"), 2, 2)
         grid.addWidget(self.frontStepSpin, 2, 3)
-        grid.addWidget(QtWidgets.QLabel("Steps:"), 2, 4)
+        self.stepsLbl = QtWidgets.QLabel("Steps:")
+        grid.addWidget(self.stepsLbl, 2, 4)
         grid.addWidget(self.sweepStepsSpin, 2, 5)
         grid.addWidget(self.frontVendLbl, 2, 6)
 
@@ -703,7 +726,22 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         grid.addWidget(self.backV0Spin, 3, 1)
         grid.addWidget(QtWidgets.QLabel("Back step (V):"), 3, 2)
         grid.addWidget(self.backStepSpin, 3, 3)
+        self.backStepsLbl = QtWidgets.QLabel("B steps:")
+        grid.addWidget(self.backStepsLbl, 3, 4)
+        grid.addWidget(self.backStepsSpin, 3, 5)
         grid.addWidget(self.backVendLbl, 3, 6)
+
+        # Sweep order row (only meaningful when both power and voltage are swept)
+        self.sweepOrderPowerOuterRb = QtWidgets.QRadioButton("Sweep voltages per power  →  next power")
+        self.sweepOrderVoltageOuterRb = QtWidgets.QRadioButton("Sweep powers per voltage  →  next voltage")
+        self.sweepOrderPowerOuterRb.setChecked(True)
+        self._sweep_order_grp = QtWidgets.QButtonGroup(self)
+        self._sweep_order_grp.addButton(self.sweepOrderPowerOuterRb)
+        self._sweep_order_grp.addButton(self.sweepOrderVoltageOuterRb)
+
+        grid.addWidget(QtWidgets.QLabel("Sweep order:"), 4, 0)
+        grid.addWidget(self.sweepOrderPowerOuterRb, 4, 1, 1, 3)
+        grid.addWidget(self.sweepOrderVoltageOuterRb, 4, 4, 1, 3)
 
         parent_layout.addWidget(box)
     def _build_plots(self, parent_layout):
@@ -811,6 +849,11 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self.powerSlider.setEnabled(False)
         self.powerSelLbl = QtWidgets.QLabel("Power: --")
 
+        self.aSelSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.aSelSlider.setRange(0, 0)
+        self.aSelSlider.setEnabled(False)
+        self.aSelLbl = QtWidgets.QLabel("Gate A: --")
+
         voltage_plot_box = QtWidgets.QWidget()
         voltage_plot_layout = QtWidgets.QVBoxLayout(voltage_plot_box)
         voltage_plot_layout.setContentsMargins(0, 0, 0, 0)
@@ -821,6 +864,11 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         voltage_slider_row.addWidget(self.powerSlider, 1)
         voltage_slider_row.addWidget(self.powerSelLbl)
         voltage_plot_layout.addLayout(voltage_slider_row)
+        a_slider_row = QtWidgets.QHBoxLayout()
+        a_slider_row.addWidget(QtWidgets.QLabel("Select A (V):"))
+        a_slider_row.addWidget(self.aSelSlider, 1)
+        a_slider_row.addWidget(self.aSelLbl)
+        voltage_plot_layout.addLayout(a_slider_row)
         voltage_clim_row = QtWidgets.QHBoxLayout()
         voltage_clim_row.addWidget(QtWidgets.QLabel("Color min:"))
         self.vmapCminEdit = QtWidgets.QLineEdit()
@@ -887,14 +935,17 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self.angleListChk.toggled.connect(self._on_angle_list_changed)
         self.angleListEdit.textChanged.connect(self._on_angle_list_changed)
         self.sweepGateCombo.currentIndexChanged.connect(self._update_gate_sweep_controls)
+        self.gridSweepChk.toggled.connect(self._update_gate_sweep_controls)
         self.frontV0Spin.valueChanged.connect(self._update_vend_labels)
         self.frontStepSpin.valueChanged.connect(self._update_vend_labels)
         self.backV0Spin.valueChanged.connect(self._update_vend_labels)
         self.backStepSpin.valueChanged.connect(self._update_vend_labels)
         self.sweepStepsSpin.valueChanged.connect(self._update_vend_labels)
+        self.backStepsSpin.valueChanged.connect(self._update_vend_labels)
         self._update_vend_labels()
         self.voltageSlider.valueChanged.connect(self._on_voltage_slider)
         self.powerSlider.valueChanged.connect(self._on_power_slider)
+        self.aSelSlider.valueChanged.connect(self._on_a_slider)
         self.mapCminEdit.editingFinished.connect(self._on_map_clim_changed)
         self.mapCmaxEdit.editingFinished.connect(self._on_map_clim_changed)
         self.vmapCminEdit.editingFinished.connect(self._on_vmap_clim_changed)
@@ -1207,6 +1258,9 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self.seriesCombo.setEnabled(sweep_power and (not need_dual) and (not angle_list_mode) and calib_ok and not busy)
         self.powerSkipSpin.setEnabled(sweep_power and (not angle_list_mode) and not busy)
         self.angleListEdit.setEnabled(sweep_power and self.angleListChk.isChecked() and not busy)
+        both_sweep = sweep_power and sweep_voltage
+        self.sweepOrderPowerOuterRb.setEnabled(both_sweep and not busy)
+        self.sweepOrderVoltageOuterRb.setEnabled(both_sweep and not busy)
 
         front_busy = self._front_ramp_thread is not None and self._front_ramp_thread.isRunning()
         back_busy = self._back_ramp_thread is not None and self._back_ramp_thread.isRunning()
@@ -1220,11 +1274,25 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self.sweepGateCombo.setEnabled(enabled)
         self.sweepStepsSpin.setEnabled(enabled)
         mode = self._sweep_gate_mode()
+        grid = self._grid_sweep_selected()
         self.frontV0Spin.setEnabled(enabled and mode in ("front", "dual"))
         self.frontStepSpin.setEnabled(enabled and mode in ("front", "dual"))
         self.backV0Spin.setEnabled(enabled and mode in ("back", "dual"))
         self.backStepSpin.setEnabled(enabled and mode in ("back", "dual"))
+        # Grid sweep is only meaningful for the dual gate mode.
+        self.gridSweepChk.setEnabled(enabled and mode == "dual")
+        self.backStepsSpin.setEnabled(enabled and grid)
+        self.backStepsLbl.setEnabled(enabled and grid)
+        self.stepsLbl.setText("Steps (A):" if grid else "Steps:")
+        self._update_vend_labels()
         self._sync_controls()
+
+    def _grid_sweep_selected(self) -> bool:
+        return (
+            self.sweepVoltageChk.isChecked()
+            and self._sweep_gate_mode() == "dual"
+            and self.gridSweepChk.isChecked()
+        )
 
     def _current_voltage_key(self) -> Optional[float]:
         if not self._voltage_keys:
@@ -1239,6 +1307,38 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         idx = int(self.powerSlider.value())
         idx = max(0, min(idx, len(self._power_view_keys) - 1))
         return self._power_view_keys[idx]
+
+    def _current_a_key(self) -> Optional[float]:
+        if not self._a_keys:
+            return None
+        idx = int(self.aSelSlider.value())
+        idx = max(0, min(idx, len(self._a_keys) - 1))
+        return self._a_keys[idx]
+
+    def _a_label_for_index(self, idx: int) -> str:
+        if not self._a_keys:
+            return "--"
+        idx = max(0, min(idx, len(self._a_keys) - 1))
+        if idx < len(self._a_labels):
+            return self._a_labels[idx]
+        return f"{self._a_keys[idx]:.6g} V"
+
+    def _update_a_slider(self) -> None:
+        n = len(self._a_keys)
+        if n == 0:
+            self.aSelSlider.setRange(0, 0)
+            self.aSelSlider.setEnabled(False)
+            self.aSelLbl.setText("Gate A: --")
+            return
+        self.aSelSlider.setRange(0, max(0, n - 1))
+        self.aSelSlider.setEnabled(self._grid_active and n > 1)
+        idx = min(int(self.aSelSlider.value()), n - 1)
+        self.aSelSlider.setValue(idx)
+        self.aSelLbl.setText(f"Gate A: {self._a_label_for_index(idx)}")
+
+    def _on_a_slider(self, _value: int) -> None:
+        self._update_a_slider()
+        self._refresh_linecut_maps()
 
     def _voltage_label_for_index(self, idx: int) -> str:
         if not self._voltage_keys:
@@ -1295,11 +1395,15 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             self.voltageSelLbl.setText("Voltage: --")
             return
         self.voltageSlider.setRange(0, max(0, n - 1))
-        enable = self.sweepPowerChk.isChecked() and self.sweepVoltageChk.isChecked() and (n > 1)
+        enable = (n > 1) and (
+            self._grid_active
+            or (self.sweepPowerChk.isChecked() and self.sweepVoltageChk.isChecked())
+        )
         self.voltageSlider.setEnabled(enable)
         idx = min(int(self.voltageSlider.value()), n - 1)
         self.voltageSlider.setValue(idx)
-        self.voltageSelLbl.setText(f"Voltage: {self._voltage_label_for_index(idx)}")
+        label = "Gate B" if self._grid_active else "Voltage"
+        self.voltageSelLbl.setText(f"{label}: {self._voltage_label_for_index(idx)}")
 
     def _update_power_slider(self) -> None:
         n = len(self._power_view_keys)
@@ -1309,7 +1413,10 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             self.powerSelLbl.setText("Power: --")
             return
         self.powerSlider.setRange(0, max(0, n - 1))
-        enable = self.sweepPowerChk.isChecked() and self.sweepVoltageChk.isChecked() and (n > 1)
+        enable = (n > 1) and (
+            self._grid_active
+            or (self.sweepPowerChk.isChecked() and self.sweepVoltageChk.isChecked())
+        )
         self.powerSlider.setEnabled(enable)
         idx = min(int(self.powerSlider.value()), n - 1)
         self.powerSlider.setValue(idx)
@@ -1445,16 +1552,26 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             "sweep_power": bool(self.sweepPowerChk.isChecked()),
             "sweep_voltage": bool(self.sweepVoltageChk.isChecked()),
             "sweep_gate_mode": self._sweep_gate_mode(),
+            "grid_sweep": bool(self._grid_sweep_selected()),
             "front_v0": float(self.frontV0Spin.value()),
             "front_step": float(self.frontStepSpin.value()),
             "back_v0": float(self.backV0Spin.value()),
             "back_step": float(self.backStepSpin.value()),
             "sweep_steps": int(self.sweepStepsSpin.value()),
+            "sweep_steps_a": int(self.sweepStepsSpin.value()),
+            "sweep_steps_b": int(self.backStepsSpin.value()),
             "power_skip_n": int(self.powerSkipSpin.value()),
+            "sweep_order": "voltage_outer" if self.sweepOrderVoltageOuterRb.isChecked() else "power_outer",
         }
 
     def _reset_sweep_data(self) -> None:
         self._pv_images.clear()
+        self._grid_images.clear()
+        self._grid_active = False
+        self._a_keys = []
+        self._a_labels = []
+        self._b_keys = []
+        self._b_labels = []
         self._voltage_keys = []
         self._voltage_labels = []
         self._voltage_pairs = {}
@@ -1468,6 +1585,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self._refresh_power_table()
         self._update_voltage_slider()
         self._update_power_slider()
+        self._update_a_slider()
         self._refresh_linecut_maps()
 
     # -----------------
@@ -2151,8 +2269,9 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
 
     def _update_vend_labels(self) -> None:
         n = int(self.sweepStepsSpin.value())
+        n_back = int(self.backStepsSpin.value()) if self._grid_sweep_selected() else n
         front_end = float(self.frontV0Spin.value()) + (n - 1) * float(self.frontStepSpin.value())
-        back_end = float(self.backV0Spin.value()) + (n - 1) * float(self.backStepSpin.value())
+        back_end = float(self.backV0Spin.value()) + (n_back - 1) * float(self.backStepSpin.value())
         self.frontVendLbl.setText(f"End: {front_end:.6g} V")
         self.backVendLbl.setText(f"End: {back_end:.6g} V")
 
@@ -2286,7 +2405,11 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self._reset_sweep_data()
 
         mode = self._sweep_gate_mode()
+        grid_active = sweep_voltage and mode == "dual" and self.gridSweepChk.isChecked()
         nsteps = int(self.sweepStepsSpin.value())
+        # In grid mode gate A and gate B use independent step counts.
+        nsteps_a = int(self.sweepStepsSpin.value())
+        nsteps_b = int(self.backStepsSpin.value())
         skip_n = int(self.powerSkipSpin.value())
         power_stride = max(1, skip_n + 1)
         front_v0 = float(self.frontV0Spin.value())
@@ -2301,7 +2424,11 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             if mode in ("back", "dual") and self.back_dev is None:
                 QtWidgets.QMessageBox.warning(self, "Sweep", "Back gate must be connected.")
                 return
-            if nsteps < 1:
+            if grid_active:
+                if nsteps_a < 1 or nsteps_b < 1:
+                    QtWidgets.QMessageBox.warning(self, "Sweep", "Gate A and B steps must be >= 1.")
+                    return
+            elif nsteps < 1:
                 QtWidgets.QMessageBox.warning(self, "Sweep", "Voltage steps must be >= 1.")
                 return
 
@@ -2316,10 +2443,16 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
                     return False
                 return True
 
-            if mode in ("front", "dual") and not _check_v_limits(front_v0, front_step, nsteps, "Front gate"):
-                return
-            if mode in ("back", "dual") and not _check_v_limits(back_v0, back_step, nsteps, "Back gate"):
-                return
+            if grid_active:
+                if not _check_v_limits(front_v0, front_step, nsteps_a, "Front gate (A)"):
+                    return
+                if not _check_v_limits(back_v0, back_step, nsteps_b, "Back gate (B)"):
+                    return
+            else:
+                if mode in ("front", "dual") and not _check_v_limits(front_v0, front_step, nsteps, "Front gate"):
+                    return
+                if mode in ("back", "dual") and not _check_v_limits(back_v0, back_step, nsteps, "Back gate"):
+                    return
 
         self._angle_list_mode = sweep_power and self.angleListChk.isChecked()
 
@@ -2403,7 +2536,33 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self._voltage_keys = []
         self._voltage_labels = []
         self._voltage_pairs = {}
-        if sweep_voltage:
+        self._grid_active = grid_active
+        self._a_keys = []
+        self._a_labels = []
+        self._b_keys = []
+        self._b_labels = []
+        if grid_active:
+            # Gate A values (the fixed axis) and gate B values (the swept axis
+            # / x-axis of the linecut-vs-voltage map).
+            for k in range(nsteps_a):
+                va = front_v0 + k * front_step
+                key = self._normalize_voltage_key(va)
+                if key is None or key in self._a_keys:
+                    continue
+                self._a_keys.append(key)
+                self._a_labels.append(f"{va:.6g} V")
+            for k in range(nsteps_b):
+                vb = back_v0 + k * back_step
+                key = self._normalize_voltage_key(vb)
+                if key is None or key in self._b_keys:
+                    continue
+                self._b_keys.append(key)
+                self._b_labels.append(f"{vb:.6g} V")
+            # The voltage slider / labels drive the gate-B axis.
+            self._voltage_keys = list(self._b_keys)
+            self._voltage_labels = list(self._b_labels)
+            self._voltage_pairs = {b: (None, b) for b in self._b_keys}
+        elif sweep_voltage:
             for k in range(nsteps):
                 vf = front_v0 + k * front_step if mode in ("front", "dual") else None
                 vb = back_v0 + k * back_step if mode in ("back", "dual") else None
@@ -2429,6 +2588,7 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
 
         self._update_voltage_slider()
         self._update_power_slider()
+        self._update_a_slider()
 
         self._prepare_single_mode()
         self._resolve_save_dir()
@@ -2438,6 +2598,8 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
 
         front_icomp_a = float(self.frontIcompSpin.value()) * 1e-9 if sweep_voltage and mode in ("front", "dual") else None
         back_icomp_a = float(self.backIcompSpin.value()) * 1e-9 if sweep_voltage and mode in ("back", "dual") else None
+
+        sweep_order = "voltage_outer" if self.sweepOrderVoltageOuterRb.isChecked() else "power_outer"
 
         self._sweep_thread = PowerVoltageSweepThread(
             self.cam,
@@ -2467,6 +2629,10 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             zero_v_eps=float(ZERO_V_EPS),
             zero_v_extra_settle_ms=float(ZERO_V_EXTRA_SETTLE_MS),
             save_dir=self._save_dir,
+            sweep_order=sweep_order,
+            grid_sweep=grid_active,
+            nsteps_a=nsteps_a,
+            nsteps_b=nsteps_b,
             readout_rate=self._readout_rate_label,
             preamp_gain=self._preamp_gain_label,
             output_amp=self._output_amp_label,
@@ -2620,6 +2786,30 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         except Exception:
             raw_store = np.asarray(raw)
         rank = self._entry_rank(entry) if entry is not None else 0
+
+        if self._grid_active and payload.get("grid"):
+            # Grid data is indexed power -> A -> B (B == voltage_key).
+            a_key = self._normalize_voltage_key(payload.get("a_voltage"))
+            b_key = self._normalize_voltage_key(payload.get("b_voltage"))
+            if a_key is None:
+                a_key = 0.0
+            if b_key is None:
+                b_key = voltage_key
+            if a_key not in self._a_keys:
+                self._a_keys.append(a_key)
+                self._a_labels.append(f"{a_key:.6g} V")
+                self._update_a_slider()
+            if b_key not in self._b_keys:
+                self._b_keys.append(b_key)
+                self._b_labels.append(f"{b_key:.6g} V")
+            a_map = self._grid_images.setdefault(power_key_val, {})
+            b_map = a_map.setdefault(a_key, {})
+            cur = b_map.get(b_key)
+            if cur is None or rank <= cur.get("rank", rank):
+                b_map[b_key] = {"rank": rank, "raw": raw_store}
+            self._refresh_linecut_maps()
+            return
+
         entry_map = self._pv_images.setdefault(power_key_val, {})
         cur = entry_map.get(voltage_key)
         if cur is None or rank <= cur.get("rank", rank):
@@ -2662,7 +2852,9 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
     # Image handling
     # -----------------
     def _prepare_display_image(self, raw):
-        disp = np.fliplr(np.flipud(np.asarray(raw)))
+        # Vertical flip only; horizontal (dispersive) axis stays in native
+        # order so map columns align with the wavelength axis.
+        disp = np.flipud(np.asarray(raw))
         h, w = disp.shape
         top = max(0, min(self._crop_top, h - 1))
         bottom = max(0, min(self._crop_bottom, h - 1))
@@ -2878,8 +3070,97 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self._refresh_linecut_power_map()
         self._refresh_linecut_voltage_map()
 
+    def _linecut_map_yaxis(self, width: int):
+        x_axis = self.liveView.get_linecut_axis()
+        if x_axis is not None and len(x_axis) == width:
+            y0 = float(x_axis[0])
+            y1 = float(x_axis[-1])
+            ylabel = "Wavelength (nm)" if self.liveView.has_wavelength_axis() else "Pixel"
+        else:
+            y0 = 0.0
+            y1 = float(width)
+            ylabel = "Pixel"
+        return y0, y1, ylabel
+
+    def _refresh_grid_power_map(self) -> None:
+        # Linecut vs power at the currently selected gate-A and gate-B values.
+        if not self._power_view_keys or not self._grid_images:
+            self.map_artist.set_data(np.zeros((10, 10)))
+            self.canvas_map.draw_idle()
+            return
+
+        a_key = self._current_a_key()
+        if a_key is None and self._a_keys:
+            a_key = self._a_keys[0]
+        b_key = self._normalize_voltage_key(self._current_voltage_key())
+        if b_key is None and self._b_keys:
+            b_key = sorted(self._b_keys)[0]
+
+        def _img_at(pkey):
+            if a_key is None or b_key is None:
+                return None
+            return self._display_image_from_entry(
+                self._grid_images.get(pkey, {}).get(a_key, {}).get(b_key)
+            )
+
+        first_image = None
+        for pkey in self._power_view_keys:
+            first_image = _img_at(pkey)
+            if first_image is not None:
+                break
+        if first_image is None:
+            self.map_artist.set_data(np.zeros((10, 10)))
+            self.canvas_map.draw_idle()
+            return
+
+        _, width = first_image.shape
+        data = np.full((width, len(self._power_view_keys)), np.nan, dtype=float)
+        linecut_row = self.liveView.linecut_row()
+        if linecut_row is None:
+            return
+
+        for col, pkey in enumerate(self._power_view_keys):
+            img = _img_at(pkey)
+            if img is None or img.shape[1] != width:
+                continue
+            line = self._linecut_from_display(img, linecut_row)
+            if line is None or line.size != width:
+                continue
+            data[:, col] = line
+
+        powers = self._power_view_keys
+        pmin = float(powers[0]) if powers else 0.0
+        pmax = float(powers[-1]) if powers else 1.0
+        if pmin == pmax:
+            pmax = pmin + 1.0
+
+        y0, y1, ylabel = self._linecut_map_yaxis(width)
+
+        x_label = "Stage A angle (°)" if self._angle_list_mode else (f"Power ({self._calib_unit})" if self._calib_unit else "Power")
+        parts = []
+        a_label = self._voltage_label_for_key(a_key) if a_key is not None else "--"
+        if a_label and a_label != "--":
+            parts.append(f"A={a_label}")
+        b_label = self._voltage_label_for_key(b_key) if b_key is not None else "--"
+        if b_label and b_label != "--":
+            parts.append(f"B={b_label}")
+        title = f"Linecut vs {x_label.split(' (')[0]}"
+        if parts:
+            title = f"{title} at {', '.join(parts)}"
+
+        self.map_artist.set_data(data)
+        self.map_artist.set_extent((pmin, pmax, y0, y1))
+        self.ax_map.set_title(title)
+        self.ax_map.set_xlabel(x_label)
+        self.ax_map.set_ylabel(ylabel)
+        self._apply_map_clim(data, self.map_artist, self.mapCminEdit, self.mapCmaxEdit)
+        self.canvas_map.draw_idle()
+
     def _refresh_linecut_power_map(self) -> None:
         if self.liveView is None:
+            return
+        if self._grid_active:
+            self._refresh_grid_power_map()
             return
         if not self._power_view_keys or not self._pv_images:
             self.map_artist.set_data(np.zeros((10, 10)))
@@ -2960,8 +3241,82 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
         self._apply_map_clim(data, self.map_artist, self.mapCminEdit, self.mapCmaxEdit)
         self.canvas_map.draw_idle()
 
+    def _refresh_grid_voltage_map(self) -> None:
+        # Linecut vs gate-B voltage, with gate A held at the current value.
+        if not self._b_keys or not self._grid_images:
+            self.vmap_artist.set_data(np.zeros((10, 10)))
+            self.canvas_vmap.draw_idle()
+            return
+
+        power_key = self._current_power_key()
+        if power_key is None and self._power_view_keys:
+            power_key = self._power_view_keys[0]
+        if power_key is None:
+            power_key = 0.0
+
+        a_key = self._current_a_key()
+        if a_key is None and self._a_keys:
+            a_key = self._a_keys[0]
+
+        b_keys = sorted(self._b_keys)
+        b_map = self._grid_images.get(power_key, {}).get(a_key, {}) if a_key is not None else {}
+
+        first_image = None
+        for bkey in b_keys:
+            first_image = self._display_image_from_entry(b_map.get(bkey))
+            if first_image is not None:
+                break
+        if first_image is None:
+            self.vmap_artist.set_data(np.zeros((10, 10)))
+            self.canvas_vmap.draw_idle()
+            return
+
+        _, width = first_image.shape
+        data = np.full((width, len(b_keys)), np.nan, dtype=float)
+        linecut_row = self.liveView.linecut_row()
+        if linecut_row is None:
+            return
+
+        for col, bkey in enumerate(b_keys):
+            img = self._display_image_from_entry(b_map.get(bkey))
+            if img is None or img.shape[1] != width:
+                continue
+            line = self._linecut_from_display(img, linecut_row)
+            if line is None or line.size != width:
+                continue
+            data[:, col] = line
+
+        bmin = float(b_keys[0])
+        bmax = float(b_keys[-1])
+        if bmin == bmax:
+            bmax = bmin + 1.0
+
+        y0, y1, ylabel = self._linecut_map_yaxis(width)
+
+        title = "Linecut vs Gate B"
+        parts = []
+        a_label = self._voltage_label_for_key(a_key) if a_key is not None else "--"
+        if a_label and a_label != "--":
+            parts.append(f"A={a_label}")
+        power_label = self._format_power_key(float(power_key))
+        if power_label and power_label != "--" and self.sweepPowerChk.isChecked():
+            parts.append(power_label)
+        if parts:
+            title = f"Linecut vs Gate B at {', '.join(parts)}"
+
+        self.vmap_artist.set_data(data)
+        self.vmap_artist.set_extent((bmin, bmax, y0, y1))
+        self.ax_vmap.set_title(title)
+        self.ax_vmap.set_xlabel("Gate B voltage (V)")
+        self.ax_vmap.set_ylabel(ylabel)
+        self._apply_map_clim(data, self.vmap_artist, self.vmapCminEdit, self.vmapCmaxEdit)
+        self.canvas_vmap.draw_idle()
+
     def _refresh_linecut_voltage_map(self) -> None:
         if self.liveView is None:
+            return
+        if self._grid_active:
+            self._refresh_grid_voltage_map()
             return
         if not self._voltage_keys or not self._pv_images:
             self.vmap_artist.set_data(np.zeros((10, 10)))
@@ -3084,10 +3439,12 @@ class PLPowerVoltageWidget(QtWidgets.QWidget):
             f"- Sweep power: {meta.get('sweep_power', '')}",
             f"- Sweep voltage: {meta.get('sweep_voltage', '')}",
             f"- Gate mode: {meta.get('sweep_gate_mode', '')}",
+            f"- Grid (fix A, sweep B): {meta.get('grid_sweep', '')}",
             f"- Front V0/step: {meta.get('front_v0', '')}, {meta.get('front_step', '')}",
             f"- Skip N power points: {meta.get('power_skip_n', 0)}",
             f"- Back V0/step: {meta.get('back_v0', '')}, {meta.get('back_step', '')}",
             f"- Steps: {meta.get('sweep_steps', '')}",
+            f"- Grid steps A x B: {meta.get('sweep_steps_a', '')} x {meta.get('sweep_steps_b', '')}",
             "",
             "## Calibration",
             f"- File: {meta.get('power_calib_file', '')}",

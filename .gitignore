@@ -30,6 +30,9 @@ code by weijian/
 # CSV files are data by default — use 'git add -f file.csv' to force-add exceptions like IRF calibration files
 *.csv
 
+# Downloaded package installers
+*.whl
+
 # Error/log files
 ___All_Errors.txt
 

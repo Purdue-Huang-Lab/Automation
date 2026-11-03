@@ -1464,7 +1464,9 @@ class AndorSystem:
             out[:, 0] = wl
             out[:, 1:] = a.T
             header = "\n".join(header_lines)
-            np.savetxt(filepath, out, fmt="%g", header=header)
+            # wavelength "%g" as always; intensities "%.10g": the same text as "%g" below 1e6 counts,
+            # and exact above it ("%g" rounded e.g. 1234567 to 1.23457e+06)
+            np.savetxt(filepath, out, fmt=["%g"] + ["%.10g"] * a.shape[0], header=header)
         else:
             header = "\n".join(header_lines)
             np.savetxt(filepath, a, fmt="%d", header=header)

@@ -1,0 +1,63 @@
+{
+  "kind": "gtd1_dual_gate_calibration",
+  "version": 1,
+  "r": 0.4612,
+  "r_sigma": 0.0205,
+  "r_definition": "r = c_b/c_t = d_front/d_back ;  u_n = V_f + r*V_b (density),  u_D = V_f - r*V_b (displacement)",
+  "methods": {
+    "integrated_intensity": {
+      "abs_r": 0.4648,
+      "signed_r": 0.4648,
+      "score_R2": 0.9085,
+      "reliable": true
+    },
+    "peak_height": {
+      "abs_r": 0.4843,
+      "signed_r": 0.4843,
+      "score_R2": 0.8291,
+      "reliable": true
+    },
+    "fft_ridge": {
+      "abs_r": 0.4344,
+      "reliable": true
+    },
+    "peak_energy_crosscheck": {
+      "abs_r": 2.0001,
+      "score_R2": 0.6005,
+      "reliable": false,
+      "note": "IX energy mixes Stark(D)+doping(n); does not collapse"
+    }
+  },
+  "data": {
+    "source_dir": "(not recorded in this cache)",
+    "cache": "dual_gate_speccube_gtd1.npz",
+    "cache_built": null,
+    "grid": [
+      41,
+      41
+    ],
+    "vf_range": [
+      -4.0,
+      4.0
+    ],
+    "vb_range": [
+      -4.0,
+      4.0
+    ],
+    "n_measured": 1681,
+    "ix_window_eV": [
+      1.28,
+      1.52
+    ],
+    "bg_window_nm": [
+      1050.0,
+      1150.0
+    ],
+    "band_half_rows": 5
+  },
+  "fit": {
+    "method": "shear-collapse (ANOVA R^2) on IX intensity; r = mean(integrated, peak-height, FFT)",
+    "created": "2026-09-17T17:21:33",
+    "script": "gtd1_full_collapse.py"
+  }
+}

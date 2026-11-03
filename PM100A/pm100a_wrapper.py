@@ -115,17 +115,24 @@ class PM100A:
 
     def zero(self, timeout_s: float = 30.0) -> None:
         """Measure dark offset and apply it as zero. Block all light first."""
-        with self._lock:
-            self._chk(self._dll.TLPM_startDarkAdjust(self._vi), "startDarkAdjust")
-        # TLPMX_getDarkAdjustState: 0 = idle/done, non-zero = busy
-        state = _ViUInt16(1)
+        self.start_dark_adjust()
         deadline = time.monotonic() + timeout_s
-        while state.value != 0:
+        while self.is_dark_adjust_busy():
             if time.monotonic() > deadline:
                 raise PM100AError("Dark adjust timed out")
             time.sleep(0.1)
-            with self._lock:
-                self._dll.TLPMX_getDarkAdjustState(self._vi, ctypes.byref(state))
+
+    def start_dark_adjust(self) -> None:
+        """Start a dark adjust without waiting; poll is_dark_adjust_busy()."""
+        with self._lock:
+            self._chk(self._dll.TLPM_startDarkAdjust(self._vi), "startDarkAdjust")
+
+    def is_dark_adjust_busy(self) -> bool:
+        # TLPMX_getDarkAdjustState: 0 = idle/done, non-zero = busy
+        state = _ViUInt16(1)
+        with self._lock:
+            self._dll.TLPMX_getDarkAdjustState(self._vi, ctypes.byref(state))
+        return state.value != 0
 
     # ---- Range ----
 

@@ -17,14 +17,14 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 # AUTOMATION_DATA_DIR environment variable, e.g. in a .env file or shell profile.
 DATA_DIR = os.environ.get(
     "AUTOMATION_DATA_DIR",
-    r"C:\Data\Minxue\260402gatedtrilayer",
+    r"D:\Data\Minxue\261022_GT_D1_trilayer",
 )
 
 DEFAULT_STAGE_SERIAL = "27600825"
 DEFAULT_STAGE_B_SERIAL = "27600915"
 DEFAULT_STAGE_SCALE = "PRM1-Z8"
 
-DEFAULT_EXPOSURE_MS = 500.0
+DEFAULT_EXPOSURE_MS = 1000.0
 DEFAULT_ACQ_NUMBER = 1
 DEFAULT_READOUT_RATE = "2.6MHz at 16-bit"
 DEFAULT_PREAMP_GAIN = "4x"
@@ -32,7 +32,7 @@ DEFAULT_OUTPUT_AMP = "Conventional"
 
 DEFAULT_GRATING = 1
 DEFAULT_CENTER_WL_NM = 850.0
-DEFAULT_SLIT_UM = 100.0
+DEFAULT_SLIT_UM = 200
 DEFAULT_SPEC_INDEX = 0
 DEFAULT_SLIT_ID = "input_side"
 

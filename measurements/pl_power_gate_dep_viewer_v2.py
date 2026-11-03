@@ -46,9 +46,11 @@ _DIP_COLORS   = ["#ff7f0e", "#2ca02c", "#9467bd", "#8c564b", "#e377c2"]
 # ══════════════════════════════════════════════════════════════════════
 
 class PLFrame:
-    __slots__ = ("path", "power_w", "v_front", "v_back", "wavelength_nm", "image", "meta", "mtime", "angle_deg")
+    __slots__ = ("path", "power_w", "v_front", "v_back", "wavelength_nm", "image", "meta",
+                 "mtime", "angle_deg", "vf_named", "vb_named")
 
-    def __init__(self, path, power_w, v_front, v_back, wavelength_nm, image, meta, mtime, angle_deg=None):
+    def __init__(self, path, power_w, v_front, v_back, wavelength_nm, image, meta, mtime,
+                 angle_deg=None, vf_named=False, vb_named=False):
         self.path        = path
         self.power_w     = power_w
         self.v_front     = v_front
@@ -58,6 +60,10 @@ class PLFrame:
         self.meta        = meta
         self.mtime       = mtime
         self.angle_deg   = angle_deg
+        # Whether the front/back gate value came from the file NAME (the swept
+        # target) rather than metadata (a noisy read-back of a fixed gate).
+        self.vf_named    = vf_named
+        self.vb_named    = vb_named
 
 
 class _Channel:
@@ -68,10 +74,15 @@ class _Channel:
         self.frames:   List[PLFrame]                             = []
         self.grid:     Dict[Tuple[float, float], PLFrame]        = {}
         self.powers:   np.ndarray                                = np.array([], dtype=float)
-        self.gates:    np.ndarray                                = np.array([], dtype=float)
+        self.gates:    np.ndarray                                = np.array([], dtype=float)   # unique front-gate values
+        self.backs:    np.ndarray                                = np.array([], dtype=float)   # unique back-gate values
         self.backs_for_gate: np.ndarray                          = np.array([], dtype=float)
+        # Full 3-D grid keyed by (power, v_front, v_back) — needed for grid-mode data
+        self.grid3:    Dict[Tuple[float, float, float], PLFrame] = {}
+        self.is_grid:  bool                                      = False
         self.default_power_key: float                            = 0.0
         self.default_gate_key:  float                            = 0.0
+        self.default_back_key:  float                            = 0.0
         self.can_power_mode: bool                                = False
         self.can_gate_mode:  bool                                = False
         self.blank_image: Optional[np.ndarray]                   = None
@@ -208,6 +219,130 @@ def _parse_from_name(name: str) -> Tuple[Optional[float], Optional[float], Optio
 def _parse_angle_from_name(name: str) -> Optional[float]:
     m = _ANGLE_RE.search(name)
     return _tok(m.group("val")) if m else None
+
+
+# ── Angle → power calibration files ───────────────────────────────────
+
+# Unit token in a power column header: "power (nW)", "power/uw", "power_mW", …
+_CALIB_UNIT_RE = re.compile(r"\b(?P<unit>[munµ]?)w\b")
+_CALIB_SCALE   = {"": 1.0, "m": 1e-3, "u": 1e-6, "µ": 1e-6, "n": 1e-9}
+
+
+def _calib_power_scale(header: str) -> float:
+    """Watts per unit implied by a power column header (default µW)."""
+    h = re.sub(r"[^a-zµ]+", " ", str(header).lower())
+    m = _CALIB_UNIT_RE.search(h)
+    return _CALIB_SCALE.get(m.group("unit"), 1e-6) if m else 1e-6
+
+
+def _read_calib_file(path: Path):
+    """Read a calibration sheet as a raw, header-less grid of cells."""
+    import pandas as pd
+    if path.suffix.lower() in (".xlsx", ".xls"):
+        try:
+            return pd.read_excel(path, header=None, dtype=object)
+        except ImportError as exc:
+            # pandas needs openpyxl (.xlsx) / xlrd (.xls) as a separate install;
+            # name the interpreter, since the usual cause is running the viewer
+            # with the wrong venv rather than a broken environment.
+            pkg = "openpyxl" if path.suffix.lower() == ".xlsx" else "xlrd"
+            raise ImportError(
+                f"Reading .xlsx/.xls needs the '{pkg}' package, which is missing "
+                f"from the Python running this viewer:\n\n    {sys.executable}\n\n"
+                f"Install it with:\n\n    \"{sys.executable}\" -m pip install {pkg}\n\n"
+                "Or launch the viewer through run_pl_power_gate_dep_viewer_v2.ps1, "
+                "which uses the Automation .venv where it is already installed."
+            ) from exc
+    return pd.read_csv(path, header=None, dtype=object, engine="python")
+
+
+def _parse_angle_power_calib(path: Path):
+    """Parse an angle→power calibration file.
+
+    The whole sheet is scanned instead of assuming the table starts at cell A1,
+    so a title row above the header ("nd wheel | 690") is handled, and so are
+    point pairs pasted into unrelated columns.
+
+    Returns (angles, powers_w, extra_angles, extra_powers_w); the extra_* arrays
+    hold numeric pairs found OUTSIDE the labelled angle/power columns, which the
+    caller decides whether to trust.
+    """
+    import pandas as pd
+
+    raw = _read_calib_file(path)
+    if raw.empty:
+        raise ValueError("The file is empty.")
+    nrow, ncol = raw.shape
+
+    # 1. Locate every "angle"/"power" header pair (there may be several blocks).
+    blocks = []                      # (angle_col, power_col, header_row, scale)
+    for r in range(nrow):
+        a_c = p_c = None
+        p_hdr = ""
+        for c in range(ncol):
+            v = raw.iat[r, c]
+            if not isinstance(v, str):
+                continue
+            s = v.strip().lower()
+            if a_c is None and "angle" in s:
+                a_c = c
+            elif p_c is None and "power" in s:
+                p_c, p_hdr = c, s
+        if a_c is not None and p_c is not None:
+            blocks.append((a_c, p_c, r, _calib_power_scale(p_hdr)))
+    if not blocks:
+        raise ValueError(
+            "Could not find 'angle' and 'power' column headers anywhere in "
+            f"{path.name}.\n\nExpected a header row such as:  angle | power (nW)")
+
+    # 2. Numeric rows under each labelled block.
+    angles, powers_w, used = [], [], set()
+    for a_c, p_c, hdr_row, scale in blocks:
+        used |= {a_c, p_c}
+        a = pd.to_numeric(raw[a_c], errors="coerce")
+        p = pd.to_numeric(raw[p_c], errors="coerce")
+        keep = a.notna() & p.notna()
+        keep.iloc[:hdr_row + 1] = False
+        angles.extend(a[keep].astype(float).tolist())
+        powers_w.extend((p[keep].astype(float) * scale).tolist())
+    if not angles:
+        raise ValueError(
+            f"Found 'angle'/'power' headers in {path.name} but no numeric rows "
+            "underneath them.")
+
+    # 3. Orphan pairs: numerics in adjacent columns that nobody labelled. This is
+    #    how points pasted into e.g. columns G/H get noticed instead of dropped.
+    scale0 = blocks[0][3]
+    extra_a, extra_p = [], []
+    free = [c for c in range(ncol) if c not in used]
+    i = 0
+    while i < len(free) - 1:
+        c1, c2 = free[i], free[i + 1]
+        if c2 != c1 + 1:
+            i += 1
+            continue
+        x = pd.to_numeric(raw[c1], errors="coerce")
+        y = pd.to_numeric(raw[c2], errors="coerce")
+        keep = x.notna() & y.notna()
+        if keep.any():
+            extra_a.extend(x[keep].astype(float).tolist())
+            extra_p.extend((y[keep].astype(float) * scale0).tolist())
+            i += 2                   # both columns consumed
+        else:
+            i += 1
+
+    return (np.asarray(angles, dtype=float), np.asarray(powers_w, dtype=float),
+            np.asarray(extra_a, dtype=float), np.asarray(extra_p, dtype=float))
+
+
+def _finalise_calib(angles: np.ndarray, powers_w: np.ndarray):
+    """Sort by angle and collapse duplicates — np.interp needs increasing x."""
+    order = np.argsort(angles, kind="stable")
+    a, p  = angles[order], powers_w[order]
+    uniq, idx = np.unique(a, return_index=True)
+    if uniq.size != a.size:
+        a, p = uniq, p[idx]
+    return a, p
 
 
 def _norm_key(v: Optional[float]) -> Optional[float]:
@@ -851,6 +986,8 @@ def _load_frames(data_dir: Path) -> List[PLFrame]:
             meta       = meta,
             mtime      = float(path.stat().st_mtime),
             angle_deg  = angle_n,
+            vf_named   = vf_n is not None,   # swept front → clean target in filename
+            vb_named   = vb_n is not None,   # swept back  → clean target in filename
         ))
     return frames
 
@@ -858,39 +995,85 @@ def _load_frames(data_dir: Path) -> List[PLFrame]:
 def _build_channel(ch: _Channel, frames: List[PLFrame]) -> None:
     """Populate grid / powers / gates from frames list."""
     ch.frames = frames
+
+    # A gate is "swept" only if its value appears in the file name (a clean
+    # target). A gate that only ever comes from metadata is a FIXED gate whose
+    # read-back is noisy — collapse it to a single representative value so read
+    # noise cannot fragment it into many spurious grid keys.
+    front_named = any(getattr(fr, "vf_named", False) for fr in frames)
+    back_named  = any(getattr(fr, "vb_named", False) for fr in frames)
+
+    def _collapsed(vals) -> float:
+        v = [float(x) for x in vals if x is not None and np.isfinite(x)]
+        return 0.0 if not v else float(round(float(np.median(v)), 3))
+
+    fixed_front = None if front_named else _norm_key(_collapsed([fr.v_front for fr in frames]))
+    fixed_back  = None if back_named  else _norm_key(_collapsed([fr.v_back  for fr in frames]))
+
+    def _eff_vf(fr):
+        return _norm_key(fr.v_front) if fixed_front is None else fixed_front
+
+    def _eff_vb(fr):
+        return _norm_key(fr.v_back) if fixed_back is None else fixed_back
+
     power_keys: set = set()
     gate_keys:  set = set()
+    back_keys:  set = set()
     back_by_gate: Dict = {}
 
     for fr in frames:
         p  = _norm_key(fr.power_w)
-        vf = _norm_key(fr.v_front)
-        vb = _norm_key(fr.v_back)
+        vf = _eff_vf(fr)
+        vb = _eff_vb(fr)
         if p  is not None: power_keys.add(p)
+        if vb is not None: back_keys.add(vb)
         if vf is not None:
             gate_keys.add(vf)
             if vb is not None:
-                back_by_gate.setdefault(vf, []).append(float(vb))
+                back_by_gate.setdefault(vf, []).append(vb)
 
     if not power_keys: power_keys = {0.0}
     if not gate_keys:  gate_keys  = {0.0}
+    if not back_keys:  back_keys  = {0.0}
 
     ch.powers = np.array(sorted(power_keys), dtype=float)
     ch.gates  = np.array(sorted(gate_keys),  dtype=float)
+    ch.backs  = np.array(sorted(back_keys),  dtype=float)
     ch.default_power_key = float(_norm_key(ch.powers[0]) or 0.0)
     ch.default_gate_key  = float(_norm_key(ch.gates[0])  or 0.0)
+    ch.default_back_key  = float(_norm_key(ch.backs[0])  or 0.0)
 
+    # Grid mode: the back gate is not a function of the front gate, i.e. at least
+    # one front-gate value was measured at more than one back-gate value (this
+    # also covers a pure back sweep at a single fixed front value).
+    ch.is_grid = any(len(set(vbs)) > 1 for vbs in back_by_gate.values())
+
+    def _key_vf(fr):
+        v = _eff_vf(fr)
+        return ch.default_gate_key if v is None else float(v)
+
+    def _key_vb(fr):
+        v = _eff_vb(fr)
+        return ch.default_back_key if v is None else float(v)
+
+    # 2-D grid keyed by (power, front) — used for non-grid data and as a fallback
     ch.grid = {}
     for fr in frames:
-        p  = _ch_norm_power(ch, fr.power_w)
-        vf = _ch_norm_gate( ch, fr.v_front)
-        key = (p, vf)
+        key = (_ch_norm_power(ch, fr.power_w), _key_vf(fr))
         old = ch.grid.get(key)
         if old is None or fr.mtime > old.mtime:
             ch.grid[key] = fr
 
+    # 3-D grid keyed by (power, front, back) — used for grid-mode data
+    ch.grid3 = {}
+    for fr in frames:
+        key = (_ch_norm_power(ch, fr.power_w), _key_vf(fr), _key_vb(fr))
+        old = ch.grid3.get(key)
+        if old is None or fr.mtime > old.mtime:
+            ch.grid3[key] = fr
+
     ch.can_power_mode = ch.powers.size > 1
-    ch.can_gate_mode  = ch.gates.size  > 1
+    ch.can_gate_mode  = ch.gates.size  > 1 or ch.backs.size > 1
     ch.angle_mode = any(fr.angle_deg is not None for fr in frames)
 
     backs = np.full(ch.gates.shape, np.nan, dtype=float)
@@ -922,6 +1105,29 @@ def _ch_norm_power(ch: _Channel, p: Optional[float]) -> float:
 def _ch_norm_gate(ch: _Channel, vf: Optional[float]) -> float:
     k = _norm_key(vf)
     return ch.default_gate_key if k is None else float(k)
+
+
+def _ch_norm_back(ch: _Channel, vb: Optional[float]) -> float:
+    k = _norm_key(vb)
+    return ch.default_back_key if k is None else float(k)
+
+
+def _frame_at(ch: _Channel, p_key: float, vf_key: float, vb_key: float) -> Optional[PLFrame]:
+    """Fetch the frame at (power, front, back).
+
+    Grid data is indexed by all three; non-grid data is indexed by (power, front)
+    only (the back gate follows the front gate)."""
+    if ch.is_grid:
+        fr = ch.grid3.get((p_key, vf_key, vb_key))
+        if fr is not None:
+            return fr
+        # fall back to the nearest back gate measured at this (power, front)
+        cands = [(k, v) for k, v in ch.grid3.items() if k[0] == p_key and k[1] == vf_key]
+        if cands:
+            cands.sort(key=lambda kv: abs(kv[0][2] - vb_key))
+            return cands[0][1]
+        return None
+    return ch.grid.get((p_key, vf_key))
 
 
 def _ch_substrate_for(ch: _Channel, fr: PLFrame) -> Optional[PLFrame]:
@@ -1560,9 +1766,12 @@ class PLViewerV2(QtWidgets.QMainWindow):
         # one _Channel per key: "" = non-pol, "LH", "RH"
         self._ch: Dict[str, _Channel] = {"": _Channel(), "LH": _Channel(), "RH": _Channel()}
         self._crop      = DEFAULT_CROP
-        self._main_idx  = 0
-        self._fixed_idx = 0
+        self._power_idx = 0
+        self._front_idx = 0
+        self._back_idx  = 0
         self._current_mode = self.MODE_POWER
+        self._gate_axis    = "front"   # "front" | "back" — swept gate in gate mode
+        self._cube_win     = None
         self._last_x: Optional[np.ndarray]      = None
         self._last_y_wl: Optional[np.ndarray]   = None
         self._last_map: Optional[np.ndarray]     = None
@@ -1699,23 +1908,47 @@ class PLViewerV2(QtWidgets.QMainWindow):
         slider_grid.addWidget(QtWidgets.QLabel("Mode:"), 0, 0)
         self.modeCombo = QtWidgets.QComboBox()
         self.modeCombo.addItems([self.MODE_POWER, self.MODE_GATE])
-        self.modeCombo.setFixedWidth(160)
+        self.modeCombo.setFixedWidth(150)
         slider_grid.addWidget(self.modeCombo, 0, 1)
 
-        slider_grid.addWidget(QtWidgets.QLabel("Main:"), 0, 2)
-        self.mainSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.mainSlider.setTracking(True)
-        slider_grid.addWidget(self.mainSlider, 0, 3)
-        self.mainLbl = QtWidgets.QLabel("--")
-        self.mainLbl.setMinimumWidth(200)
-        slider_grid.addWidget(self.mainLbl, 0, 4)
+        slider_grid.addWidget(QtWidgets.QLabel("Gate axis:"), 0, 2)
+        self.gateAxisCombo = QtWidgets.QComboBox()
+        self.gateAxisCombo.addItems(["Front gate", "Back gate"])
+        self.gateAxisCombo.setFixedWidth(120)
+        self.gateAxisCombo.setToolTip(
+            "In Gate dependence mode, choose which gate is swept along the map\n"
+            "x-axis; the other gate is held fixed by its slider (grid data only).")
+        slider_grid.addWidget(self.gateAxisCombo, 0, 3)
 
-        slider_grid.addWidget(QtWidgets.QLabel("Fixed:"), 1, 2)
-        self.fixedSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.fixedSlider.setTracking(True)
-        slider_grid.addWidget(self.fixedSlider, 1, 3)
-        self.fixedLbl = QtWidgets.QLabel("--")
-        slider_grid.addWidget(self.fixedLbl, 1, 4)
+        self.cubeBtn = QtWidgets.QPushButton("Print cube")
+        self.cubeBtn.setFixedWidth(100)
+        self.cubeBtn.setToolTip(
+            "Open a 3-D volume: x = front gate, y = back gate, z = wavelength,\n"
+            "colour = baseline-corrected linecut intensity (baseline transparent).")
+        slider_grid.addWidget(self.cubeBtn, 0, 4)
+
+        # Power / Front / Back sliders
+        slider_grid.addWidget(QtWidgets.QLabel("Power:"), 1, 0)
+        self.powerSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.powerSlider.setTracking(True)
+        slider_grid.addWidget(self.powerSlider, 1, 1, 1, 3)
+        self.powerLbl = QtWidgets.QLabel("--")
+        self.powerLbl.setMinimumWidth(200)
+        slider_grid.addWidget(self.powerLbl, 1, 4)
+
+        slider_grid.addWidget(QtWidgets.QLabel("Front gate:"), 2, 0)
+        self.frontSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.frontSlider.setTracking(True)
+        slider_grid.addWidget(self.frontSlider, 2, 1, 1, 3)
+        self.frontLbl = QtWidgets.QLabel("--")
+        slider_grid.addWidget(self.frontLbl, 2, 4)
+
+        slider_grid.addWidget(QtWidgets.QLabel("Back gate:"), 3, 0)
+        self.backSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.backSlider.setTracking(True)
+        slider_grid.addWidget(self.backSlider, 3, 1, 1, 3)
+        self.backLbl = QtWidgets.QLabel("--")
+        slider_grid.addWidget(self.backLbl, 3, 4)
 
         right.addLayout(slider_grid)
 
@@ -1820,8 +2053,11 @@ class PLViewerV2(QtWidgets.QMainWindow):
         self.bgHiSpin.valueChanged.connect(lambda _: self._clear_caches_and_refresh())
         self.subCheck.toggled.connect(lambda _: self._refresh_all())
         self.modeCombo.currentTextChanged.connect(self._on_mode_changed)
-        self.mainSlider.valueChanged.connect(self._on_main_changed)
-        self.fixedSlider.valueChanged.connect(self._on_fixed_changed)
+        self.gateAxisCombo.currentTextChanged.connect(self._on_gate_axis_changed)
+        self.powerSlider.valueChanged.connect(self._on_power_changed)
+        self.frontSlider.valueChanged.connect(self._on_front_changed)
+        self.backSlider.valueChanged.connect(self._on_back_changed)
+        self.cubeBtn.clicked.connect(self._on_print_cube)
         self.cropApplyBtn.clicked.connect(self._on_apply_crop)
         self.derivMaxSpin.valueChanged.connect(lambda _: self._update_maps())
         for w in (self.sgSweepCheck, self.sgWlCheck, self.sgSweepWin, self.sgSweepOrd, self.sgWlWin, self.sgWlOrd):
@@ -1945,51 +2181,61 @@ class PLViewerV2(QtWidgets.QMainWindow):
         )
         if not path:
             return
+        p = Path(path)
         try:
-            import pandas as pd
-            p = Path(path)
-            calib_angles = calib_powers_w = None
-            for h in (0, 1, None):
-                try:
-                    df = pd.read_excel(p, header=h) if p.suffix.lower() in (".xlsx", ".xls") else pd.read_csv(p, header=h)
-                    cols = {str(c).lower().strip(): c for c in df.columns}
-                    angle_col = next((cols[k] for k in cols if "angle" in k), None)
-                    power_col = next((cols[k] for k in cols if "power" in k), None)
-                    if angle_col is None or power_col is None:
-                        continue
-                    angles = pd.to_numeric(df[angle_col], errors="coerce")
-                    powers = pd.to_numeric(df[power_col], errors="coerce")
-                    valid  = angles.notna() & powers.notna()
-                    if valid.sum() < 2:
-                        continue
-                    angles = np.asarray(angles[valid], dtype=float)
-                    powers = np.asarray(powers[valid], dtype=float)
-                    # detect unit from column name suffix
-                    pc = str(power_col).lower()
-                    if "/mw" in pc or "mw" in pc:
-                        scale = 1e-3
-                    elif "/nw" in pc or "nw" in pc:
-                        scale = 1e-9
-                    elif "/w" in pc and "mw" not in pc and "nw" not in pc and "uw" not in pc:
-                        scale = 1.0
-                    else:
-                        scale = 1e-6  # default: µW
-                    order = np.argsort(angles)
-                    calib_angles   = angles[order]
-                    calib_powers_w = powers[order] * scale
-                    break
-                except Exception:
-                    continue
-            if calib_angles is None:
-                raise ValueError("Could not find 'angle' and 'power' columns in the file.")
-            for ch in self._ch.values():
-                ch._angle_calib_angles   = calib_angles
-                ch._angle_calib_powers_w = calib_powers_w
-            n = len(calib_angles)
-            self.angleCalibStatusLbl.setText(f"{n} pts: {p.name}")
-            self._refresh_all()
+            angles, powers_w, extra_a, extra_p = _parse_angle_power_calib(p)
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Load error", str(exc))
+            QtWidgets.QMessageBox.critical(
+                self, "Calibration load error", f"{p.name}\n\n{exc}")
+            return
+
+        # Pairs sitting outside the labelled angle/power columns are the usual
+        # cause of a calibration that loads but is missing points, so ask rather
+        # than dropping them silently.
+        if extra_a.size:
+            shown = "\n".join(f"    {a:g}°  →  {w * 1e6:.4g} µW"
+                              for a, w in zip(extra_a[:10], extra_p[:10]))
+            more  = f"\n    … and {extra_a.size - 10} more" if extra_a.size > 10 else ""
+            ans = QtWidgets.QMessageBox.question(
+                self, "Extra calibration points",
+                f"{p.name} has {extra_a.size} numeric pair(s) outside the "
+                f"labelled 'angle'/'power' columns:\n\n{shown}{more}\n\n"
+                "Include them in the calibration?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes)
+            if ans == QtWidgets.QMessageBox.Yes:
+                angles   = np.concatenate([angles, extra_a])
+                powers_w = np.concatenate([powers_w, extra_p])
+
+        angles, powers_w = _finalise_calib(angles, powers_w)
+        if angles.size < 2:
+            QtWidgets.QMessageBox.critical(
+                self, "Calibration load error",
+                f"{p.name}\n\nNeed at least 2 distinct angles; got {angles.size}.")
+            return
+
+        for ch in self._ch.values():
+            ch._angle_calib_angles   = angles
+            ch._angle_calib_powers_w = powers_w
+
+        self.angleCalibStatusLbl.setText(f"{angles.size} pts: {p.name}")
+        self.angleCalibStatusLbl.setToolTip(
+            f"{p}\n{angles.size} points, {angles[0]:g}° – {angles[-1]:g}°, "
+            f"{powers_w.min() * 1e6:.4g} – {powers_w.max() * 1e6:.4g} µW\n"
+            "Angles outside this range are clamped to the nearest endpoint.")
+
+        # The calibration only shows up on data whose file names carry a stage
+        # angle; say so instead of leaving the user wondering why nothing moved.
+        loaded = [ch for ch in self._ch.values() if ch.has_data]
+        if loaded and not any(ch.angle_mode for ch in loaded):
+            QtWidgets.QMessageBox.information(
+                self, "Calibration loaded",
+                f"Loaded {angles.size} calibration points from {p.name}.\n\n"
+                "The data currently loaded has no stage angle in its file names "
+                "(expected e.g. PL_A180deg_Vf0_Vb0.asc), so it is treated as a "
+                "fixed-power measurement and the calibration will not be applied "
+                "to its axes.")
+        self._refresh_all()
 
     def _browse_data(self, key: str) -> None:
         ch  = self._ch[key]
@@ -2230,53 +2476,98 @@ class PLViewerV2(QtWidgets.QMainWindow):
 
     def _on_mode_changed(self, text: str) -> None:
         self._current_mode = text
-        self._main_idx = 0
-        self._fixed_idx = 0
         self._reconfigure_sliders()
-
-    def _on_main_changed(self, v: int) -> None:
-        self._main_idx = int(v)
         self._refresh_all()
 
-    def _on_fixed_changed(self, v: int) -> None:
-        self._fixed_idx = int(v)
+    def _on_gate_axis_changed(self, text: str) -> None:
+        self._gate_axis = "back" if "back" in text.lower() else "front"
         self._refresh_all()
+
+    def _on_power_changed(self, v: int) -> None:
+        self._power_idx = int(v)
+        self._refresh_all()
+
+    def _on_front_changed(self, v: int) -> None:
+        self._front_idx = int(v)
+        ch = self._primary_ch()
+        if not ch.is_grid:
+            self._sync_back_to_front(ch)   # non-grid: back follows front
+        self._refresh_all()
+
+    def _on_back_changed(self, v: int) -> None:
+        self._back_idx = int(v)
+        self._refresh_all()
+
+    def _cur_power_key(self, ch: _Channel) -> float:
+        return _ch_norm_power(ch, float(ch.powers[self._power_idx])) if ch.powers.size else ch.default_power_key
+
+    def _cur_front_key(self, ch: _Channel) -> float:
+        return _ch_norm_gate(ch, float(ch.gates[self._front_idx])) if ch.gates.size else ch.default_gate_key
+
+    def _cur_back_key(self, ch: _Channel) -> float:
+        return _ch_norm_back(ch, float(ch.backs[self._back_idx])) if ch.backs.size else ch.default_back_key
+
+    def _sync_back_to_front(self, ch: _Channel) -> None:
+        """Non-grid data: set the back slider to the back value paired with the
+        currently-selected front gate, and keep it read-only."""
+        if ch.gates.size == 0 or ch.backs.size == 0:
+            return
+        fi = max(0, min(self._front_idx, ch.gates.size - 1))
+        vb = ch.backs_for_gate[fi] if fi < ch.backs_for_gate.size else np.nan
+        if np.isfinite(vb):
+            bi = int(np.argmin(np.abs(ch.backs - float(vb))))
+            self._back_idx = bi
+            self.backSlider.blockSignals(True)
+            self.backSlider.setValue(bi)
+            self.backSlider.blockSignals(False)
 
     def _reconfigure_sliders(self) -> None:
         ch = self._primary_ch()
+        for s in (self.powerSlider, self.frontSlider, self.backSlider):
+            s.blockSignals(True)
         if not ch.has_data:
-            self.mainSlider.setRange(0, 0)
-            self.fixedSlider.setRange(0, 0)
+            for s in (self.powerSlider, self.frontSlider, self.backSlider):
+                s.setRange(0, 0)
+                s.blockSignals(False)
+            self.gateAxisCombo.setEnabled(False)
             return
-        if self._current_mode == self.MODE_GATE:
-            n_main  = ch.gates.size
-            n_fixed = ch.powers.size
-        else:
-            n_main  = ch.powers.size
-            n_fixed = ch.gates.size
 
-        for slider, n, attr in [
-            (self.mainSlider,  n_main,  "_main_idx"),
-            (self.fixedSlider, n_fixed, "_fixed_idx"),
-        ]:
-            slider.blockSignals(True)
-            slider.setRange(0, max(0, n - 1))
-            setattr(self, attr, max(0, min(getattr(self, attr), max(0, n - 1))))
-            slider.setValue(getattr(self, attr))
-            slider.blockSignals(False)
-
-        # auto-select mode if only one is available
-        combo_was = self._current_mode
+        # auto-select mode if only one axis is available
         if ch.can_gate_mode and not ch.can_power_mode:
             self._current_mode = self.MODE_GATE
-            self.modeCombo.blockSignals(True)
-            self.modeCombo.setCurrentText(self.MODE_GATE)
-            self.modeCombo.blockSignals(False)
         elif ch.can_power_mode and not ch.can_gate_mode:
             self._current_mode = self.MODE_POWER
-            self.modeCombo.blockSignals(True)
-            self.modeCombo.setCurrentText(self.MODE_POWER)
-            self.modeCombo.blockSignals(False)
+        self.modeCombo.blockSignals(True)
+        self.modeCombo.setCurrentText(self._current_mode)
+        self.modeCombo.blockSignals(False)
+
+        self._power_idx = max(0, min(self._power_idx, max(0, ch.powers.size - 1)))
+        self._front_idx = max(0, min(self._front_idx, max(0, ch.gates.size  - 1)))
+        self._back_idx  = max(0, min(self._back_idx,  max(0, ch.backs.size   - 1)))
+        self.powerSlider.setRange(0, max(0, ch.powers.size - 1)); self.powerSlider.setValue(self._power_idx)
+        self.frontSlider.setRange(0, max(0, ch.gates.size  - 1)); self.frontSlider.setValue(self._front_idx)
+        self.backSlider.setRange(0, max(0, ch.backs.size   - 1)); self.backSlider.setValue(self._back_idx)
+        for s in (self.powerSlider, self.frontSlider, self.backSlider):
+            s.blockSignals(False)
+
+        # gate-axis selector only meaningful for grid data in gate mode
+        self.gateAxisCombo.setEnabled(ch.is_grid and self._current_mode == self.MODE_GATE)
+        if not ch.is_grid:
+            self._gate_axis = "front"
+        elif ch.gates.size <= 1 and ch.backs.size > 1:
+            self._gate_axis = "back"    # only the back gate was swept
+        elif ch.backs.size <= 1 and ch.gates.size > 1:
+            self._gate_axis = "front"
+        self.gateAxisCombo.blockSignals(True)
+        self.gateAxisCombo.setCurrentText("Back gate" if self._gate_axis == "back" else "Front gate")
+        self.gateAxisCombo.blockSignals(False)
+
+        self.powerSlider.setEnabled(ch.powers.size > 1)
+        self.frontSlider.setEnabled(ch.gates.size  > 1)
+        # the back gate is user-driven only for grid data; otherwise it follows front
+        self.backSlider.setEnabled(ch.is_grid and ch.backs.size > 1)
+        if not ch.is_grid:
+            self._sync_back_to_front(ch)
 
     # ── Per-frame helpers ─────────────────────────────────────────────
 
@@ -2322,16 +2613,11 @@ class PLViewerV2(QtWidgets.QMainWindow):
         return corrected, wl
 
     def _get_frame(self, ch: _Channel) -> Optional[PLFrame]:
-        """Current frame to display, given sliders."""
+        """Current frame to display, given the power/front/back sliders."""
         if not ch.has_data:
             return None
-        if self._current_mode == self.MODE_GATE:
-            p_key  = _ch_norm_power(ch, float(ch.powers[self._fixed_idx])) if ch.powers.size else ch.default_power_key
-            vf_key = _ch_norm_gate( ch, float(ch.gates[self._main_idx]))   if ch.gates.size  else ch.default_gate_key
-        else:
-            p_key  = _ch_norm_power(ch, float(ch.powers[self._main_idx]))  if ch.powers.size else ch.default_power_key
-            vf_key = _ch_norm_gate( ch, float(ch.gates[self._fixed_idx]))  if ch.gates.size  else ch.default_gate_key
-        return ch.grid.get((p_key, vf_key))
+        return _frame_at(ch, self._cur_power_key(ch),
+                         self._cur_front_key(ch), self._cur_back_key(ch))
 
     # ── Refresh ───────────────────────────────────────────────────────
 
@@ -2348,8 +2634,9 @@ class PLViewerV2(QtWidgets.QMainWindow):
             blank = np.zeros((10, 10), dtype=float)
             self.liveView.set_image(blank)
             self.liveView.set_image_title("No data loaded")
-            self.mainLbl.setText("--")
-            self.fixedLbl.setText("--")
+            self.powerLbl.setText("--")
+            self.frontLbl.setText("--")
+            self.backLbl.setText("--")
             return
 
         if fr is None:
@@ -2378,36 +2665,30 @@ class PLViewerV2(QtWidgets.QMainWindow):
             pw = None
             if ch._angle_calib_angles is not None and np.isfinite(angle_val):
                 pw = float(np.interp(angle_val, ch._angle_calib_angles, ch._angle_calib_powers_w) * 1e6)
-            pwr_str = f"A={_f(angle_val)} °  P={_f(pw)} µW" if pw is not None else f"A={_f(angle_val)} °"
-            self.liveView.set_image_title(f"{pwr_str}  Vf={_f(fr.v_front)} V  Vb={_f(fr.v_back)} V{suffix}")
-            if self._current_mode == self.MODE_GATE:
-                self.mainLbl.setText(f"Front gate: {_f(fr.v_front)} V")
-                angle_fix = float(ch.powers[self._fixed_idx]) if ch.powers.size else np.nan
-                pw_fix = None
-                if ch._angle_calib_angles is not None and np.isfinite(angle_fix):
-                    pw_fix = float(np.interp(angle_fix, ch._angle_calib_angles, ch._angle_calib_powers_w) * 1e6)
-                fix_str = (f"Angle: {_f(angle_fix)} °  ({_f(pw_fix)} µW) (fixed)" if pw_fix is not None
-                           else f"Angle: {_f(angle_fix)} ° (fixed)")
-                self.fixedLbl.setText(fix_str)
-            else:
-                main_str = (f"Angle: {_f(angle_val)} °  ({_f(pw)} µW)" if pw is not None
-                            else f"Angle: {_f(angle_val)} °")
-                self.mainLbl.setText(main_str)
-                vf_fix = float(ch.gates[self._fixed_idx]) if ch.gates.size else np.nan
-                self.fixedLbl.setText(f"Front gate: {_f(vf_fix)} V (fixed)")
+            self.liveView.set_image_title(
+                (f"A={_f(angle_val)} °  P={_f(pw)} µW" if pw is not None else f"A={_f(angle_val)} °")
+                + f"  Vf={_f(fr.v_front)} V  Vb={_f(fr.v_back)} V{suffix}")
+            power_base = f"Angle: {_f(angle_val)} °" + (f"  ({_f(pw)} µW)" if pw is not None else "")
         else:
             p_uW = float(fr.power_w * 1e6) if fr.power_w is not None else np.nan
             self.liveView.set_image_title(
-                f"P={_f(p_uW)} µW  Vf={_f(fr.v_front)} V  Vb={_f(fr.v_back)} V{suffix}"
-            )
-            if self._current_mode == self.MODE_GATE:
-                self.mainLbl.setText(f"Front gate: {_f(fr.v_front)} V")
-                p_fix = float(ch.powers[self._fixed_idx] * 1e6) if ch.powers.size else np.nan
-                self.fixedLbl.setText(f"Power: {_f(p_fix)} µW (fixed)")
-            else:
-                self.mainLbl.setText(f"Power: {_f(p_uW)} µW")
-                vf_fix = float(ch.gates[self._fixed_idx]) if ch.gates.size else np.nan
-                self.fixedLbl.setText(f"Front gate: {_f(vf_fix)} V (fixed)")
+                f"P={_f(p_uW)} µW  Vf={_f(fr.v_front)} V  Vb={_f(fr.v_back)} V{suffix}")
+            power_base = f"Power: {_f(p_uW)} µW"
+
+        # Tag which quantity is the swept (map x-axis) variable
+        if self._current_mode == self.MODE_GATE and self._gate_axis == "back" and ch.is_grid:
+            swept = "back"
+        elif self._current_mode == self.MODE_GATE:
+            swept = "front"
+        else:
+            swept = "power"
+
+        def _tag(name: str) -> str:
+            return "   ← swept" if name == swept else "   (fixed)"
+
+        self.powerLbl.setText(power_base + _tag("power"))
+        self.frontLbl.setText(f"Front gate: {_f(fr.v_front)} V" + _tag("front"))
+        self.backLbl.setText(f"Back gate: {_f(fr.v_back)} V" + _tag("back"))
 
     def _sg_apply(self, m: np.ndarray) -> np.ndarray:
         ws = int(self.sgSweepWin.value()) if self.sgSweepCheck.isChecked() else 0
@@ -2424,21 +2705,33 @@ class PLViewerV2(QtWidgets.QMainWindow):
 
         row_disp_raw = self.liveView.linecut_row()  # None if no cursor set
 
-        if self._current_mode == self.MODE_GATE:
-            x_axis    = ch.gates
-            fixed_key = _ch_norm_power(ch, float(ch.powers[self._fixed_idx])) if ch.powers.size else ch.default_power_key
+        p_key  = self._cur_power_key(ch)
+        vf_key = self._cur_front_key(ch)
+        vb_key = self._cur_back_key(ch)
+
+        gate_back = (self._current_mode == self.MODE_GATE
+                     and self._gate_axis == "back" and ch.is_grid)
+
+        if gate_back:
+            sweep_vals = ch.backs
+            x_axis     = ch.backs
+            def _frame_for(val):
+                return _frame_at(ch, p_key, vf_key, _ch_norm_back(ch, float(val)))
+        elif self._current_mode == self.MODE_GATE:
+            sweep_vals = ch.gates
+            x_axis     = ch.gates
+            def _frame_for(val):
+                return _frame_at(ch, p_key, _ch_norm_gate(ch, float(val)), vb_key)
         else:
-            x_axis    = ch.powers if ch.angle_mode else ch.powers * 1e6
-            fixed_key = _ch_norm_gate(ch, float(ch.gates[self._fixed_idx])) if ch.gates.size else ch.default_gate_key
+            sweep_vals = ch.powers
+            x_axis     = ch.powers if ch.angle_mode else ch.powers * 1e6
+            def _frame_for(val):
+                return _frame_at(ch, _ch_norm_power(ch, float(val)), vf_key, vb_key)
 
         # Find reference wavelength axis from first available frame
         wl_ref = None
-        sweep_vals = ch.gates if self._current_mode == self.MODE_GATE else ch.powers
         for val in sweep_vals:
-            if self._current_mode == self.MODE_GATE:
-                fr = ch.grid.get((fixed_key, _ch_norm_gate(ch, float(val))))
-            else:
-                fr = ch.grid.get((_ch_norm_power(ch, float(val)), fixed_key))
+            fr = _frame_for(val)
             if fr is not None:
                 _, wl_ref = self._get_cropped_raw(ch, fr)
                 break
@@ -2450,10 +2743,7 @@ class PLViewerV2(QtWidgets.QMainWindow):
         cols   = []
 
         for val in sweep_vals:
-            if self._current_mode == self.MODE_GATE:
-                fr = ch.grid.get((fixed_key, _ch_norm_gate(ch, float(val))))
-            else:
-                fr = ch.grid.get((_ch_norm_power(ch, float(val)), fixed_key))
+            fr = _frame_for(val)
 
             if fr is None:
                 cols.append(np.full(wl_ref.shape, np.nan, dtype=float))
@@ -2494,42 +2784,66 @@ class PLViewerV2(QtWidgets.QMainWindow):
                     ])
                     m = m - m_rh_res
 
+        # Single-wheel (angle) power dependence with a calibration: order the
+        # sweep columns by ascending calibrated power rather than by stage angle
+        # (angle and power are not monotonically related).
+        col_order = None
+        if (self._current_mode != self.MODE_GATE and ch.angle_mode
+                and ch._angle_calib_angles is not None and ch.powers.size > 1):
+            pw_cal = np.interp(ch.powers, ch._angle_calib_angles, ch._angle_calib_powers_w)
+            order  = np.argsort(pw_cal, kind="stable")
+            if not np.array_equal(order, np.arange(order.size)):
+                col_order = order
+                m = m[:, col_order]
+
         self._map_version += 1
         self._last_y_wl   = np.asarray(wl_nm, dtype=float)
         self._last_map    = np.asarray(m, dtype=float)
 
         m_smooth = self._sg_apply(m)
 
+        sec_axis = None
         if self._current_mode == self.MODE_GATE:
-            deriv    = _deriv_vs_x(m_smooth, x)
-            x_label  = "Front gate (V)"
-            marker   = float(ch.gates[self._main_idx]) if ch.gates.size else 0.0
-            self.mapView.set_secondary_axis(ch.backs_for_gate, label="Back gate (V)")
-            self.derivView.set_secondary_axis(ch.backs_for_gate, label="Back gate (V)")
-            self.mapView.setTitle("Linecut vs Front Gate")
-            self.derivView.setTitle("dI/dVf")
+            deriv = _deriv_vs_x(m_smooth, x)
+            if self._gate_axis == "back" and ch.is_grid:
+                x_label = "Back gate (V)"
+                marker  = float(ch.backs[self._back_idx]) if ch.backs.size else 0.0
+                self.mapView.setTitle("Linecut vs Back Gate")
+                self.derivView.setTitle("dI/dVb")
+            else:
+                x_label = "Front gate (V)"
+                marker  = float(ch.gates[self._front_idx]) if ch.gates.size else 0.0
+                if not ch.is_grid:
+                    sec_axis = ch.backs_for_gate
+                self.mapView.setTitle("Linecut vs Front Gate")
+                self.derivView.setTitle("dI/dVf")
+            self.mapView.set_secondary_axis(sec_axis, label="Back gate (V)")
+            self.derivView.set_secondary_axis(sec_axis, label="Back gate (V)")
         elif ch.angle_mode:
             if ch._angle_calib_angles is not None:
-                x_pw   = np.interp(ch.powers, ch._angle_calib_angles, ch._angle_calib_powers_w)
+                x_pw = np.interp(ch.powers, ch._angle_calib_angles, ch._angle_calib_powers_w)
+                if col_order is not None:      # match the reordered map columns
+                    x_pw = x_pw[col_order]
                 x      = x_pw * 1e6
                 deriv  = _deriv_dlogp(m_smooth, x_pw)
                 x_label = "Power (µW)"
-                marker  = float(np.interp(ch.powers[self._main_idx], ch._angle_calib_angles,
+                marker  = float(np.interp(ch.powers[self._power_idx], ch._angle_calib_angles,
                                           ch._angle_calib_powers_w) * 1e6) if ch.powers.size else 0.0
+                self.mapView.setTitle("Linecut vs Power")
                 self.derivView.setTitle("dI/dlog₁₀P")
             else:
                 x      = ch.powers.copy()
                 deriv  = _deriv_vs_x(m_smooth, x)
                 x_label = "Stage A angle (°)"
-                marker  = float(ch.powers[self._main_idx]) if ch.powers.size else 0.0
+                marker  = float(ch.powers[self._power_idx]) if ch.powers.size else 0.0
+                self.mapView.setTitle("Linecut vs Angle")
                 self.derivView.setTitle("dI/dAngle")
             self.mapView.set_secondary_axis(None)
             self.derivView.set_secondary_axis(None)
-            self.mapView.setTitle("Linecut vs Angle")
         else:
             deriv    = _deriv_dlogp(m_smooth, ch.powers)
             x_label  = "Power (µW)"
-            marker   = float(ch.powers[self._main_idx] * 1e6) if ch.powers.size else 0.0
+            marker   = float(ch.powers[self._power_idx] * 1e6) if ch.powers.size else 0.0
             self.mapView.set_secondary_axis(None)
             self.derivView.set_secondary_axis(None)
             self.mapView.setTitle("Linecut vs Power")
@@ -2552,8 +2866,8 @@ class PLViewerV2(QtWidgets.QMainWindow):
         self.deriv2EView.set_manual_symmetric_max(max_abs if max_abs > 0 else None)
 
         if self._current_mode == self.MODE_GATE:
-            self.derivEView.set_secondary_axis(ch.backs_for_gate,  label="Back gate (V)")
-            self.deriv2EView.set_secondary_axis(ch.backs_for_gate, label="Back gate (V)")
+            self.derivEView.set_secondary_axis(sec_axis,  label="Back gate (V)")
+            self.deriv2EView.set_secondary_axis(sec_axis, label="Back gate (V)")
         else:
             self.derivEView.set_secondary_axis(None)
             self.deriv2EView.set_secondary_axis(None)
@@ -2731,12 +3045,265 @@ class PLViewerV2(QtWidgets.QMainWindow):
                                      x_smooth=fit.get("x_smooth"),
                                      y_smooth=fit.get("y_smooth"))
 
+    # ── 3-D cube ──────────────────────────────────────────────────────
+
+    def _baseline_linecut(self, lc: np.ndarray, wl: np.ndarray) -> np.ndarray:
+        """Baseline-correct a 1-D linecut by subtracting its mean over the
+        [bgLo, bgHi] nm range (same convention as the 2-D baseline correction;
+        summing baseline-corrected rows is equivalent to baselining the sum)."""
+        lc = np.asarray(lc, dtype=float).ravel()
+        wl = np.asarray(wl, dtype=float).ravel()
+        if lc.size != wl.size or lc.size == 0:
+            return lc
+        lo = float(self.bgLoSpin.value())
+        hi = float(self.bgHiSpin.value())
+        mask = (wl >= lo) & (wl <= hi)
+        if mask.any():
+            return lc - float(np.nanmean(lc[mask]))
+        return lc
+
+    def _collect_cube_data(self, ch: _Channel):
+        """Build (fronts, backs, wl_ref, vol[nf, nb, nwl]) of baseline-corrected
+        linecuts at the current fixed power and linecut row."""
+        fronts, backs = ch.gates, ch.backs
+        if fronts.size == 0 or backs.size == 0:
+            return None
+        p_key    = self._cur_power_key(ch)
+        row_disp = self.liveView.linecut_row()
+        width    = int(self.liveView.linecut_width())
+
+        wl_ref = None
+        for vf in fronts:
+            for vb in backs:
+                fr = _frame_at(ch, p_key, _ch_norm_gate(ch, float(vf)), _ch_norm_back(ch, float(vb)))
+                if fr is not None:
+                    _, wl_ref = self._get_cropped_raw(ch, fr)
+                    break
+            if wl_ref is not None:
+                break
+        if wl_ref is None:
+            return None
+        wl_ref = np.asarray(wl_ref, dtype=float)
+        vol = np.full((fronts.size, backs.size, wl_ref.size), np.nan, dtype=float)
+
+        for i, vf in enumerate(fronts):
+            for j, vb in enumerate(backs):
+                fr = _frame_at(ch, p_key, _ch_norm_gate(ch, float(vf)), _ch_norm_back(ch, float(vb)))
+                if fr is None:
+                    continue
+                img, wl = self._get_corrected(ch, fr)
+                h = img.shape[0]
+                row_d   = h // 2 if row_disp is None else max(0, min(int(row_disp), h - 1))
+                row_raw = h - 1 - row_d
+                lc = _linecut_h(img, row_raw, width)
+                if lc is None:
+                    continue
+                lc = self._baseline_linecut(lc, wl)
+                vol[i, j, :] = np.asarray(_resample(wl, lc, wl_ref), dtype=float)
+        return fronts.copy(), backs.copy(), wl_ref, vol
+
+    def _on_print_cube(self) -> None:
+        ch = self._primary_ch()
+        if not ch.has_data:
+            QtWidgets.QMessageBox.information(self, "Print cube", "Load data first.")
+            return
+        try:
+            import pyqtgraph.opengl  # noqa: F401
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Print cube",
+                f"The 3-D cube needs PyOpenGL:\n{exc}\n\nInstall with:  pip install PyOpenGL")
+            return
+        data = self._collect_cube_data(ch)
+        if data is None:
+            QtWidgets.QMessageBox.warning(self, "Print cube",
+                                          "No frames available for the current power.")
+            return
+        fronts, backs, wl, vol = data
+        if not np.isfinite(vol).any():
+            QtWidgets.QMessageBox.warning(self, "Print cube", "All linecuts are empty.")
+            return
+        p_key = self._cur_power_key(ch)
+        ptxt  = f"angle {p_key:g}" if ch.angle_mode else f"P={p_key * 1e6:.4g} µW"
+        row   = self.liveView.linecut_row()
+        title = f"PL cube — {ptxt}, linecut row {row}"
+        try:
+            self._cube_win = _CubeWindow(fronts, backs, wl, vol, title=title,
+                                         cmap_name="viridis", parent=self)
+            self._cube_win.show()
+            self._cube_win.raise_()
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            QtWidgets.QMessageBox.warning(self, "Print cube",
+                                          f"Could not open the 3-D view:\n{exc}")
+
 
 # ── tiny helper ───────────────────────────────────────────────────────
 
 def _bold_label(text: str) -> QtWidgets.QLabel:
     lbl = QtWidgets.QLabel(f"<b>{text}</b>")
     return lbl
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 3-D cube window (front gate × back gate × wavelength, colour = intensity)
+# ══════════════════════════════════════════════════════════════════════
+
+class _CubeWindow(QtWidgets.QMainWindow):
+    """Volumetric render of baseline-corrected linecuts over the gate grid.
+
+    x = front gate, y = back gate, z = wavelength, colour = intensity.
+    Opacity ramps from transparent at the (corrected) baseline to opaque at the
+    highest intensity, so the baseline background disappears.
+    """
+
+    _L = 10.0  # visual edge length per axis
+
+    def __init__(self, fronts, backs, wl, vol, *, title: str = "",
+                 cmap_name: str = "viridis", parent=None):
+        super().__init__(parent)
+        import pyqtgraph.opengl as gl
+        self._gl   = gl
+        self.fronts = np.asarray(fronts, dtype=float).ravel()
+        self.backs  = np.asarray(backs,  dtype=float).ravel()
+        self.wl     = np.asarray(wl,     dtype=float).ravel()
+        self.vol    = np.asarray(vol,    dtype=float)          # (nf, nb, nz)
+        self._cmap_name = cmap_name
+        self._vol_item  = None
+        self.setWindowTitle(title or "PL cube")
+        self.resize(920, 780)
+        self._build_ui()
+        self._add_static_items()
+        self._rebuild_volume()
+
+    def _build_ui(self) -> None:
+        central = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(central)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(4)
+
+        ctrl = QtWidgets.QHBoxLayout()
+        ctrl.addWidget(QtWidgets.QLabel("Opacity:"))
+        self.opacitySlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.opacitySlider.setRange(1, 100)
+        self.opacitySlider.setValue(45)
+        self.opacitySlider.setFixedWidth(170)
+        ctrl.addWidget(self.opacitySlider)
+        ctrl.addSpacing(12)
+        ctrl.addWidget(QtWidgets.QLabel("Transparent below:"))
+        self.threshSpin = QtWidgets.QDoubleSpinBox()
+        self.threshSpin.setRange(0.0, 99.0)
+        self.threshSpin.setValue(2.0)
+        self.threshSpin.setSuffix(" %")
+        self.threshSpin.setFixedWidth(70)
+        self.threshSpin.setToolTip("Intensity (as % of the colour-scale max) below\n"
+                                   "which voxels are fully transparent.")
+        ctrl.addWidget(self.threshSpin)
+        ctrl.addSpacing(12)
+        ctrl.addWidget(QtWidgets.QLabel("Opacity γ:"))
+        self.gammaSpin = QtWidgets.QDoubleSpinBox()
+        self.gammaSpin.setRange(0.1, 5.0)
+        self.gammaSpin.setSingleStep(0.1)
+        self.gammaSpin.setValue(1.5)
+        self.gammaSpin.setFixedWidth(60)
+        self.gammaSpin.setToolTip("Opacity curve: >1 suppresses low intensities\n"
+                                  "(more transparent), <1 lifts them.")
+        ctrl.addWidget(self.gammaSpin)
+        ctrl.addStretch()
+        v.addLayout(ctrl)
+
+        self.glView = self._gl.GLViewWidget()
+        self.glView.setBackgroundColor("k")
+        v.addWidget(self.glView, 1)
+
+        def _rng(a):
+            a = a[np.isfinite(a)]
+            return (float(a.min()), float(a.max())) if a.size else (0.0, 0.0)
+        f0, f1 = _rng(self.fronts); b0, b1 = _rng(self.backs); w0, w1 = _rng(self.wl)
+        self.infoLbl = QtWidgets.QLabel(
+            f"X front gate {f0:g}…{f1:g} V   |   "
+            f"Y back gate {b0:g}…{b1:g} V   |   "
+            f"Z wavelength {w0:.1f}…{w1:.1f} nm   |   colour = intensity")
+        self.infoLbl.setStyleSheet("color:#aaa; font-size:8pt;")
+        v.addWidget(self.infoLbl)
+        self.setCentralWidget(central)
+
+        self.opacitySlider.valueChanged.connect(lambda _: self._rebuild_volume())
+        self.threshSpin.valueChanged.connect(lambda _: self._rebuild_volume())
+        self.gammaSpin.valueChanged.connect(lambda _: self._rebuild_volume())
+
+    def _scales(self):
+        nf, nb, nz = self.vol.shape
+        L = self._L
+        sx = L / max(1, nf - 1) if nf > 1 else L
+        sy = L / max(1, nb - 1) if nb > 1 else L
+        sz = L / max(1, nz - 1) if nz > 1 else L
+        return sx, sy, sz
+
+    def _add_static_items(self) -> None:
+        gl = self._gl
+        L  = self._L
+        ax = gl.GLAxisItem()
+        ax.setSize(L, L, L)
+        self.glView.addItem(ax)
+
+        def _lbl(text, pos, color=(200, 200, 200, 255)):
+            try:
+                t = gl.GLTextItem(pos=np.array(pos, dtype=float), text=text, color=color)
+                self.glView.addItem(t)
+            except Exception:
+                pass
+
+        def _rng(a):
+            a = a[np.isfinite(a)]
+            return (float(a.min()), float(a.max())) if a.size else (0.0, 0.0)
+        f0, f1 = _rng(self.fronts); b0, b1 = _rng(self.backs); w0, w1 = _rng(self.wl)
+        _lbl(f"Vf {f1:g}", (L, 0, 0), (255, 120, 120, 255))
+        _lbl(f"Vb {b1:g}", (0, L, 0), (120, 255, 120, 255))
+        _lbl(f"λ {w1:.0f}", (0, 0, L), (120, 160, 255, 255))
+        _lbl(f"Vf {f0:g} / Vb {b0:g} / λ {w0:.0f}", (0, 0, 0))
+
+        self.glView.opts["center"] = pg.Vector(L / 2, L / 2, L / 2)
+        self.glView.setCameraPosition(distance=2.4 * L, elevation=22, azimuth=-60)
+
+    def _rebuild_volume(self) -> None:
+        gl = self._gl
+        nf, nb, nz = self.vol.shape
+        finite = self.vol[np.isfinite(self.vol)]
+        if finite.size == 0:
+            return
+        vhi = float(np.nanpercentile(finite, 99.5))
+        if not np.isfinite(vhi) or vhi <= 0:
+            vhi = float(np.nanmax(finite))
+        if not np.isfinite(vhi) or vhi <= 0:
+            vhi = 1.0
+
+        # baseline (≈0 after correction) → 0 → transparent; peak → 1 → opaque
+        norm = np.clip(np.nan_to_num(self.vol, nan=0.0) / vhi, 0.0, 1.0)
+        thr = float(self.threshSpin.value()) / 100.0
+        if thr > 0:
+            norm = np.clip((norm - thr) / max(1e-6, 1.0 - thr), 0.0, 1.0)
+        gamma = float(self.gammaSpin.value())
+        alpha = norm ** gamma
+
+        lut = _pg_cmap(self._cmap_name).getLookupTable(0.0, 1.0, 256)  # (256, 3) ubyte
+        idx = np.clip(norm * 255.0, 0, 255).astype(int)
+        rgba = np.empty((nf, nb, nz, 4), dtype=np.ubyte)
+        rgba[..., 0] = lut[idx, 0]
+        rgba[..., 1] = lut[idx, 1]
+        rgba[..., 2] = lut[idx, 2]
+        gain = float(self.opacitySlider.value()) / 100.0
+        rgba[..., 3] = np.clip(alpha * 255.0 * gain, 0, 255).astype(np.ubyte)
+
+        if self._vol_item is not None:
+            self.glView.removeItem(self._vol_item)
+            self._vol_item = None
+        vi = gl.GLVolumeItem(rgba, smooth=True, glOptions="translucent")
+        sx, sy, sz = self._scales()
+        vi.scale(sx, sy, sz)
+        self.glView.addItem(vi)
+        self._vol_item = vi
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -1,4 +1,5 @@
 import csv
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -18,12 +19,22 @@ from .config import (
     DEFAULT_B_RESOURCE,
     POLL_MS_DEFAULT,
     BTN_W,
+    LEAKAGE_FLUSH_EVERY,
+    LEAKAGE_V_DECIMALS,
     RAMP_STEP_V,
     RAMP_DWELL_S,
     SWEEP_SETTLE_MS,
 )
 from .device_panel import DevicePanel
+from .leakage_window import LeakageWindow
 from .workers import DualSweepThread
+
+LEAK_MODE_IDLE = ("MODE: POLL ONLY", "color:#666; font-weight:700; font-size:11pt;")
+LEAK_MODE_REC_CSS = "color:#0a7a24; font-weight:700; font-size:11pt;"
+LEAK_MODE_PAUSED = (
+    "MODE: LEAKAGE TEST - PAUSED (no live source)",
+    "color:#c66a00; font-weight:700; font-size:11pt;",
+)
 
 
 class DualKeithleyWidget(QtWidgets.QWidget):
@@ -93,12 +104,45 @@ class DualKeithleyWidget(QtWidgets.QWidget):
         top.addSpacing(10)
         top.addWidget(self.panicBtn)
 
+        # Leakage test bar
+        leak = QtWidgets.QHBoxLayout()
+        vbox.addLayout(leak)
+
+        self.leakModeLbl = QtWidgets.QLabel(LEAK_MODE_IDLE[0])
+        self.leakModeLbl.setStyleSheet(LEAK_MODE_IDLE[1])
+
+        leak_tip = "Starts/stops recording only - does not change the output or move the gate."
+        self.leakStartBtn = QtWidgets.QPushButton("Start Leakage Rec."); self.leakStartBtn.setFixedWidth(150)
+        self.leakStartBtn.setToolTip(leak_tip)
+        self.leakStopBtn = QtWidgets.QPushButton("Stop Leakage Rec."); self.leakStopBtn.setFixedWidth(150)
+        self.leakStopBtn.setToolTip(leak_tip); self.leakStopBtn.setEnabled(False)
+        self.ivWindowBtn = QtWidgets.QPushButton("I-V Window"); self.ivWindowBtn.setFixedWidth(BTN_W)
+
+        self.leakDecimalsSpin = QtWidgets.QSpinBox()
+        self.leakDecimalsSpin.setRange(0, 2)
+        self.leakDecimalsSpin.setValue(LEAKAGE_V_DECIMALS)
+        self.leakDecimalsSpin.setToolTip("Voltage bin width = 10^-n V. Locked while recording.")
+
+        self.leakCountLbl = QtWidgets.QLabel("A: -- | B: --")
+        self.leakCountLbl.setStyleSheet("color:#666;")
+        self.leakCountLbl.setMinimumWidth(260)
+
+        leak.addWidget(self.leakModeLbl)
+        leak.addSpacing(16)
+        leak.addWidget(self.leakStartBtn); leak.addWidget(self.leakStopBtn)
+        leak.addSpacing(10)
+        leak.addWidget(self.ivWindowBtn)
+        leak.addSpacing(12)
+        leak.addWidget(QtWidgets.QLabel("V bin decimals:")); leak.addWidget(self.leakDecimalsSpin)
+        leak.addStretch()
+        leak.addWidget(self.leakCountLbl)
+
         # Panels
         panels = QtWidgets.QHBoxLayout()
         vbox.addLayout(panels)
 
-        self.panelA = DevicePanel("Source A", self.rm, default_a_resource, main_ref_callable=lambda: self)
-        self.panelB = DevicePanel("Source B", self.rm, default_b_resource, main_ref_callable=lambda: self)
+        self.panelA = DevicePanel("Source A", self.rm, default_a_resource, main_ref_callable=lambda: self, tag="A")
+        self.panelB = DevicePanel("Source B", self.rm, default_b_resource, main_ref_callable=lambda: self, tag="B")
         panels.addWidget(self.panelA, 1)
         panels.addWidget(self.panelB, 1)
 
@@ -121,6 +165,15 @@ class DualKeithleyWidget(QtWidgets.QWidget):
         self.dual_thread: Optional[DualSweepThread] = None
         self._dual_controller: Optional[SweepController] = None
 
+        # Leakage test
+        self.leak_active = False
+        self.leak_path: Optional[str] = None
+        self.leak_file = None
+        self.leak_writer = None
+        self._leak_rows_since_flush = 0
+        self._leak_t0 = 0.0
+        self.leakWindow = LeakageWindow(self)
+
         # Signals
         self.panicBtn.clicked.connect(self.on_panic)
         self.pollSpin.valueChanged.connect(self.on_poll_interval_changed)
@@ -132,10 +185,17 @@ class DualKeithleyWidget(QtWidgets.QWidget):
         self.dualNextBtn.clicked.connect(self.on_next_dual_step)
         self.dualStopBtn.clicked.connect(self.on_stop_dual_sweep)
 
+        self.leakStartBtn.clicked.connect(self.on_leak_start)
+        self.leakStopBtn.clicked.connect(self.on_leak_stop)
+        self.ivWindowBtn.clicked.connect(self.on_show_iv_window)
+        self.leakDecimalsSpin.valueChanged.connect(self.on_leak_decimals_changed)
+
         for w in (self.panelA.nSpin, self.panelB.nSpin, self.panelA.v0Spin, self.panelA.stepSpin, self.panelB.v0Spin, self.panelB.stepSpin):
             w.valueChanged.connect(self.update_dual_controls)
 
         self.update_dual_controls()
+        self._refresh_leak_mode()
+        self._refresh_leak_labels()
 
     def statusBar(self) -> QtWidgets.QStatusBar:
         return self._status_bar
@@ -178,6 +238,7 @@ class DualKeithleyWidget(QtWidgets.QWidget):
         panel.outputChk.blockSignals(False)
         panel.bannerLbl.setText(f"SOFTWARE OC: |I|={abs(iA)*1e9:.6g} nA > {abs(limit_a)*1e9:.6g} nA")
         panel.statusLbl.setText("OC trip: output OFF")
+        self._refresh_leak_mode()
 
     # ---- logging ----
 
@@ -225,6 +286,177 @@ class DualKeithleyWidget(QtWidgets.QWidget):
             self.open_log()
         else:
             self.close_log()
+
+    # ---- leakage test ----
+
+    def _leak_recorders(self):
+        return (("A", self.panelA), ("B", self.panelB))
+
+    def _refresh_leak_labels(self):
+        self.leakCountLbl.setText(
+            f"A: {self.panelA.leak.n_samples} pts / {self.panelA.leak.n_bins} bins | "
+            f"B: {self.panelB.leak.n_samples} pts / {self.panelB.leak.n_bins} bins"
+        )
+
+    def _refresh_leak_mode(self):
+        if not self.leak_active:
+            text, css = LEAK_MODE_IDLE
+        else:
+            live = [t for t, p in self._leak_recorders()
+                    if p.dev is not None and p.outputChk.isChecked()]
+            if live:
+                text = "MODE: LEAKAGE TEST - RECORDING (" + "+".join(live) + ")"
+                css = LEAK_MODE_REC_CSS
+            else:
+                text, css = LEAK_MODE_PAUSED
+
+        self.leakModeLbl.setText(text)
+        self.leakModeLbl.setStyleSheet(css)
+        self.leakWindow.set_mode(text, css)
+
+        self.leakStartBtn.setEnabled(not self.leak_active)
+        self.leakStopBtn.setEnabled(self.leak_active)
+        self.leakDecimalsSpin.setEnabled(not self.leak_active)
+
+    def on_leak_decimals_changed(self, decimals: int):
+        for _tag, panel in self._leak_recorders():
+            if panel.leak.n_samples:
+                ans = QtWidgets.QMessageBox.question(
+                    self, "V bin decimals",
+                    "Changing the bin width discards the recorded I-V data. Continue?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                if ans != QtWidgets.QMessageBox.Yes:
+                    self.leakDecimalsSpin.blockSignals(True)
+                    self.leakDecimalsSpin.setValue(self.panelA.leak.decimals)
+                    self.leakDecimalsSpin.blockSignals(False)
+                    return
+                break
+
+        for _tag, panel in self._leak_recorders():
+            panel.leak.set_decimals(int(decimals))
+        self.leakWindow.update_plots()
+        self._refresh_leak_labels()
+
+    def on_leak_start(self):
+        if any(p.leak.n_samples for _t, p in self._leak_recorders()):
+            ans = QtWidgets.QMessageBox.question(
+                self, "Leakage test",
+                "Clear the I-V data from the previous test?\n\n"
+                "Yes = start fresh, No = keep accumulating into the same bins.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Yes,
+            )
+            if ans == QtWidgets.QMessageBox.Cancel:
+                return
+            if ans == QtWidgets.QMessageBox.Yes:
+                for _tag, panel in self._leak_recorders():
+                    panel.leak.clear()
+                self.leakWindow.update_plots()
+
+        default_name = "leakage_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Leakage raw CSV", default_name, filter="CSV Files (*.csv);;All Files (*)"
+        )
+        if path:
+            if not self.open_leakage_log(path):
+                return
+        else:
+            ans = QtWidgets.QMessageBox.question(
+                self, "Leakage test",
+                "No raw CSV chosen. Record to the plot only, without saving?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if ans != QtWidgets.QMessageBox.Yes:
+                return
+
+        self.leak_active = True
+        self._leak_t0 = time.monotonic()
+        for _tag, panel in self._leak_recorders():
+            panel.set_leakage_recording(True)
+
+        self._refresh_leak_mode()
+        self._refresh_leak_labels()
+        self.on_show_iv_window()
+        self.statusBar().showMessage("Leakage recording STARTED")
+
+    def on_leak_stop(self):
+        # Disarm first, then draw: no sample can slip in after the final redraw.
+        self.leak_active = False
+        for _tag, panel in self._leak_recorders():
+            panel.set_leakage_recording(False)
+
+        self.leakWindow.update_plots()
+        self.close_leakage_log()
+
+        self._refresh_leak_mode()
+        self._refresh_leak_labels()
+        self.statusBar().showMessage("Leakage recording STOPPED")
+
+    def on_show_iv_window(self):
+        self.leakWindow.show()
+        self.leakWindow.raise_()
+        self.leakWindow.activateWindow()
+
+    def open_leakage_log(self, path: str) -> bool:
+        self.close_leakage_log()
+        try:
+            self.leak_file = open(path, "a", newline="")
+            self.leak_writer = csv.writer(self.leak_file)
+            self.leak_writer.writerow([
+                "timestamp", "t_rel_s", "panel", "Vread(V)", "Iread(A)",
+                "Vset(V)", "Icomp(A)", "output", "source",
+            ])
+            self.leak_path = path
+            self._leak_rows_since_flush = 0
+            return True
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Leakage log error", f"Cannot open file:\n{e}")
+            self.leak_file = None
+            self.leak_writer = None
+            return False
+
+    def close_leakage_log(self):
+        try:
+            if self.leak_file:
+                self.leak_file.flush()
+                self.leak_file.close()
+        except Exception:
+            pass
+        self.leak_file = None
+        self.leak_writer = None
+        self._leak_rows_since_flush = 0
+
+    def write_leakage_row(self, tag: str, v: float, iA: float, src: str):
+        """One raw sample from a DevicePanel. GUI thread only."""
+        self._leak_rows_since_flush += 1
+
+        if self.leak_writer:
+            panel = self.panelA if tag == "A" else self.panelB
+            try:
+                self.leak_writer.writerow([
+                    datetime.now().isoformat(timespec="milliseconds"),
+                    f"{time.monotonic() - self._leak_t0:.3f}",
+                    tag, v, iA,
+                    float(panel.vsetSpin.value()),
+                    float(panel.icompSpin_nA.value()) * 1e-9,
+                    1 if panel.outputChk.isChecked() else 0,
+                    src,
+                ])
+            except Exception:
+                pass
+
+        # Microsteps arrive at ~20 Hz: flushing and relabelling per row is wasteful.
+        if self._leak_rows_since_flush >= LEAKAGE_FLUSH_EVERY:
+            self._leak_rows_since_flush = 0
+            if self.leak_file:
+                try:
+                    self.leak_file.flush()
+                except Exception:
+                    pass
+            self._refresh_leak_labels()
 
     # ---- panic ----
 
@@ -274,6 +506,7 @@ class DualKeithleyWidget(QtWidgets.QWidget):
 
         self.statusBar().showMessage(f"Polling @ {ms} ms")
         self.update_dual_controls()
+        self._refresh_leak_mode()
 
     # ---- dual sweep controls ----
 
@@ -413,11 +646,18 @@ class DualKeithleyWidget(QtWidgets.QWidget):
             pass
 
         try:
+            if self.leak_active:
+                self.on_leak_stop()
+        except Exception:
+            pass
+
+        try:
             self.timer.stop()
         except Exception:
             pass
 
         self.close_log()
+        self.close_leakage_log()
 
         for panel in (self.panelA, self.panelB):
             try:
