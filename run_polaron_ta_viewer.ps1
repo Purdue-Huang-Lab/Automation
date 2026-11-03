@@ -1,2 +1,16 @@
-Set-Location $PSScriptRoot
-python "data processing/polaron_ta_viewer.py" $args
+Param(
+    [string]$RepoRoot = $PSScriptRoot
+)
+
+$venvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $venvPython)) {
+    # OneDrive-synced PCs have no Automation\.venv; use the shared workspace venv one level up
+    $venvPython = Join-Path (Split-Path $RepoRoot -Parent) ".venv\Scripts\python.exe"
+}
+if (-not (Test-Path $venvPython)) {
+    Write-Error "Missing venv python at $venvPython"
+    exit 1
+}
+
+Set-Location $RepoRoot
+& $venvPython "data processing/polaron_ta_viewer.py" @args

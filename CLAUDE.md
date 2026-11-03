@@ -8,11 +8,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Venv**: `.venv\Scripts\python.exe` (never use the system Python)
 - **OS**: Windows only (hardware drivers, PowerShell launchers, DLL paths)
 
+- **OneDrive-synced PCs** (personal/office, not the lab PC): there is no `Automation\.venv`. They use the
+  shared workspace venv `..\.venv` (Python 3.10.11 at `C:\Users\Public\Python310`), built from the
+  workspace-root `requirements.txt`, which does `-r Automation/requirements.txt` + offline-analysis extras.
+  Every `run_*.ps1` falls back to `..\.venv` when `.venv` is missing. See the workspace-root `CLAUDE.md`.
+
 Activate: `.venv\Scripts\activate`
 Run any GUI: `.\run_<name>.ps1` (all launchers live at repo root)
 Or directly: `.venv\Scripts\python.exe -m <module.path>`
 
-Update requirements after installing new packages:
+Update requirements after installing new packages — **only from the lab PC's `Automation\.venv`**.
+Never `pip freeze` the OneDrive workspace venv into this file (it contains analysis-only extras);
+on an OneDrive PC, add the new pin to this file by hand instead.
 ```powershell
 [System.IO.File]::WriteAllText("$PWD\requirements.txt", (pip freeze | Out-String), [System.Text.UTF8Encoding]::new($false))
 ```
