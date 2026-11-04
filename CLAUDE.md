@@ -244,3 +244,34 @@ Wire `QRadioButton`s to switch the stack page. Cache the parsed list in `self._c
 - Never commit `.venv/`, `__pycache__/`, `.claude/settings.local.json`.
 - `ph300/740 irf 20260311.csv` is a calibration file — **do** track it; do not add `ph300/*.csv` to `.gitignore`.
 - Use feature branches for experimental changes; `main` is production.
+
+### Remotes & private backup
+
+| Remote | URL | Role |
+|---|---|---|
+| `origin` (fetch) | `https://github.com/Purdue-Huang-Lab/Automation` | Canonical org repo (public) |
+| `origin` (push) | org repo **and** `https://github.com/moonriver366/Automation-backup` | One `git push` updates both |
+| `backup` | `https://github.com/moonriver366/Automation-backup` (private) | Append-only safety copy, for inspection / explicit pushes |
+
+The backup exists because the org repo's history has been force-rewritten before (2026-06 and 2026-11),
+which silently dropped branches and commits. Rules:
+
+- **Always push to both.** Plain `git push` does it automatically via the two `origin` push URLs. New
+  branches/tags must also reach the backup: `git push origin <branch>` covers both;
+  for tags use `git push origin <tag>` (or `refs/tags/...`).
+- **Never force-push (`--force`, `--force-with-lease`, `--mirror`) or delete refs on the backup.** It must
+  only ever gain history. The same goes for the org repo unless the owner (moonriver366) explicitly asks.
+- **A rejected (non-fast-forward) push to the backup is the alarm** that the org history was rewritten.
+  Do not "fix" it. Stop, tell the user, and only with their OK: tag the backup's current `main` as
+  `backup/main-before-<YYYYMMDD>` on the backup, then update the backup's `main`.
+- Retired branches are archived as annotated tags `backup/<branch-name>` (pushed to both), then the
+  branch is deleted. Only `main` is kept as a local branch.
+- One-time setup on a new clone (e.g. the lab PC; OneDrive PCs share this `.git` and already have it):
+  ```powershell
+  git remote add backup https://github.com/moonriver366/Automation-backup.git
+  git remote set-url --add --push origin https://github.com/Purdue-Huang-Lab/Automation.git
+  git remote set-url --add --push origin https://github.com/moonriver366/Automation-backup.git
+  git remote -v   # origin should list one fetch URL and two push URLs
+  ```
+  Pushing to the backup needs moonriver366's GitHub login; on a PC signed in as someone else the
+  backup push fails — tell the user rather than skipping it.
