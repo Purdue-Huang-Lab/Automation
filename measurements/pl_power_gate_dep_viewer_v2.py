@@ -888,6 +888,18 @@ def _baseline_correct(image: np.ndarray, wl: np.ndarray, lo: float, hi: float) -
     return img - bg
 
 
+def _window_mean(image: np.ndarray, wl: np.ndarray, lo: float, hi: float) -> float:
+    """Mean counts of the whole image inside [lo, hi] nm (NaN if the window is empty)."""
+    img = np.asarray(image, dtype=float)
+    wl  = np.asarray(wl, dtype=float).ravel()
+    if img.ndim != 2 or wl.size != img.shape[1]:
+        return float("nan")
+    mask = (wl >= min(lo, hi)) & (wl <= max(lo, hi))
+    if not mask.any():
+        return float("nan")
+    return float(np.nanmean(img[:, mask]))
+
+
 def _corrected_image(
     data_img: np.ndarray, data_wl: Optional[np.ndarray],
     sub_img:  Optional[np.ndarray], sub_wl: Optional[np.ndarray],
@@ -1782,6 +1794,11 @@ class PLViewerV2(QtWidgets.QMainWindow):
         self._dip_fit_result      = None
         self._dip_fit_map_version = -1
         self._active_overlay      = "peak"   # "peak" | "dip"
+        # Reference normalization: frames of the reference folder, and the
+        # reference counts of the last map's columns (for the "Ref counts" tab)
+        self._norm_ref_dir: Optional[Path] = None
+        self._norm_ref_frames: List[PLFrame] = []
+        self._map_ref_counts: Optional[np.ndarray] = None
 
         self._build_ui()
         self._refresh_all()
@@ -1826,6 +1843,11 @@ class PLViewerV2(QtWidgets.QMainWindow):
         self.analysisTabs.addTab(self.dipPosPlot,       "Dip Positions")
         self.analysisTabs.addTab(self.derivEView,       "dI/dE")
         self.analysisTabs.addTab(self.deriv2EView,      "d²I/dE²")
+        self.refCountsPlot = pg.PlotWidget()
+        self.refCountsPlot.setLabel("left", "Reference counts (mean in λ window)")
+        self.refCountsPlot.setLabel("bottom", "X")
+        self.refCountsPlot.showGrid(x=True, y=True, alpha=0.25)
+        self.analysisTabs.addTab(self.refCountsPlot,    "Ref counts")
         split.addWidget(self.mapView)
         split.addWidget(self.analysisTabs)
         split.setStretchFactor(0, 3)
@@ -1894,6 +1916,7 @@ class PLViewerV2(QtWidgets.QMainWindow):
         cl.addWidget(self.angleCalibStatusLbl)
         cl.addStretch()
         left.addWidget(corr)
+        left.addWidget(self._make_norm_box())
         left.addStretch()
         outer.addLayout(left, 2)
 
@@ -2074,6 +2097,58 @@ class PLViewerV2(QtWidgets.QMainWindow):
         self.loadAngleCalibBtn.clicked.connect(self._on_load_angle_calib)
         # liveView signals connected later in _build_ui() after liveView is created
 
+        return box
+
+    def _make_norm_box(self) -> QtWidgets.QGroupBox:
+        """Divide every frame by its reference counts (e.g. white-light power dependence)."""
+        box = QtWidgets.QGroupBox("Reference normalization")
+        nl = QtWidgets.QHBoxLayout(box)
+        nl.setContentsMargins(8, 4, 8, 4)
+        nl.setSpacing(8)
+        self.normCheck = QtWidgets.QCheckBox("Normalize by ref counts")
+        self.normCheck.setToolTip(
+            "Divide each frame by its reference counts: the mean counts in the λ range\n"
+            "over the whole cropped image, after baseline correction (no substrate).\n"
+            "Enable Baseline correction (with a range where there is no light) so the\n"
+            "camera's dark offset is not part of the reference counts.")
+        nl.addWidget(self.normCheck)
+        nl.addWidget(QtWidgets.QLabel("λ range:"))
+        self.normLoSpin = QtWidgets.QDoubleSpinBox()
+        self.normHiSpin = QtWidgets.QDoubleSpinBox()
+        for spin, val in ((self.normLoSpin, 700.0), (self.normHiSpin, 720.0)):
+            spin.setDecimals(1)
+            spin.setRange(200.0, 2000.0)
+            spin.setValue(val)
+            spin.setFixedWidth(75)
+            spin.setSuffix(" nm")
+        nl.addWidget(self.normLoSpin)
+        nl.addWidget(QtWidgets.QLabel("to"))
+        nl.addWidget(self.normHiSpin)
+        nl.addWidget(QtWidgets.QLabel("Ref from:"))
+        self.normSrcCombo = QtWidgets.QComboBox()
+        self.normSrcCombo.addItems(["This data", "Ref folder"])
+        self.normSrcCombo.setToolTip(
+            "This data: each frame's own counts in the λ range.\n"
+            "Ref folder: the counts of the reference folder's frame at the same power\n"
+            "(nearest power within 1 %; several frames at one power are averaged).")
+        nl.addWidget(self.normSrcCombo)
+        self.normFolderBtn = QtWidgets.QPushButton("Folder…")
+        self.normFolderBtn.setFixedWidth(80)
+        nl.addWidget(self.normFolderBtn)
+        self.normFolderLbl = QtWidgets.QLabel("(none)")
+        self.normFolderLbl.setStyleSheet("font-style:italic; color:#888;")
+        nl.addWidget(self.normFolderLbl)
+        self.normWarnLbl = QtWidgets.QLabel("")
+        self.normWarnLbl.setStyleSheet("color: #c25700;")
+        nl.addWidget(self.normWarnLbl)
+        nl.addStretch()
+
+        self.normCheck.toggled.connect(lambda _: self._on_norm_changed())
+        self.normLoSpin.valueChanged.connect(lambda _: self._on_norm_changed())
+        self.normHiSpin.valueChanged.connect(lambda _: self._on_norm_changed())
+        self.normSrcCombo.currentIndexChanged.connect(lambda _: self._on_norm_changed())
+        self.normFolderBtn.clicked.connect(self._browse_norm_folder)
+        self.baselineCheck.toggled.connect(lambda _: self._update_norm_warning())
         return box
 
     def _make_nonpol_page(self) -> QtWidgets.QWidget:
@@ -2291,6 +2366,77 @@ class PLViewerV2(QtWidgets.QMainWindow):
             return
         self._update_sub_label(key, folder=folder)
         self._refresh_all()
+
+    def _browse_norm_folder(self) -> None:
+        start = str(self._norm_ref_dir or self._primary_ch().data_dir or "")
+        chosen = QtWidgets.QFileDialog.getExistingDirectory(self, "Select reference folder", start)
+        if not chosen:
+            return
+        folder = Path(chosen)
+        frames = _load_frames(folder)
+        if not frames:
+            QtWidgets.QMessageBox.warning(self, "No data", f"No .asc files found in:\n{folder}")
+            return
+        self._norm_ref_dir    = folder
+        self._norm_ref_frames = frames
+        n_p = len({_norm_key(fr.power_w) for fr in frames})
+        self.normFolderLbl.setText(f"{folder.name} ({len(frames)} files, {n_p} powers)")
+        self.normFolderLbl.setToolTip(str(folder))
+        self.normSrcCombo.setCurrentIndex(1)   # -> _on_norm_changed
+        self._on_norm_changed()
+
+    # ── Reference normalization ───────────────────────────────────────
+
+    def _norm_from_folder(self) -> bool:
+        return self.normSrcCombo.currentIndex() == 1
+
+    def _norm_active(self) -> bool:
+        return self.normCheck.isChecked() and (not self._norm_from_folder() or bool(self._norm_ref_frames))
+
+    def _on_norm_changed(self) -> None:
+        self._update_norm_warning()
+        self._refresh_all()
+
+    def _update_norm_warning(self) -> None:
+        txt = ""
+        if self.normCheck.isChecked():
+            if self._norm_from_folder() and not self._norm_ref_frames:
+                txt = "Load a reference folder"
+            elif not self.baselineCheck.isChecked():
+                txt = "Baseline correction is off: the dark offset stays in the ref counts"
+        self.normWarnLbl.setText(txt)
+
+    def _crop_frame(self, fr: PLFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """Cropped (and λ-reversed) image of a frame outside any channel, like the substrate."""
+        wl = fr.wavelength_nm
+        if wl is None:
+            wl = np.arange(fr.image.shape[1], dtype=float)
+        img = _apply_crop(fr.image, self._crop)
+        if self.reverseWlCheck.isChecked():
+            img = img[:, ::-1]
+        return img, _crop_axis(wl, self._crop, fr.image.shape[1])
+
+    def _window_counts(self, img: np.ndarray, wl: np.ndarray) -> float:
+        """Reference counts of one image: baseline-corrected (if on) mean in the λ window."""
+        if self.baselineCheck.isChecked():
+            img = _baseline_correct(img, wl, float(self.bgLoSpin.value()), float(self.bgHiSpin.value()))
+        return _window_mean(img, wl, float(self.normLoSpin.value()), float(self.normHiSpin.value()))
+
+    def _ref_counts_for(self, ch: _Channel, fr: PLFrame) -> float:
+        """Reference counts for a data frame (NaN if none)."""
+        if not self._norm_from_folder():
+            return self._window_counts(*self._get_cropped_raw(ch, fr))
+        p = _norm_key(fr.power_w)
+        refs = [r for r in self._norm_ref_frames if _norm_key(r.power_w) == p]
+        if not refs and p:   # no exact match: the nearest power, if within 1 %
+            cands = [r for r in self._norm_ref_frames if r.power_w is not None and r.power_w / p > 0]
+            if cands:
+                best = min(cands, key=lambda r: abs(np.log(r.power_w / p)))
+                if abs(best.power_w / p - 1.0) <= 0.01:
+                    refs = [r for r in cands if _norm_key(r.power_w) == _norm_key(best.power_w)]
+        vals = [self._window_counts(*self._crop_frame(r)) for r in refs]
+        vals = [v for v in vals if np.isfinite(v)]
+        return float(np.mean(vals)) if vals else float("nan")
 
     def _update_data_label(self, key: str) -> None:
         ch  = self._ch[key]
@@ -2586,6 +2732,17 @@ class PLViewerV2(QtWidgets.QMainWindow):
         return img, wl_c
 
     def _get_corrected(self, ch: _Channel, fr: PLFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (corrected_image, wl): baseline and substrate corrections, then the reference normalization."""
+        corrected, wl = self._get_baseline_sub(ch, fr)
+        if self._norm_active():
+            ref = self._ref_counts_for(ch, fr)
+            if np.isfinite(ref) and ref > 0:
+                corrected = corrected / ref
+            else:   # no usable reference: blank rather than mix normalized and raw frames
+                corrected = np.full(corrected.shape, np.nan, dtype=float)
+        return corrected, wl
+
+    def _get_baseline_sub(self, ch: _Channel, fr: PLFrame) -> Tuple[np.ndarray, np.ndarray]:
         """Return (corrected_image, wl) applying baseline and substrate corrections."""
         img, wl = self._get_cropped_raw(ch, fr)
         do_bl  = self.baselineCheck.isChecked()
@@ -2686,6 +2843,12 @@ class PLViewerV2(QtWidgets.QMainWindow):
         def _tag(name: str) -> str:
             return "   ← swept" if name == swept else "   (fixed)"
 
+        if self._norm_active():
+            ref = self._ref_counts_for(ch, fr)
+            self.liveView.set_image_title(
+                self.liveView._titleLbl.text()
+                + (f"   ÷ ref {ref:.4g}" if np.isfinite(ref) and ref > 0 else "   (no reference counts)"))
+
         self.powerLbl.setText(power_base + _tag("power"))
         self.frontLbl.setText(f"Front gate: {_f(fr.v_front)} V" + _tag("front"))
         self.backLbl.setText(f"Back gate: {_f(fr.v_back)} V" + _tag("back"))
@@ -2741,13 +2904,17 @@ class PLViewerV2(QtWidgets.QMainWindow):
         wl_ref = np.asarray(wl_ref, dtype=float)
         width  = int(self.liveView.linecut_width())
         cols   = []
+        norm   = self._norm_active()
+        refs   = np.full(len(sweep_vals), np.nan, dtype=float)
 
-        for val in sweep_vals:
+        for i, val in enumerate(sweep_vals):
             fr = _frame_for(val)
 
             if fr is None:
                 cols.append(np.full(wl_ref.shape, np.nan, dtype=float))
                 continue
+            if norm:
+                refs[i] = self._ref_counts_for(ch, fr)
             img, wl = self._get_corrected(ch, fr)
             h = img.shape[0]
             # linecut_row() is in display space (flipud); convert to raw row
@@ -2761,6 +2928,8 @@ class PLViewerV2(QtWidgets.QMainWindow):
             cols.append(np.asarray(_resample(wl, lc, wl_ref), dtype=float))
 
         map_data = np.stack(cols, axis=1) if cols else np.full((wl_ref.size, x_axis.size), np.nan)
+        if ch is self._primary_ch():
+            self._map_ref_counts = refs if norm else None
         return x_axis, wl_ref, map_data
 
     def _update_maps(self) -> None:
@@ -2851,6 +3020,7 @@ class PLViewerV2(QtWidgets.QMainWindow):
 
         self._last_x_label = x_label
         self._last_x       = np.asarray(x, dtype=float)
+        self._update_ref_counts_tab(col_order)
 
         # convert nm → eV for display (uniform energy grid)
         y_ev, m_ev    = _nm_to_ev(wl_nm, m_smooth)
@@ -2893,6 +3063,24 @@ class PLViewerV2(QtWidgets.QMainWindow):
             self.liveView.clear_dip_overlay()
             self._update_live_linecut_fit_overlay()
         self._update_dip_positions_tab(x, x_label)
+
+    def _update_ref_counts_tab(self, col_order) -> None:
+        """Reference counts of the current map's columns vs the map x-axis."""
+        self.refCountsPlot.clear()
+        self.refCountsPlot.setLabel("bottom", self._last_x_label)
+        refs = self._map_ref_counts
+        if refs is None or self._last_x is None:
+            self.refCountsPlot.setTitle("Reference normalization is off")
+            return
+        if col_order is not None:
+            refs = refs[col_order]
+        lo, hi = sorted((self.normLoSpin.value(), self.normHiSpin.value()))
+        src = self._norm_ref_dir.name if self._norm_from_folder() and self._norm_ref_dir else "this data"
+        self.refCountsPlot.setTitle(f"Mean counts {lo:g}–{hi:g} nm  ({src})")
+        ok = np.isfinite(refs)
+        if ok.any():
+            self.refCountsPlot.plot(self._last_x[ok], refs[ok], pen=pg.mkPen("#1f77b4", width=2),
+                                    symbol="o", symbolSize=7, symbolBrush="#1f77b4")
 
     # ── Dip fitting ───────────────────────────────────────────────────
 
