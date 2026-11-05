@@ -72,8 +72,13 @@ def _parse_unit_from_header(header: List[str]) -> str:
     return "nW"
 
 
+def _is_excel(path: str) -> bool:
+    """.xlsx files are single-wheel (angle | power) calibrations, read by power_calibration."""
+    return os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm")
+
+
 def is_dual_wheel_calibration(path: str) -> bool:
-    if not path or not os.path.exists(path):
+    if not path or not os.path.exists(path) or _is_excel(path):
         return False
     with open(path, "r", newline="") as f:
         reader = csv.reader(f)
@@ -170,7 +175,7 @@ class HWPNDCalibData:
 
 def is_hwp_nd_calibration(path: str) -> bool:
     """Return True if the file is a wheel+HWP calibration (has [HWP_SWEEP] marker)."""
-    if not path or not os.path.exists(path):
+    if not path or not os.path.exists(path) or _is_excel(path):
         return False
     try:
         with open(path, "r", newline="") as f:

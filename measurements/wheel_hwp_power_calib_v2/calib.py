@@ -338,3 +338,63 @@ def read_fixed_angles(path: str) -> Tuple[Optional[float], Optional[float]]:
     except OSError:
         pass
     return nd_fixed, hwp_fixed
+
+
+# ---------------------------------------------------------------- ND-wheel-only (.xlsx)
+ND_XLSX_DETAILS = "details"
+
+
+def save_nd_xlsx(path: str, header: Sequence[str],
+                 nd: Tuple[Sequence[float], Sequence[float], Sequence[float]]) -> int:
+    """ND-wheel-only calibration as ``angle | power (nW)`` on the first sheet; returns the rows written.
+
+    That sheet is what PL + TRPL v2 loads as a single-wheel calibration (and the viewers'
+    angle -> power files); points without a valid (finite, > 0) power are left out of it.
+    The "details" sheet keeps ``header`` and every point with its std, for reloading here.
+    """
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws.append(["angle", "power (nW)"])
+    n = 0
+    for ang, pw in zip(nd[0], nd[1]):
+        if np.isfinite(pw) and pw > 0:
+            ws.append([round(float(ang), 4), float(f"{pw / 1e-9:.6g}")])
+            n += 1
+    det = wb.create_sheet(ND_XLSX_DETAILS)
+    for line in header:
+        det.append([line])
+    det.append([])
+    det.append(["nd_angle_deg", "mean_power_w", "std_power_w"])
+    for ang, pw, sd in zip(*nd):
+        det.append([float(ang), float(pw), float(sd)])
+    wb.save(path)
+    return n
+
+
+def load_nd_xlsx(path: str) -> Tuple[List[float], List[float], List[float]]:
+    """(angles, powers W, stds W) from ``save_nd_xlsx`` or any ``angle | power (unit)`` sheet (std 0)."""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        if ND_XLSX_DETAILS in wb.sheetnames:
+            rows = list(wb[ND_XLSX_DETAILS].iter_rows(values_only=True))
+            for i, row in enumerate(rows):
+                if row and row[0] == "nd_angle_deg":
+                    pts = [r[:3] for r in rows[i + 1:]
+                           if r and len(r) >= 3 and all(isinstance(v, (int, float)) for v in r[:3])]
+                    if pts:
+                        a, p, s = zip(*pts)
+                        return [float(v) for v in a], [float(v) for v in p], [float(v) for v in s]
+    finally:
+        wb.close()
+    from measurements.power_calibration import load_power_calibration
+
+    data = load_power_calibration(path)
+    if not data.entries:
+        raise ValueError(f"No angle / power rows in {os.path.basename(path)}")
+    return ([e.position_deg for e in data.entries], [e.power_w for e in data.entries],
+            [0.0] * len(data.entries))

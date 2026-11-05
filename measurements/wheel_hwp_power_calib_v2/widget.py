@@ -50,6 +50,8 @@ from .workers import PMThread, StageSweepWorker
 
 STAGES = ("nd", "hwp")
 STAGE_LABEL = {"nd": "ND wheel", "hwp": "HWP"}
+MODES = ("ND wheel + HWP", "ND wheel only")  # ND only: no HWP stage, saved as angle | power (nW) .xlsx
+TAB_HWP, TAB_ND, TAB_ANALYSIS, TAB_PLANNER = range(4)
 
 
 def _grid(box: QtWidgets.QWidget) -> QtWidgets.QGridLayout:
@@ -143,6 +145,7 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         self._regrid_timer.timeout.connect(self._rebuild_grid)
 
         self._build_ui()
+        self._apply_mode()
         for name, dev in self._devs.items():
             dev.state_changed.connect(lambda _s, n=name: self._on_stage_state(n))
             dev.connected.connect(lambda info, n=name: self._on_stage_connected(n, info))
@@ -158,6 +161,13 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
 
         # 1. top bar
         top = QtWidgets.QHBoxLayout()
+        self.modeCombo = QtWidgets.QComboBox()
+        self.modeCombo.addItems(MODES)
+        self.modeCombo.setToolTip("ND wheel only: no HWP; one ND sweep, saved as an angle | power (nW) .xlsx\n"
+                                  "that PL+TRPL v2 loads as a single-wheel calibration")
+        top.addWidget(QtWidgets.QLabel("Mode:"))
+        top.addWidget(self.modeCombo)
+        top.addSpacing(16)
         self.btn_run_hwp = _button("Run HWP sweep", 110)
         self.btn_run_nd = _button("Run ND sweep", 110)
         self.btn_run_both = _button("Run both")
@@ -214,6 +224,7 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         self.btn_stop.clicked.connect(self._on_stop)
         self.btn_load.clicked.connect(self._on_load)
         self.btn_save.clicked.connect(self._on_save)
+        self.modeCombo.currentIndexChanged.connect(self._apply_mode)
 
     def statusBar(self) -> QtWidgets.QStatusBar:
         return self._status
@@ -229,6 +240,7 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         self.btn_disc: Dict[str, QtWidgets.QPushButton] = {}
         self.devStatusLbl: Dict[str, QtWidgets.QLabel] = {}
         self.posLbl: Dict[str, QtWidgets.QLabel] = {}
+        self._hwp_widgets: List[QtWidgets.QWidget] = []  # hidden in ND-only mode
         g.addWidget(QtWidgets.QLabel("Position"), 0, 6)
         for row, (name, default) in enumerate((("nd", DEFAULT_ND_SERIAL), ("hwp", DEFAULT_HWP_SERIAL)), start=1):
             cb = QtWidgets.QComboBox()
@@ -242,13 +254,17 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
             self.devStatusLbl[name] = QtWidgets.QLabel("Disconnected")
             self.posLbl[name] = QtWidgets.QLabel("---")
             self.posLbl[name].setFont(mono)
-            g.addWidget(QtWidgets.QLabel(f"{STAGE_LABEL[name]}:"), row, 0)
+            lbl = QtWidgets.QLabel(f"{STAGE_LABEL[name]}:")
+            g.addWidget(lbl, row, 0)
             g.addWidget(cb, row, 1)
             g.addWidget(self.btn_scan[name], row, 2)
             g.addWidget(self.btn_conn[name], row, 3)
             g.addWidget(self.btn_disc[name], row, 4)
             g.addWidget(self.devStatusLbl[name], row, 5)
             g.addWidget(self.posLbl[name], row, 6)
+            if name == "hwp":
+                self._hwp_widgets += [lbl, cb, self.btn_scan[name], self.btn_conn[name], self.btn_disc[name],
+                                      self.devStatusLbl[name], self.posLbl[name]]
             self.btn_scan[name].clicked.connect(self._scan_stages)
             self.btn_conn[name].clicked.connect(lambda _=False, n=name: self._connect_stage(n))
             self.btn_disc[name].clicked.connect(lambda _=False, n=name: self._devs[n].disconnect_device())
@@ -280,9 +296,12 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         self.btn_move: Dict[str, QtWidgets.QPushButton] = {}
         for row, name in enumerate(STAGES):
             self.btn_move[name] = _button("Move to")
-            g.addWidget(QtWidgets.QLabel(f"{STAGE_LABEL[name]}:"), row, 0)
+            lbl = QtWidgets.QLabel(f"{STAGE_LABEL[name]}:")
+            g.addWidget(lbl, row, 0)
             g.addWidget(self.targetSpin[name], row, 1)
             g.addWidget(self.btn_move[name], row, 2)
+            if name == "hwp":
+                self._hwp_widgets += [lbl, self.targetSpin[name], self.btn_move[name]]
             self.btn_move[name].clicked.connect(lambda _=False, n=name: self._move(n))
         g.setColumnStretch(1, 1)
         return box
@@ -324,7 +343,7 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         vl = QtWidgets.QVBoxLayout(box)
         vl.setContentsMargins(8, 8, 8, 8)
         vl.setSpacing(6)
-        sweep_tabs = QtWidgets.QTabWidget()
+        self.sweepTabs = sweep_tabs = QtWidgets.QTabWidget()
         sweep_tabs.setDocumentMode(True)
         vl.addWidget(sweep_tabs)
 
@@ -347,8 +366,11 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
             w = QtWidgets.QWidget()
             g = _grid(w)
             for r, (lbl, spin) in enumerate(rows):
-                g.addWidget(QtWidgets.QLabel(lbl), r, 0)
+                lbl_w = QtWidgets.QLabel(lbl)
+                g.addWidget(lbl_w, r, 0)
                 g.addWidget(spin, r, 1)
+                if spin is self.hwpFixedSpin:
+                    self._hwp_widgets += [lbl_w, spin]
             g.addWidget(total, len(rows), 0, 1, 2)
             g.setColumnStretch(1, 1)
             sweep_tabs.addTab(w, title)
@@ -744,6 +766,32 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         if cb is not None:
             cb()
 
+    # ================================================================== mode
+    @property
+    def _nd_only(self) -> bool:
+        return self.modeCombo.currentIndex() == 1
+
+    def _apply_mode(self) -> None:
+        """Show / hide the HWP parts; ND only = ND sweep, ND tab and .xlsx save."""
+        nd_only = self._nd_only
+        for w in self._hwp_widgets:
+            w.setVisible(not nd_only)
+        for b in (self.btn_run_hwp, self.btn_run_both):
+            b.setVisible(not nd_only)
+        self.sweepTabs.setTabVisible(0, not nd_only)
+        for i in (TAB_HWP, TAB_ANALYSIS, TAB_PLANNER):
+            self.tabs.setTabVisible(i, not nd_only)
+        if nd_only:
+            self.sweepTabs.setCurrentIndex(1)
+            self.tabs.setCurrentIndex(TAB_ND)
+        self.btn_load.setText("Load XLSX" if nd_only else "Load CSV")
+        self.btn_save.setText("Save XLSX" if nd_only else "Save CSV")
+        self._sync_controls()
+
+    def _set_mode(self, nd_only: bool) -> None:
+        if self._nd_only != nd_only:
+            self.modeCombo.setCurrentIndex(1 if nd_only else 0)  # -> _apply_mode
+
     # ================================================================== state
     def _sync_controls(self) -> None:
         busy = self._running or self._zeroing
@@ -765,14 +813,17 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         for b in (self.btn_pm_wave, self.btn_pm_avg, self.btn_pm_read, self.btn_pm_zero):
             b.setEnabled(pm_cmd)
 
-        ready = all(d.is_connected for d in self._devs.values()) and self._pm_ok
+        nd_only = self._nd_only
+        needed = ("nd",) if nd_only else STAGES
+        ready = all(self._devs[n].is_connected for n in needed) and self._pm_ok
         for b in (self.btn_run_hwp, self.btn_run_nd, self.btn_run_both):
             b.setEnabled(ready and not busy and not moving)
         self.btn_stop.setEnabled((self._running and not self._stopping) or moving)
 
-        has_data = bool(self._hwp_angles or self._nd_angles)
+        has_data = bool(self._nd_angles) if nd_only else bool(self._hwp_angles or self._nd_angles)
         self.btn_save.setEnabled(has_data and not self._running)
         self.btn_load.setEnabled(not self._running)
+        self.modeCombo.setEnabled(not self._running)
         for spin in (self.ndFixedSpin, self.hwpStartSpin, self.hwpStopSpin, self.hwpStepSpin,
                      self.hwpFixedSpin, self.ndStartSpin, self.ndStopSpin, self.ndStepSpin,
                      self.nReadingsSpin, self.rampSpin, self.pmWaveSpin, self.pmAvgSpin):
@@ -809,7 +860,7 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         self._nd_fixed = self.ndFixedSpin.value()
         self.hwpTable.setRowCount(0)
         self.hwpPlot.clear()
-        self.tabs.setCurrentIndex(0)
+        self.tabs.setCurrentIndex(TAB_HWP)
         self._start_sweep("hwp", fixed="nd", sweep="hwp", fixed_angle=self._nd_fixed, angles=angles)
 
     def _on_start_nd(self) -> None:
@@ -819,10 +870,14 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
             self._finish_sweep()
             return
         self._nd_angles, self._nd_powers, self._nd_stds = [], [], []
-        self._hwp_fixed = self.hwpFixedSpin.value()
         self.ndTable.setRowCount(0)
         self.ndPlot.clear()
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(TAB_ND)
+        if self._nd_only:  # no HWP: the "fixed" move just brings the ND wheel to the start angle
+            self._hwp_fixed = None
+            self._start_sweep("nd", fixed="nd", sweep="nd", fixed_angle=float(angles[0]), angles=angles)
+            return
+        self._hwp_fixed = self.hwpFixedSpin.value()
         self._start_sweep("nd", fixed="hwp", sweep="nd", fixed_angle=self._hwp_fixed, angles=angles)
 
     def _on_start_both(self) -> None:
@@ -1099,6 +1154,9 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
 
     # ================================================================== save / load
     def _on_save(self) -> None:
+        if self._nd_only:
+            self._save_nd_xlsx()
+            return
         default = os.path.join(DATA_DIR, f"wheel_hwp_calib_{datetime.now():%Y%m%d_%H%M%S}.csv")
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save calibration CSV", default, "CSV files (*.csv)")
         if not path:
@@ -1124,13 +1182,46 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
         self._calib_path = path
         self._status.showMessage(f"Saved → {path}")
 
+    def _save_nd_xlsx(self) -> None:
+        folder = os.path.dirname(self._calib_path) if self._calib_path else DATA_DIR
+        default = os.path.join(folder, f"power{datetime.now():%m%d}.xlsx")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save ND wheel calibration", default,
+                                                        "Excel files (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        header = [
+            f"ND wheel power calibration (no HWP)  {datetime.now().isoformat()}",
+            f"ND serial:      {self.serialCombo['nd'].currentText()}",
+            f"PM averaging:   {self.pmAvgSpin.value()}",
+            f"Readings/step:  {self.nReadingsSpin.value()}",
+            f"Wavelength (nm):{self.pmWaveSpin.value()}",
+            f"PM zero:        {self.pmZeroLbl.text()}",
+        ]
+        try:
+            n = calib.save_nd_xlsx(path, header, (self._nd_angles, self._nd_powers, self._nd_stds))
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(exc))
+            return
+        self._calib_path = path
+        skipped = len(self._nd_angles) - n
+        self._status.showMessage(f"Saved {n} angles → {path}"
+                                 + (f"   ({skipped} without a valid power left out)" if skipped else ""))
+
     def _on_load(self) -> None:
         folder = os.path.dirname(self._calib_path) if self._calib_path else DATA_DIR
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load calibration CSV", folder, "CSV files (*.csv)")
+        filters = ["CSV files (*.csv)", "Excel files (*.xlsx)"]
+        if self._nd_only:
+            filters.reverse()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load calibration", folder, ";;".join(filters))
         if path:
             self.load_file(path)
 
     def load_file(self, path: str) -> bool:
+        if path.lower().endswith((".xlsx", ".xlsm")):
+            return self._load_nd_xlsx(path)
         try:
             data = load_hwp_nd_calibration(path)
         except Exception as exc:
@@ -1149,9 +1240,29 @@ class WheelHWPCalibWidget(QtWidgets.QWidget):
             self._fill_table(self.ndTable, self._nd_angles, self._nd_powers, self._nd_stds)
             self.ndPlot.set_data(self._nd_angles, self._nd_powers, self._nd_stds)
         self._calib_path = path
+        self._set_mode(False)
         self._data_changed()
         if self._grid_data is not None:
-            self.tabs.setCurrentIndex(3)
+            self.tabs.setCurrentIndex(TAB_PLANNER)
+        self._status.showMessage(f"Loaded ← {os.path.basename(path)}")
+        self._sync_controls()
+        return True
+
+    def _load_nd_xlsx(self, path: str) -> bool:
+        """ND-wheel-only calibration (angle | power): switches to ND-only mode."""
+        try:
+            angles, powers, stds = calib.load_nd_xlsx(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Load failed", str(exc))
+            return False
+        self._nd_angles, self._nd_powers, self._nd_stds = angles, powers, stds
+        self._hwp_fixed = None
+        self._fill_table(self.ndTable, angles, powers, stds)
+        self.ndPlot.set_data(angles, powers, stds)
+        self._calib_path = path
+        self._set_mode(True)
+        self._data_changed()
+        self.tabs.setCurrentIndex(TAB_ND)
         self._status.showMessage(f"Loaded ← {os.path.basename(path)}")
         self._sync_controls()
         return True

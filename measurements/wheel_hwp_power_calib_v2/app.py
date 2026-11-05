@@ -36,7 +36,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     ap = argparse.ArgumentParser(description="Wheel + HWP power calibration v2")
-    ap.add_argument("calib", nargs="?", help="calibration CSV to load on start")
+    ap.add_argument("calib", nargs="?", help="calibration CSV (or ND-only .xlsx) to load on start")
     args, qt_args = ap.parse_known_args()
     enable_high_dpi()
     app = QtWidgets.QApplication(sys.argv[:1] + qt_args)

@@ -36,7 +36,7 @@ def _unit_from_header(header: List[str]) -> str:
     if len(header) < 2:
         return "nW"
     h1 = header[1].strip().lower()
-    if "uw" in h1:
+    if "uw" in h1 or "µw" in h1 or "μw" in h1:
         return "uW"
     if "nw" in h1:
         return "nW"
@@ -56,15 +56,40 @@ def _parse_series_filters(series: str) -> Tuple[int, ...]:
     return tuple(sorted({int(n) for n in nums}))
 
 
+def is_excel_path(path: str) -> bool:
+    return os.path.splitext(path or "")[1].lower() in (".xlsx", ".xlsm")
+
+
+def _read_excel_rows(path: str) -> List[List[str]]:
+    """First sheet of an .xlsx as csv-like rows of strings (e.g. ``angle | power (nW)``)."""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        rows: List[List[str]] = []
+        for vals in wb.worksheets[0].iter_rows(values_only=True):
+            row = ["" if v is None else str(v) for v in vals]
+            while row and not row[-1].strip():
+                row.pop()
+            if row:
+                rows.append(row)
+        return rows
+    finally:
+        wb.close()
+
+
 def load_power_calibration(path: str) -> PowerCalibData:
     if not path:
         raise ValueError("No calibration path provided")
     if not os.path.exists(path):
         raise FileNotFoundError(path)
 
-    with open(path, "r", newline="") as f:
-        reader = csv.reader(f)
-        rows = [row for row in reader if row]
+    if is_excel_path(path):
+        rows = _read_excel_rows(path)
+    else:
+        with open(path, "r", newline="") as f:
+            reader = csv.reader(f)
+            rows = [row for row in reader if row]
 
     nd_ratios: Dict[int, float] = {}
     data_rows: List[List[str]] = []
@@ -89,7 +114,7 @@ def load_power_calibration(path: str) -> PowerCalibData:
                 except Exception:
                     continue
             continue
-        if "position" in head and len(row) > 1 and "power" in row[1].strip().lower():
+        if ("position" in head or "angle" in head) and len(row) > 1 and "power" in row[1].strip().lower():
             header_row = row
             continue
         data_rows.append(row)

@@ -823,6 +823,29 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self.hwpMaxSpin.setRange(0, 360); self.hwpMaxSpin.setDecimals(2)
         self.hwpMaxSpin.setSingleStep(0.5); self.hwpMaxSpin.setSuffix(" °")
         self.hwpMaxSpin.setFixedWidth(90)
+        self.hwpDashLbl = QtWidgets.QLabel("–")
+
+        # Single wheel: only the calibration points between these wheel angles are swept
+        self.wheelRangeLbl = QtWidgets.QLabel("ND wheel range:")
+        self.wheelStartSpin = QtWidgets.QDoubleSpinBox()
+        self.wheelEndSpin = QtWidgets.QDoubleSpinBox()
+        for spin in (self.wheelStartSpin, self.wheelEndSpin):
+            spin.setRange(0, 360); spin.setDecimals(2)
+            spin.setSingleStep(1.0); spin.setSuffix(" °")
+            spin.setFixedWidth(90)
+            spin.setToolTip("Sweep only the calibration points from start to end (inclusive), going towards\n"
+                            "increasing angle and wrapping through 360° = 0°: 100 → 20 is 100–360° plus 0–20°")
+        self.wheelRangeBox = QtWidgets.QWidget()
+        hl = QtWidgets.QHBoxLayout(self.wheelRangeBox)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addWidget(QtWidgets.QLabel("start"))
+        hl.addWidget(self.wheelStartSpin)
+        hl.addWidget(QtWidgets.QLabel("→ end"))
+        hl.addWidget(self.wheelEndSpin)
+        self.wheelFullBtn = QtWidgets.QPushButton("Full range")
+        self.wheelFullBtn.setFixedWidth(90)
+        hl.addWidget(self.wheelFullBtn)
+        hl.addStretch()
 
         self.cropTopSpin = QtWidgets.QSpinBox()
         self.cropBottomSpin = QtWidgets.QSpinBox()
@@ -858,8 +881,11 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         grid.addWidget(self.ndWheelAngleCombo, 4, 1)
         grid.addWidget(self.hwpAngleLbl,       4, 2)
         grid.addWidget(self.hwpMinSpin,        4, 3)
-        grid.addWidget(QtWidgets.QLabel("–"),  4, 4)
+        grid.addWidget(self.hwpDashLbl,        4, 4)
         grid.addWidget(self.hwpMaxSpin,        4, 5)
+        # same row, shown instead of the HWP+ND controls in single-wheel mode
+        grid.addWidget(self.wheelRangeLbl,     4, 0)
+        grid.addWidget(self.wheelRangeBox,     4, 1, 1, 5)
 
         grid.addWidget(QtWidgets.QLabel("Crop T/B/L/R:"), 5, 0)
         grid.addWidget(self.cropTopSpin, 5, 1)
@@ -1541,8 +1567,12 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self.hwpMinSpin.valueChanged.connect(self._on_hwp_nd_angle_changed)
         self.hwpMaxSpin.valueChanged.connect(self._on_hwp_nd_angle_changed)
         for w in (self.ndWheelAngleLbl, self.ndWheelAngleCombo,
-                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpMaxSpin):
+                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpDashLbl, self.hwpMaxSpin):
             w.setVisible(False)
+        self._set_wheel_range_visible(False)
+        self.wheelStartSpin.valueChanged.connect(self._on_wheel_range_changed)
+        self.wheelEndSpin.valueChanged.connect(self._on_wheel_range_changed)
+        self.wheelFullBtn.clicked.connect(self._set_full_wheel_range)
         self.cropApplyBtn.clicked.connect(self.on_apply_crop)
         self.readoutRateCombo.currentIndexChanged.connect(self.on_preamp_change)
         self.preampCombo.currentIndexChanged.connect(self.on_preamp_change)
@@ -2601,6 +2631,8 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self.readoutRateCombo.setEnabled(cam_ok and not busy)
         self.preampCombo.setEnabled(cam_ok and not busy)
         self.seriesCombo.setEnabled(sweep_power and (not need_dual) and (not angle_list_mode) and calib_ok and not busy)
+        for w in (self.wheelStartSpin, self.wheelEndSpin, self.wheelFullBtn):
+            w.setEnabled(sweep_power and (not need_dual) and (not angle_list_mode) and calib_ok and not busy)
         power_list = self._power_list_active()
         self.powerSkipSpin.setEnabled(sweep_power and (not angle_list_mode) and (not power_list) and not busy)
         self.angleListEdit.setEnabled(sweep_power and self.angleListChk.isChecked() and not busy)
@@ -2908,6 +2940,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             "stage_serial_b": self.stage_b.serial if self.stage_b else "",
             "calib_mode": self._calib_mode,
             "power_calib_file": self.calibPathEdit.text().strip(),
+            **({"wheel_range_deg": "%g->%g" % self._wheel_range()} if self._calib_mode == "single" else {}),
             "crop_top": self._crop_top,
             "crop_bottom": self._crop_bottom,
             "crop_left": self._crop_left,
@@ -3502,7 +3535,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             self,
             "Select calibration file",
             DATA_DIR,
-            "CSV Files (*.csv);;All Files (*)",
+            "Calibration files (*.csv *.xlsx);;CSV Files (*.csv);;Excel Files (*.xlsx);;All Files (*)",
         )
         if path:
             self.calibPathEdit.setText(path)
@@ -3532,7 +3565,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self._hwp_nd_calib_data = None
         self._dual_entries = []
         for w in (self.ndWheelAngleLbl, self.ndWheelAngleCombo,
-                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpMaxSpin):
+                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpDashLbl, self.hwpMaxSpin):
             w.setVisible(False)
         self._calib_unit = data.unit
         self._calib_scale = data.scale
@@ -3550,11 +3583,52 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self.seriesCombo.blockSignals(False)
         self.calibModeLbl.setText("Mode: single wheel + ND filters")
         self._drop_power_list()
+        self._set_full_wheel_range()
+        self._set_wheel_range_visible(True)
 
         self._build_power_display()
         self._total_entries = len(data.entries)
         self._reset_sweep_data()
         self._update_series_info()
+
+    # Single-wheel angle range ------------------------------------------------
+    def _set_wheel_range_visible(self, on: bool) -> None:
+        self.wheelRangeLbl.setVisible(on)
+        self.wheelRangeBox.setVisible(on)
+
+    def _set_full_wheel_range(self) -> None:
+        """Start / end = the lowest / highest wheel angle in the calibration file."""
+        data = self._calib_data
+        if data is None or not data.entries:
+            return
+        pos = [e.position_deg for e in data.entries]
+        lo, hi = min(pos), max(pos)
+        for spin, val in ((self.wheelStartSpin, lo), (self.wheelEndSpin, hi)):
+            spin.blockSignals(True)
+            spin.setRange(min(0.0, lo), max(360.0, hi))
+            spin.setValue(val)
+            spin.blockSignals(False)
+        self._on_wheel_range_changed()
+
+    def _wheel_range(self) -> Tuple[float, float]:
+        return self.wheelStartSpin.value(), self.wheelEndSpin.value()
+
+    def _single_series_entries(self, series: str) -> List[PowerCalibEntry]:
+        """The series' calibration points inside the wheel range (inclusive), by power.
+
+        The range runs from start towards increasing angle and wraps through 360° = 0°:
+        100 -> 20 is 100..360 plus 0..20, while 20 -> 100 is 20..100.
+        """
+        start, end = self._wheel_range()
+        span = (end - start) % 360.0
+        if span == 0.0 and end != start:  # e.g. 0 -> 360: the whole wheel
+            span = 360.0
+        return [e for e in self._series_entries.get(series, [])
+                if (e.position_deg - start + 1e-6) % 360.0 <= span + 2e-6]
+
+    def _on_wheel_range_changed(self, *_args) -> None:
+        if self._calib_mode == "single":
+            self._update_series_info()
 
     def _load_dual_calibration(self, data: DualWheelPowerData):
         self._calib_mode = "dual"
@@ -3564,7 +3638,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self._series_entries.clear()
         self._dual_entries = list(data.entries)
         for w in (self.ndWheelAngleLbl, self.ndWheelAngleCombo,
-                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpMaxSpin):
+                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpDashLbl, self.hwpMaxSpin):
             w.setVisible(False)
         self._calib_unit = data.unit
         self._calib_scale = data.scale
@@ -3576,6 +3650,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self.seriesCombo.blockSignals(False)
         self.calibModeLbl.setText("Mode: dual wheel (file order sweep)")
         self._drop_power_list()
+        self._set_wheel_range_visible(False)
 
         self._build_power_display()
         self._total_entries = len(data.entries)
@@ -3606,8 +3681,9 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             self.hwpMaxSpin.blockSignals(False)
 
         for w in (self.ndWheelAngleLbl, self.ndWheelAngleCombo,
-                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpMaxSpin):
+                  self.hwpAngleLbl, self.hwpMinSpin, self.hwpDashLbl, self.hwpMaxSpin):
             w.setVisible(True)
+        self._set_wheel_range_visible(False)
 
         self.seriesCombo.blockSignals(True)
         self.seriesCombo.clear()
@@ -3691,7 +3767,9 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             return
         series = self.seriesCombo.currentText().strip()
         n = len(self._series_entries.get(series, []))
-        self.seriesInfoLbl.setText(f"{series} ({n} powers)")
+        n_in = len(self._single_series_entries(series))
+        self.seriesInfoLbl.setText(f"{series} ({n} powers)" if n_in == n
+                                   else f"{series} ({n_in} of {n} powers in wheel range)")
 
     def _refresh_power_table(self):
         unit = self._calib_unit
@@ -3978,11 +4056,12 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         if self._calib_data is None:
             return [], [], "Load a power calibration file first."
         series = self.seriesCombo.currentText().strip()
-        entries = sorted(self._series_entries.get(series, []), key=lambda e: e.power_w)
+        entries = sorted(self._single_series_entries(series), key=lambda e: e.power_w)
         if power_stride > 1:
             entries = entries[::power_stride]
         if not entries:
-            return [], [], f"No entries for series '{series}'."
+            start, end = self._wheel_range()
+            return [], [], f"No entries for series '{series}' in the ND wheel range {start:g}° → {end:g}°."
         for entry in entries:
             power_val = power_key(entry.power_w, scale=self._calib_scale)
             power_label = f"{power_val:.6g}".replace(".", "p")
@@ -4583,7 +4662,8 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
 
         for spin in (self.exposureSpin, self.accumSpin, self.tcspcAcqSpin, self.flipperSettleSpin,
                      self.frontV0Spin, self.frontStepSpin, self.backV0Spin, self.backStepSpin,
-                     self.sweepStepsSpin, self.backStepsSpin, self.powerSkipSpin, self.hwpMinSpin, self.hwpMaxSpin):
+                     self.sweepStepsSpin, self.backStepsSpin, self.powerSkipSpin, self.hwpMinSpin, self.hwpMaxSpin,
+                     self.wheelStartSpin, self.wheelEndSpin):
             spin.valueChanged.connect(later)
         for combo in (self.readoutRateCombo, self.sweepGateCombo, self.measureCombo, self.seriesCombo,
                       self.ndWheelAngleCombo):
@@ -6115,6 +6195,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             "## Calibration",
             f"- File: {meta.get('power_calib_file', '')}",
             f"- Mode: {meta.get('calib_mode', '')}",
+        ] + ([f"- ND wheel range (deg): {meta['wheel_range_deg']}"] if meta.get("wheel_range_deg") else []) + [
             "",
             "## Display Crop",
             f"- Top: {meta.get('crop_top', '')}",
