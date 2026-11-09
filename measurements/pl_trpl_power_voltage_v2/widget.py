@@ -4058,7 +4058,9 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         series = self.seriesCombo.currentText().strip()
         entries = sorted(self._single_series_entries(series), key=lambda e: e.power_w)
         if power_stride > 1:
-            entries = entries[::power_stride]
+            entries = entries[::power_stride]  # stride from the lowest power so it is always kept
+        # single wheel: sweep from the highest to the lowest power (the scan ends at the lowest)
+        entries = entries[::-1]
         if not entries:
             start, end = self._wheel_range()
             return [], [], f"No entries for series '{series}' in the ND wheel range {start:g}° → {end:g}°."
