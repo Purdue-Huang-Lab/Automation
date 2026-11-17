@@ -22,7 +22,7 @@ No test suite exists. Verification is done by launching the relevant GUI.
 ## Data Directory
 
 Measurement output goes to `DATA_DIR`, configured in [measurements/config.py](measurements/config.py):
-- Default: `C:\Data\Minxue\260402gatedtrilayer`
+- Default: `D:\Data\Minxue\261022_GT_D1_trilayer`
 - Override: set `AUTOMATION_DATA_DIR` environment variable
 
 `ROOT_DIR` points to the repo root (one level above `measurements/`).
@@ -31,11 +31,12 @@ Measurement output goes to `DATA_DIR`, configured in [measurements/config.py](me
 
 This is a PyQt5 lab automation framework. Code is organized in three layers:
 
-### 1. Hardware Wrappers (`andor/`, `flipper/`, `keithley/`, `ph300/`, `PM100A/`, `rot/`, `spad23/`, `spad93/`)
+### 1. Hardware Wrappers (`andor/`, `flipper/`, `keithley/`, `ph300/`, `PM100A/`, `rot/`, `smc100/`, `spad23/`, `spad93/`)
 
 Each device module exposes a single wrapper class with a consistent interface: `open()` / `close()`, configuration setters, acquisition methods, and optional `verbose` logging. Wrappers are thread-safe via `RLock`. They do not import Qt and have no GUI dependency.
 
-Key classes: `AndorSystem`, `FilterFlipper`, `KeithleySMU`, `PicoHarp300`, `PM100ADevice`, `MotionController`.
+Key classes: `AndorSystem`, `FilterFlipper`, `KeithleySMU`, `PicoHarp300`, `PM100ADevice`, `MotionController`,
+`SMC100Stage` (Newport SMC100 delay stage over pyserial; `python -m smc100.smc100_wrapper --simulate` for a no-hardware test).
 
 ### 2. Measurement Modules (`measurements/`)
 
@@ -51,6 +52,14 @@ Complex measurements follow the **Config → Workers → Widget → Entry** patt
 Workers emit signals; widgets connect slots. All hardware access in measurements goes through the wrappers above. `measurements/config.py` provides shared defaults across measurement modules (device serials, Andor settings, ROI bounds) and imports device-level configs where available.
 
 Submodule measurements (`pump_probe_gate_dep/`, `trpl_gate_power_dep/`) follow the same pattern but are launched via `gui_integrated.py` or `__main__.py` within the subdirectory.
+
+`pump_probe_gate_dep_montana/` is the v2 rewrite of `pump_probe_gate_dep/` for the Montana setup (SMC100 delay
+stage, one ND wheel, PL+TRPL v2 dual-gate sweep). Its TA logic lives in `ta_core.py` and must stay identical to
+the old GUI (ON/OFF split, `-1000 log10(ON/OFF)`, `*para.txt`/`*sum.txt` layout). `pixelink_compat.py` lets
+`pixelinkWrapper` import on Windows builds without WMIC. Launch: `.\run_pump_probe_gate_dep_montana_gui.ps1`.
+Sweep progress is kept in `sweep_state_<timestamp>.json` (`sweep_progress.py`); the sweep thread flattens its loops
+into a fixed action list so scan k is the same scan after **Resume sweep**. **Terminate** abandons a thread stuck in a
+driver call (it is kept in `_zombies`, never destroyed while running).
 
 Offline data viewers (`*_viewer*.py`) load `.csv`/`.txt`/`.npy` files from disk and do no hardware access.
 

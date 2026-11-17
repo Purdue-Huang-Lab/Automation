@@ -2,10 +2,13 @@
 measurements/ta_gate_power_viewer.py
 
 Viewer for gate- and power-dependent transient absorption data
-produced by the pump-probe gate-dep GUI (pump_probe_gate_dep/).
+produced by the pump-probe gate-dep GUIs (pump_probe_gate_dep/ and
+pump_probe_gate_dep_montana/).
 
 Each *para.txt + *sum.txt pair is one scan at one (gate voltage, ND angle).
-An optional XLSX maps ND-wheel angles to power in µW.
+Power comes from the file name's _P<value><unit> tag (Montana GUI); an optional
+XLSX / CSV angle → power map overrides it for the angles it covers.
+File loading is shared with ta_viewer.py (measurements/ta_data.py).
 
 Usage:
     python -m measurements.ta_gate_power_viewer [folder]
@@ -13,12 +16,8 @@ Usage:
 """
 import sys
 import os
-import re
-import glob
 import numpy as np
-import pandas as pd
 from pathlib import Path
-from dataclasses import dataclass, field
 from typing import Optional, List
 
 from PyQt5 import QtWidgets, QtCore
@@ -26,356 +25,13 @@ import pyqtgraph as pg
 
 pg.setConfigOptions(imageAxisOrder="row-major", background="w", foreground="k")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Colour maps
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _rdbu_lut() -> np.ndarray:
-    """RdBu_r – red=positive, blue=negative (standard TA convention)."""
-    pts = np.linspace(0.0, 1.0, 11)
-    rgba = np.array([
-        [103,   0,  31, 255],
-        [178,  24,  43, 255],
-        [214,  96,  77, 255],
-        [244, 165, 130, 255],
-        [253, 219, 199, 255],
-        [247, 247, 247, 255],
-        [209, 229, 240, 255],
-        [146, 197, 222, 255],
-        [ 67, 147, 195, 255],
-        [ 33, 102, 172, 255],
-        [  5,  48,  97, 255],
-    ], dtype=np.ubyte)
-    return pg.ColorMap(pts, rgba).getLookupTable(nPts=256)
-
-
-def _viridis_lut() -> np.ndarray:
-    return pg.colormap.get("viridis").getLookupTable(nPts=256)
-
-
-LUTS = {"RdBu_r": None, "viridis": None, "gray": None}
-
-
-def _get_lut(name: str) -> Optional[np.ndarray]:
-    if name == "RdBu_r":
-        if LUTS["RdBu_r"] is None:
-            LUTS["RdBu_r"] = _rdbu_lut()
-        return LUTS["RdBu_r"]
-    if name == "viridis":
-        if LUTS["viridis"] is None:
-            LUTS["viridis"] = _viridis_lut()
-        return LUTS["viridis"]
-    return None  # gray → no LUT (pyqtgraph default grayscale)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Filename / para.txt parsers
-# ─────────────────────────────────────────────────────────────────────────────
-
-_VF_RE  = re.compile(r"Vf([pn])(\d+)d(\d+)V", re.I)
-_VB_RE  = re.compile(r"Vb([pn])(\d+)d(\d+)V", re.I)
-_ND_RE  = re.compile(r"ND(n?)(\d+)(?:p(\d+))?deg", re.I)
-_HEL_RE = re.compile(r"(?<![A-Za-z])(LH|RH)(?![A-Za-z])", re.I)
-
-
-def _volt(m: re.Match) -> float:
-    sign = -1.0 if m.group(1).lower() == "n" else 1.0
-    return sign * float(f"{m.group(2)}.{m.group(3)}")
-
-
-def _ang(m: re.Match) -> float:
-    sign = -1.0 if m.group(1).lower() == "n" else 1.0
-    dec = m.group(3) or "0"
-    return sign * float(f"{m.group(2)}.{dec}")
-
-
-def _parse_fname(stem: str):
-    """Return (v_front, v_back, angle, helicity) from filename; NaN/'' if absent."""
-    vf = vb = angle = np.nan
-    helicity = ""
-    m = _VF_RE.search(stem)
-    if m:
-        vf = _volt(m)
-    m = _VB_RE.search(stem)
-    if m:
-        vb = _volt(m)
-    m = _ND_RE.search(stem)
-    if m:
-        angle = _ang(m)
-    m = _HEL_RE.search(stem)
-    if m:
-        helicity = m.group(1).upper()
-    return vf, vb, angle, helicity
-
-
-def _parse_para(path: Path) -> dict:
-    """
-    Parse a *para.txt produced by _save_gate_step / _save_angle.
-
-    Line layout (0-indexed, comment lines excluded):
-      0  : tab-separated delays in ps
-      1  : avg counts per delay
-      2  : 0
-      3  : scale factor (1.0)
-      4  : pixel_size (µm/pixel)
-      5  : crop_w  – spectral pixels  (≈ 480)  ← N2 in TAM notation
-      6  : pixel_size (repeated)
-      7  : crop_h  – spatial pixels   (≈ 128)  ← N1 in TAM notation
-      8  : 0
-      9  : t0_ps
-      10-14: 0s
-      15 : 0
-      16 : angle (degrees)
-      17 : 1
-      18 : 0
-      19 : n_frames
-      20 : 1
-    Comment lines: # FrontGateV=…  # BackGateV=…  # Helicity=LH/RH
-    """
-    data_lines: List[str] = []
-    comments: dict = {}
-    with open(path, "r", errors="ignore") as fh:
-        for raw in fh:
-            s = raw.strip()
-            if s.startswith("#"):
-                if "=" in s:
-                    k, v = s[1:].split("=", 1)
-                    comments[k.strip()] = v.strip()
-            else:
-                data_lines.append(s)
-
-    def _f(idx: int, default: float = 0.0) -> float:
-        try:
-            return float(data_lines[idx])
-        except Exception:
-            return default
-
-    def _i(idx: int, default: int = 128) -> int:
-        try:
-            return int(float(data_lines[idx]))
-        except Exception:
-            return default
-
-    delays = np.array(
-        [float(x) for x in data_lines[0].split("\t") if x.strip()],
-        dtype=np.float64,
-    ) if data_lines else np.array([], dtype=np.float64)
-
-    hel = (comments.get("Helicity", "") or comments.get("helicity", "")).strip().upper()
-
-    return dict(
-        delays_ps  = delays,
-        pixel_size = _f(4, 0.07),   # µm/pixel
-        crop_w     = _i(5, 480),    # spectral width  (N2)
-        crop_h     = _i(7, 128),    # spatial height  (N1)
-        t0_ps      = _f(9, 0.0),
-        angle      = _f(16, np.nan),
-        v_front    = float(comments["FrontGateV"]) if "FrontGateV" in comments else np.nan,
-        v_back     = float(comments["BackGateV"])  if "BackGateV"  in comments else np.nan,
-        helicity   = hel,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ScanRecord
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class ScanRecord:
-    path_para:  Path
-    path_sum:   Path
-    delays_ps:  np.ndarray
-    crop_h:     int        # spatial pixels  (N1, ≈128)
-    crop_w:     int        # spectral pixels (N2, ≈480)
-    t0_ps:      float
-    pixel_size: float      # µm/pixel (spatial)
-    v_front:    float      # NaN if unknown
-    v_back:     float      # NaN if unknown
-    angle:      float      # rotation stage degrees; NaN if absent
-    power_uw:   float      # µW from wheel map; NaN if unmapped
-    helicity:   str        # "LH", "RH", or ""
-    _stack: Optional[np.ndarray] = field(default=None, repr=False)
-
-    # ── convenience ──────────────────────────────────────────────────────────
-
-    @property
-    def n_delays(self) -> int:
-        return len(self.delays_ps)
-
-    @property
-    def label(self) -> str:
-        parts = []
-        if self.helicity:
-            parts.append(self.helicity)
-        if np.isfinite(self.v_front):
-            parts.append(f"Vf={self.v_front:+.3f} V")
-        if np.isfinite(self.v_back):
-            parts.append(f"Vb={self.v_back:+.3f} V")
-        if np.isfinite(self.power_uw):
-            parts.append(f"{self.power_uw:.3g} µW")
-        elif np.isfinite(self.angle):
-            parts.append(f"ND {self.angle:.1f}°")
-        return "  ".join(parts) if parts else self.path_para.stem[:50]
-
-    # ── stack loading ─────────────────────────────────────────────────────────
-
-    def load_stack(self) -> Optional[np.ndarray]:
-        """
-        Load full (T, crop_h, crop_w) stack from sum.txt.
-
-        sum.txt layout (written by _save_gate_step / _save_angle):
-          For each time step t:  crop_w rows × crop_h columns
-          (= transposed log-ratio image, crop_w ≈ 480 rows, crop_h ≈ 128 cols)
-        Reading back: raw[t*N2 : (t+1)*N2, :] → rot90 → (N1, N2) = (crop_h, crop_w)
-        """
-        if self._stack is not None:
-            return self._stack
-        try:
-            raw = (
-                pd.read_csv(
-                    self.path_sum,
-                    delimiter="\t",
-                    header=None,
-                    na_values=["--", "---"],
-                )
-                .fillna(0.0)
-                .values.astype(np.float32)
-            )
-            N1, N2, Nt = self.crop_h, self.crop_w, self.n_delays
-            stack = np.zeros((Nt, N1, N2), dtype=np.float32)
-            for i in range(Nt):
-                s = i * N2
-                if s + N2 > raw.shape[0]:
-                    break
-                stack[i] = np.rot90(raw[s : s + N2, :N1])
-            self._stack = stack
-            return stack
-        except Exception as exc:
-            print(f"load_stack {self.path_sum.name}: {exc}")
-            return None
-
-    def value_at(self, t_idx: int, iy: int, ix: int) -> float:
-        """
-        Signal at one pixel, loading only the required frame if the full
-        stack is not yet cached.
-        """
-        if self._stack is not None:
-            stk = self._stack
-            t = int(np.clip(t_idx, 0, stk.shape[0] - 1))
-            y = int(np.clip(iy,    0, stk.shape[1] - 1))
-            x = int(np.clip(ix,    0, stk.shape[2] - 1))
-            return float(stk[t, y, x])
-        # Load only the needed frame rows (fast for large files)
-        N1, N2 = self.crop_h, self.crop_w
-        t = int(np.clip(t_idx, 0, self.n_delays - 1))
-        y = int(np.clip(iy, 0, N1 - 1))
-        x = int(np.clip(ix, 0, N2 - 1))
-        try:
-            chunk = (
-                pd.read_csv(
-                    self.path_sum,
-                    delimiter="\t",
-                    header=None,
-                    skiprows=t * N2,
-                    nrows=N2,
-                    na_values=["--", "---"],
-                )
-                .fillna(0.0)
-                .values.astype(np.float32)
-            )
-            frame = np.rot90(chunk[:N2, :N1])  # (N1, N2)
-            return float(frame[y, x])
-        except Exception:
-            return np.nan
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Folder / XLSX helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def scan_folder(folder: str, wheel_map: dict) -> List[ScanRecord]:
-    """Discover all *para.txt + *sum.txt pairs, build ScanRecord list."""
-    records = []
-    for para_path in sorted(Path(folder).glob("*para.txt")):
-        sum_path = para_path.with_name(para_path.name.replace("para.txt", "sum.txt"))
-        if not sum_path.exists():
-            continue
-        try:
-            meta = _parse_para(para_path)
-        except Exception as exc:
-            print(f"Skip {para_path.name}: {exc}")
-            continue
-
-        fn_vf, fn_vb, fn_ang, fn_hel = _parse_fname(para_path.stem)
-        # Prefer comment-line metadata; fall back to filename
-        vf  = meta["v_front"]  if np.isfinite(meta["v_front"]) else fn_vf
-        vb  = meta["v_back"]   if np.isfinite(meta["v_back"])  else fn_vb
-        ang = meta["angle"]    if np.isfinite(meta["angle"])   else fn_ang
-        hel = meta["helicity"] or fn_hel
-
-        # Map angle → power via wheel_map (nearest within 0.5°)
-        puw = np.nan
-        if np.isfinite(ang) and wheel_map:
-            best = min(wheel_map, key=lambda k: abs(k - ang))
-            if abs(best - ang) <= 0.5:
-                puw = wheel_map[best]
-
-        records.append(ScanRecord(
-            path_para  = para_path,
-            path_sum   = sum_path,
-            delays_ps  = meta["delays_ps"],
-            crop_h     = meta["crop_h"],
-            crop_w     = meta["crop_w"],
-            t0_ps      = meta["t0_ps"],
-            pixel_size = meta["pixel_size"],
-            v_front    = vf,
-            v_back     = vb,
-            angle      = ang,
-            power_uw   = puw,
-            helicity   = hel,
-        ))
-    return records
-
-
-def load_wheel_map(xlsx_path: str) -> dict:
-    """
-    Read angle→power_µW from an XLSX file.
-    Expected layout (matching the screenshot):
-      Row N   : column headers containing 'angle' and 'power'
-      Row N+1…: numeric data
-    Returns {angle_float: power_uw_float}.
-    """
-    try:
-        df = pd.read_excel(xlsx_path, header=None)
-        # Find the header row (first row that contains 'angle' as a cell value)
-        hdr_row = None
-        for i, row in df.iterrows():
-            if any("angle" in str(v).lower() for v in row):
-                hdr_row = i
-                break
-        if hdr_row is None:
-            return {}
-        header = [str(v).lower().strip() for v in df.iloc[hdr_row]]
-        data   = df.iloc[hdr_row + 1 :].reset_index(drop=True)
-        data.columns = header
-        angle_col = next((c for c in header if "angle" in c), None)
-        power_col = next((c for c in header if "power" in c), None)
-        if not angle_col or not power_col:
-            return {}
-        result: dict = {}
-        for _, row in data.iterrows():
-            try:
-                a = float(row[angle_col])
-                p = float(row[power_col])
-                if np.isfinite(a) and np.isfinite(p):
-                    result[a] = p
-            except (ValueError, TypeError):
-                pass
-        return result
-    except Exception as exc:
-        print(f"XLSX load failed: {exc}")
-        return {}
+from measurements.ta_data import (  # noqa: E402  (after pyqtgraph config)
+    ScanRecord,
+    apply_power_map,
+    get_lut as _get_lut,
+    load_wheel_map,
+    scan_folder,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -454,10 +110,15 @@ class TAGatePowerViewer(QtWidgets.QMainWindow):
         layout.addWidget(fg)
 
         # ── XLSX ──
-        xg = QtWidgets.QGroupBox("ND Wheel → Power (XLSX)")
+        xg = QtWidgets.QGroupBox("ND Wheel → Power (XLSX / CSV)")
         xl = QtWidgets.QGridLayout(xg)
         self.xlsx_edit = QtWidgets.QLineEdit()
-        self.xlsx_edit.setPlaceholderText("Optional wheel-power map…")
+        self.xlsx_edit.setPlaceholderText("Optional; default: power in file name")
+        self.xlsx_edit.setToolTip(
+            "Optional angle → power table (.xlsx or .csv, header with 'angle' and\n"
+            "'power (nW)' / 'power (uW)'; no unit = µW).  Overrides the _P…nW power\n"
+            "tag of the file names (Montana GUI) for the angles it covers."
+        )
         xl.addWidget(self.xlsx_edit, 0, 0)
         self.xlsx_btn = QtWidgets.QPushButton("Browse")
         self.xlsx_btn.setFixedWidth(58)
@@ -800,8 +461,8 @@ class TAGatePowerViewer(QtWidgets.QMainWindow):
     def _browse_xlsx(self) -> None:
         p, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select ND-wheel power map",
-            os.path.dirname(self.xlsx_edit.text() or ""),
-            "Excel (*.xlsx *.xls);;All (*.*)",
+            os.path.dirname(self.xlsx_edit.text() or "") or self.folder_edit.text(),
+            "Power map (*.xlsx *.xls *.csv);;All (*.*)",
         )
         if p:
             self.xlsx_edit.setText(p)
@@ -822,13 +483,8 @@ class TAGatePowerViewer(QtWidgets.QMainWindow):
             self._apply_wheel_map()
 
     def _apply_wheel_map(self) -> None:
-        """Re-apply the current wheel_map to all loaded records and refresh the table."""
-        for r in self.records:
-            r.power_uw = np.nan
-            if np.isfinite(r.angle) and self.wheel_map:
-                best = min(self.wheel_map, key=lambda k: abs(k - r.angle))
-                if abs(best - r.angle) <= 0.5:
-                    r.power_uw = self.wheel_map[best]
+        """Re-apply the current wheel_map (else the file-name power tag) and refresh the table."""
+        apply_power_map(self.records, self.wheel_map)
         self._populate_table()
         self._rebuild_sliders()
 
