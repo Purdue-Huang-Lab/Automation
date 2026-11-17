@@ -60,6 +60,19 @@ def _brushes(cmap: pg.ColorMap, values: np.ndarray, levels, nan_color: str = NAN
             out[i] = pg.mkBrush(c)
     return out
 
+class _NanSafeImageItem(pg.ImageItem):
+    """ImageItem whose NaN cells stay transparent at every downsampled size.
+
+    pyqtgraph 0.13.7 caches the NaN positions of the (auto-downsampled) image and reuses them after a zoom or
+    resize changes the downsampled shape: "IndexError: index N is out of bounds" in paint, and the image is not
+    drawn.  Recomputing them at each render is cheap (renders happen only when the image or view changes).
+    """
+
+    def render(self, *args, **kwargs):
+        self._imageNanLocations = None
+        return super().render(*args, **kwargs)
+
+
 
 class PixelMapPlot(QtWidgets.QWidget):
     """The 23-pixel map: one circle per pixel colored by value.
@@ -428,7 +441,7 @@ class TimeSpectrumImage(QtWidgets.QWidget):
         self.axis.set_calibration(None)
         self.plot.setLabel("left", "Time (ns)")
         self.cmap = pg.colormap.get(FIT_CMAP)
-        self.img = pg.ImageItem(autoDownsample=True)
+        self.img = _NanSafeImageItem(autoDownsample=True)
         self.plot.addItem(self.img)
         self.cbar = pg.ColorBarItem(values=(0.0, 1.0), colorMap=self.cmap, interactive=False, width=14,
                                     colorMapMenu=False, pen="k")

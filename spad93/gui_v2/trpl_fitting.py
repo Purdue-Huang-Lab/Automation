@@ -1,10 +1,11 @@
 """Fitting sub-tab of the TRPL panel ("Fit All" over the selected time range).
 
 2D space (ports of spad23_trpl_viewer): 1 sequential 2D Gaussian, 2 fixed-center
-radial 1D Gaussian -> sigma_eq^2(t); 3 sequential double 2D Gaussian (two round
-spots on one offset) -> sigma1^2(t), sigma2^2(t).  By default both centers stay
+radial 1D Gaussian -> sigma_eq^2(t); 3 sequential double 2D Gaussian (two elliptical
+spots, sigma_x and sigma_y each, on one offset) -> sigma_x1 sigma_y1 (t), sigma_x2 sigma_y2 (t)
+(the sigma_eq^2 of each spot).  By default both centers stay
 where the reference fit put them (two pump spots whose signal spreads); the
-bottom trace is then each spot's integrated intensity 2 pi A sigma^2.  With the
+bottom trace is then each spot's integrated intensity 2 pi A sigma_x sigma_y.  With the
 centers free it is their separation d(t).
 By default every pixel's offset before time zero (its mean count per bin over a
 pre-t0 window, automatic or typed in) is subtracted from its trace first, so
@@ -133,7 +134,8 @@ class TrplFittingTab(QtWidgets.QWidget):
         self.spin_ratio.setValue(0.0)
         self.spin_ratio.setKeyboardTracking(False)
         self.chk_share_sigma = QtWidgets.QCheckBox("Same σ for both")
-        self.chk_share_sigma.setToolTip("Fit one width shared by both Gaussians (also in the reference fit).")
+        self.chk_share_sigma.setToolTip(
+            "Fit one σx and one σy shared by both Gaussians (also in the reference fit).")
         dro.addWidget(QtWidgets.QLabel("Method 3:"))
         dro.addWidget(self.chk_fix_centers)
         dro.addSpacing(12)
@@ -356,6 +358,11 @@ class TrplFittingTab(QtWidgets.QWidget):
         self.width_map.set_time_range(t0, t1)
         self.width_trace.plot.setXRange(t0, t1, padding=0.01)
 
+    def shift_times(self, d: float) -> None:
+        """The panel's time axis moved by ``d`` ns (raw <-> time zero at 0): a manual pre-t0 window follows."""
+        if not self._win_auto:
+            self._set_window(self.spin_w0.value() + d, self.spin_w1.value() + d)
+
     def set_cursor(self, t_ns: float) -> None:
         self.trace.set_cursor(t_ns)
         self.width_trace.set_cursor(t_ns)
@@ -481,7 +488,7 @@ class TrplFittingTab(QtWidgets.QWidget):
         if getattr(res, "amp_ratio", None) is not None:
             parts.append(f"A2/A1 fixed at {res.amp_ratio:.3g}")
         if getattr(res, "shared_sigma", False):
-            parts.append("same σ")
+            parts.append("same σx, σy")
         return ("; " + ", ".join(parts)) if parts else ""
 
     def _fix_offset(self) -> Optional[float]:
@@ -672,10 +679,10 @@ class TrplFittingTab(QtWidgets.QWidget):
         t = p.view_time[idxs]
         fits = [res.results[i] for i in idxs]
         if res.method == DOUBLE:
-            s1 = np.array([abs(f.component(0)[3]) for f in fits])
-            s2 = np.array([abs(f.component(1)[3]) for f in fits])
+            s1 = np.array([f.sigma_eq(0) for f in fits])
+            s2 = np.array([f.sigma_eq(1) for f in fits])
             sub = f"{self.cmb_method.currentText()}; ref t = {p.time_of(res.ref_idx):.3f} ns"
-            labels = dict(y_b=s2**2, label_a="σ1² (Gaussian 1)", label_b="σ2² (Gaussian 2)")
+            labels = dict(y_b=s2**2, label_a="σx1·σy1 (Gaussian 1)", label_b="σx2·σy2 (Gaussian 2)")
             sub += self._constraint_text(res)
             if res.centers is not None:
                 # the centers are fixed: the separation is constant, show each spot's integrated intensity
@@ -683,13 +690,13 @@ class TrplFittingTab(QtWidgets.QWidget):
                 w = np.array([f.weights for f in fits])
                 c = res.centers
                 sub += f"; centers fixed at ({c[0]:.1f}, {c[1]:.1f}) and ({c[2]:.1f}, {c[3]:.1f}) µm"
-                self.trace.set_series(t, s1**2, flagged, "σ² (µm²)", "σ1², σ2² vs time", y2=w[:, 0],
-                                      ylabel2="2πAσ² (counts·µm²)", subtitle=sub, y2_b=w[:, 1],
+                self.trace.set_series(t, s1**2, flagged, "σx·σy (µm²)", "σx·σy of each Gaussian vs time",
+                                      y2=w[:, 0], ylabel2="2πAσxσy (counts·µm²)", subtitle=sub, y2_b=w[:, 1],
                                       label2_a="I1 (Gaussian 1)", label2_b="I2 (Gaussian 2)", **labels)
             else:
                 flagged = np.array([bool(f.at_bound) or not f.resolved for f in fits])
                 d = np.array([f.separation for f in fits])
-                self.trace.set_series(t, s1**2, flagged, "σ² (µm²)", "σ1², σ2² vs time", y2=d,
+                self.trace.set_series(t, s1**2, flagged, "σx·σy (µm²)", "σx·σy of each Gaussian vs time", y2=d,
                                       ylabel2="Separation d (µm)", subtitle=sub, **labels)
             self.trace.set_cursor(p.time_of(p.current))
             return
@@ -939,16 +946,20 @@ class TrplFittingTab(QtWidgets.QWidget):
             for k in range(2):
                 n = k + 1
                 cols.update({f"A{n}": [c[0] for c in comp[k]], f"x{n}_um": [c[1] for c in comp[k]],
-                             f"y{n}_um": [c[2] for c in comp[k]], f"sigma{n}_um": [abs(c[3]) for c in comp[k]]})
+                             f"y{n}_um": [c[2] for c in comp[k]], f"sigma{n}_x_um": [c[3] for c in comp[k]],
+                             f"sigma{n}_y_um": [c[4] for c in comp[k]],
+                             f"sigma{n}_eq_um": [float(np.sqrt(c[3] * c[4])) for c in comp[k]]})
             cols.update({"offset": [f.offset for f in fits], "separation_um": [f.separation for f in fits],
                          "snr1": [f.snr1 for f in fits], "snr2": [f.snr2 for f in fits],
                          "resolved": [float(f.resolved) for f in fits], "at_bound": [float(bool(f.at_bound)) for f in fits],
                          "I1": [f.weights[0] for f in fits], "I2": [f.weights[1] for f in fits]})
             c = res.centers
             return cols, {"failures": res.failures, "reference_time_ns": p.time_of(res.ref_idx),
-                          "model": "A1 exp(-r1^2/2 sigma1^2) + A2 exp(-r2^2/2 sigma2^2) + offset; I = 2 pi A sigma^2",
+                          "model": "sum over k=1,2 of Ak exp(-(x-xk)^2/2 sigmak_x^2 - (y-yk)^2/2 sigmak_y^2)"
+                                   " + offset; sigma_eq = sqrt(sigma_x sigma_y); I = 2 pi A sigma_x sigma_y",
                           "amplitude_ratio_A2_A1": "free" if res.amp_ratio is None else f"fixed at {res.amp_ratio:.4g}",
-                          "sigma": "shared (sigma1 = sigma2)" if res.shared_sigma else "separate",
+                          "sigma": "shared (sigma1_x = sigma2_x, sigma1_y = sigma2_y)" if res.shared_sigma
+                          else "separate",
                           "centers": "free" if c is None else
                           f"fixed at the reference fit: ({c[0]:.3f}, {c[1]:.3f}) and ({c[2]:.3f}, {c[3]:.3f}) um"}
         if res.method == "2d_sequential":

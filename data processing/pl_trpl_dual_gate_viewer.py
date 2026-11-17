@@ -18,13 +18,30 @@ Tabs
      the tolerance of the u_n axis a constant-D scan (swept in n): the sweep axis
      of the other tabs is then D/ε₀ or n (u_D or u_n without physical units);
      otherwise it is the front gate voltage.
+     Peak fit (Gaussian, Lorentzian or Gauss ⊗ 2 exp = Gaussian ⊗ asymmetric exponential):
+     clicking a map point fits its spectrum (center, height, FWHM shown under it).  Sub-tabs
+     "Spectrum vs n (const D)" / "Spectrum vs D (const n)": linecuts through the map (as the
+     gate grids viewer's waterfalls; drawn dashed on the map, slider or click to move) with
+     "Fit linecut" → fitted centers on the spectrum map, intensity / center / width / local
+     slope dE/dx versus n or D, a straight-line fit over a dragged range, and the dipole
+     moment p = −ε_⊥·dE/d(D/ε₀) when the sweep axis is D.
   2. Point — PL image + spectrum, TRPL count map at the time-scrollbar bin with
      the 1σ / 2σ contours of its 2D Gaussian fit, decay of the selected pixel
      (left click on the map; right click = exclude the pixel from fits).
+     TRPL view "Spectral" (SPAD spectral mode, as the SPAD93 / SPAD23 GUIs; picked from the
+     scan header's spad_view_mode): the centre line (SPAD93 columns at y = 92 µm, SPAD23
+     rows at x = 46 µm) on a wavelength axis from the λ-calibration (WLCAL_*.json in the
+     folder, else the header's; "Load λ-cal…"): time-resolved spectrum image, spectrum at
+     the time cursor (maximum + Gaussian centre / FWHM), decays of the selected lines, and a
+     sequential 1D Gaussian fit of the active (last selected) line's pixels along y (SPAD93) / x
+     (SPAD23): profile map vs time with ±σ lines and σ²(t) with the D line (tab 3's settings);
+     tab 4's decay map then follows the active line.
   3. Spatial fit — radial profile of the 2D Gaussian at the time-scrollbar bin and
      σ_eq²(t) of this point ("Fit this point" / "Fit all"; never automatic).
   4. Dependence — versus gate (calibrated axis) or power: PL spectrum map, decay
      map of the selected pixel, and σ_eq²(t) map (filled by "Fit all" only).
+  5. PL fit (scan) — the same linecut fit for the loaded scan's PL spectra along tab 4's
+     sweep line (tab 2's CCD row / width / crop / baseline).
 
 The PL and TRPL processing (crop, linecut, time-zero alignment, background, the
 sequential 2D Gaussian fit) is copied from pl_trpl_power_gate_dep_viewer_v2.py;
@@ -53,6 +70,14 @@ try:
     from scipy.optimize import curve_fit as _curve_fit
 except ImportError:
     _curve_fit = None
+try:
+    from scipy.special import erfc, erfcx
+except ImportError:
+    erfc = erfcx = None
+try:
+    from scipy.interpolate import LinearNDInterpolator as _LinearND
+except ImportError:
+    _LinearND = None
 
 DEFAULT_CROP  = (50, 50, 200, 200)
 EV_NM         = 1239.841984
@@ -463,6 +488,44 @@ def _corrected_image(
 # SingleFrameView  (pyqtgraph single-frame viewer with linecut)
 # ══════════════════════════════════════════════════════════════════════
 
+def export_matrix_csv(path, x, y, z) -> None:
+    """Origin-ready matrix CSV: first row = x values (top-left cell empty), first column = y values,
+    z[k, j] at (x[j], y[k]); numbers only (NaN cells left empty), no header."""
+    x, y, z = np.asarray(x, float).ravel(), np.asarray(y, float).ravel(), np.asarray(z, float)
+    if z.shape != (y.size, x.size):
+        raise ValueError(f"matrix shape {z.shape} does not match y × x = {y.size} × {x.size}")
+
+    def num(v):
+        return "" if not np.isfinite(v) else f"{v:.10g}"
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write("," + ",".join(num(v) for v in x) + "\n")
+        for k in range(y.size):
+            fh.write(num(y[k]) + "," + ",".join(num(v) for v in z[k]) + "\n")
+
+
+def _export_csv_dialog(parent, default_name: str, write) -> None:
+    """Ask for a file (start in the last export folder) and call write(path)."""
+    st = _settings()
+    start = str(st.value("export/csv_dir") or "")
+    name = re.sub(r"[^\w.+-]+", "_", default_name).strip("_")[:120] or "map"
+    fn, _ = QtWidgets.QFileDialog.getSaveFileName(parent, "Export colour map (Origin matrix CSV)",
+                                                  str(Path(start) / f"{name}.csv"), "CSV (*.csv)")
+    if not fn:
+        return
+    st.setValue("export/csv_dir", str(Path(fn).parent))
+    try:
+        write(fn)
+    except (OSError, ValueError) as exc:
+        QtWidgets.QMessageBox.warning(parent, "Export CSV", str(exc))
+
+
+def _export_button(tip: str) -> QtWidgets.QPushButton:
+    b = QtWidgets.QPushButton("Export CSV…")
+    b.setToolTip(tip + "\nOrigin-ready matrix: first row = x values, first column = y values, numbers only.")
+    b.setEnabled(False)
+    return b
+
+
 def _pg_cmap(name: str) -> pg.ColorMap:
     for source in ("matplotlib", None):
         try:
@@ -500,6 +563,10 @@ class SingleFrameView(QtWidgets.QWidget):
         self.linecutWidthSpin.setFixedWidth(60)
         ctrl.addWidget(self.linecutWidthSpin)
         ctrl.addStretch()
+        self.exportBtn = _export_button("Export the PL image: x = wavelength (nm; pixel without a wavelength axis),\n"
+                                        "y = spatial pixel as displayed (0 = top row)")
+        self.exportBtn.clicked.connect(self._on_export)
+        ctrl.addWidget(self.exportBtn)
         vlay.addLayout(ctrl)
 
         self._glw = pg.GraphicsLayoutWidget()
@@ -610,9 +677,20 @@ class SingleFrameView(QtWidgets.QWidget):
             self._vline.setValue(mid)
         self._refresh_linecut()
         self._refresh_vlinecut()
+        self.exportBtn.setEnabled(bool(np.isfinite(self._img_data).any()))
 
     def set_image_title(self, text: str) -> None:
         self._titleLbl.setText(str(text))
+
+    def export_csv(self, fn) -> None:
+        x = self._wl if self._wl is not None and self._wl.size == self._w else np.arange(self._w, dtype=float)
+        export_matrix_csv(fn, x, np.arange(self._h, dtype=float), np.flipud(self._img_data))
+
+    def _on_export(self) -> None:
+        if self._img_data is None:
+            return
+        name = self._titleLbl.text().split("·")[-1].strip() or "PL_image"
+        _export_csv_dialog(self, Path(name).stem + "_image", self.export_csv)
 
     def set_crop(self, *args) -> None:
         pass  # crop is applied externally before set_image is called
@@ -1172,6 +1250,412 @@ def nd_prepare(data: dict) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# Spectral peak fits: one peak, Gaussian / Lorentzian / Gaussian ⊗ asymmetric exponential
+# ══════════════════════════════════════════════════════════════════════
+#   Gaussian      A·exp(−(E−E0)²/2σ²)                 height A, FWHM 2√(2 ln2)·σ, area √(2π)·A·σ
+#   Lorentzian    A·γ²/((E−E0)² + γ²)   (γ = HWHM)     height A, FWHM 2γ,          area π·A·γ
+#   Gauss ⊗ 2 exp gauss_2exp below: each erfcx term is an exponentially modified Gaussian of area
+#                 A·τ, so area = A·(τ_lo + τ_hi); peak maximum, height and FWHM are found numerically.
+
+SHAPE_G2E, SHAPE_GAUSS, SHAPE_LOR = "Gauss ⊗ 2 exp", "Gaussian", "Lorentzian"
+PEAK_SHAPES = (SHAPE_G2E, SHAPE_GAUSS, SHAPE_LOR)
+E_NM_DEBYE = 48.0321            # 1 e·nm in debye
+_SQRT2 = np.sqrt(2.0)
+
+
+def gauss_2exp(E, A, E0, sigma, tau_lo, tau_hi):
+    """Gaussian (sigma) ⊗ asymmetric exponential: low-E tail tau_lo, high-E tail tau_hi.
+    erfcx form stays numerically stable when tau << sigma."""
+    u = (E - E0) / sigma
+    g = np.exp(-0.5 * u**2)
+    return 0.5 * A * g * (erfcx((u + sigma/tau_lo) / np.sqrt(2))
+                          + erfcx((-u + sigma/tau_hi) / np.sqrt(2)))
+
+# p0 for this spectrum (eV): [1.5, 1.357, 0.0115, 0.021, 0.010]
+
+
+def _emg_term(u: np.ndarray, k: float) -> np.ndarray:
+    """exp(−u²/2)·erfcx((u + k)/√2) without the 0·inf far out in the tail (k = σ/τ).  For a negative
+    erfcx argument it equals exp(k·u + k²/2)·erfc(z), which cannot overflow there."""
+    z = (u + k) / _SQRT2
+    out = np.empty_like(z)
+    pos = z >= 0
+    out[pos] = np.exp(-0.5 * u[pos] ** 2) * erfcx(z[pos])
+    neg = ~pos
+    out[neg] = np.exp(k * u[neg] + 0.5 * k * k) * erfc(z[neg])
+    return out
+
+
+def _g2e(E, A, E0, sigma, tau_lo, tau_hi):
+    """gauss_2exp, evaluated without overflow far from the peak (same values elsewhere)."""
+    u = (np.atleast_1d(np.asarray(E, float)) - E0) / sigma
+    return 0.5 * A * (_emg_term(u, sigma / tau_lo) + _emg_term(-u, sigma / tau_hi))
+
+
+def _gauss_peak(E, A, E0, sigma):
+    return A * np.exp(-0.5 * ((np.asarray(E, float) - E0) / sigma) ** 2)
+
+
+def _lor_peak(E, A, E0, gamma):
+    return A * gamma * gamma / ((np.asarray(E, float) - E0) ** 2 + gamma * gamma)
+
+
+_PEAK_FUNCS = {SHAPE_G2E: (_g2e, 5), SHAPE_GAUSS: (_gauss_peak, 3), SHAPE_LOR: (_lor_peak, 3)}
+_PEAK_PARAMS = ("A", "E0", "width", "tau_lo", "tau_hi")
+
+
+class PeakFitOpts:
+    """Lineshape, fit window (eV) and start values (eV) of a single-peak fit."""
+    __slots__ = ("shape", "lo", "hi", "width0", "tau_lo0", "tau_hi0", "offset")
+
+    def __init__(self, shape=SHAPE_G2E, lo=1.28, hi=1.52, width0=0.0115, tau_lo0=0.021, tau_hi0=0.010,
+                 offset=False):
+        self.shape = shape if shape in _PEAK_FUNCS else SHAPE_G2E
+        self.lo, self.hi = float(min(lo, hi)), float(max(lo, hi))
+        self.width0, self.tau_lo0, self.tau_hi0 = float(width0), float(tau_lo0), float(tau_hi0)
+        self.offset = bool(offset)
+
+    def key(self):
+        return (self.shape, round(self.lo, 6), round(self.hi, 6), round(self.width0, 7),
+                round(self.tau_lo0, 7), round(self.tau_hi0, 7), self.offset)
+
+    def describe(self) -> str:
+        s = f"{self.shape}, window {self.lo:.3f}–{self.hi:.3f} eV"
+        return s + (", constant offset fitted" if self.offset else "")
+
+
+def _unit_peak(width: float, tau_lo: float, tau_hi: float) -> Tuple[float, float]:
+    """(position of the maximum − E0, maximum) of gauss_2exp with A = 1."""
+    x = np.linspace(-8 * width - 15 * tau_lo, 8 * width + 15 * tau_hi, 6001)
+    y = _g2e(x, 1.0, 0.0, width, tau_lo, tau_hi)
+    k = int(np.argmax(y))
+    return float(x[k]), float(y[k])
+
+
+def _peak_metrics(shape: str, p) -> Tuple[float, float, float, float]:
+    """(E_peak, height, FWHM, area) of the fitted peak (offset excluded)."""
+    A, E0, w = (float(v) for v in p[:3])
+    if shape == SHAPE_GAUSS:
+        return E0, A, 2.0 * np.sqrt(2.0 * np.log(2.0)) * w, A * w * np.sqrt(2.0 * np.pi)
+    if shape == SHAPE_LOR:
+        return E0, A, 2.0 * w, np.pi * A * w
+    tl, th = float(p[3]), float(p[4])
+    x = np.linspace(E0 - 8 * w - 15 * tl, E0 + 8 * w + 15 * th, 20001)
+    y = _g2e(x, A, E0, w, tl, th)
+    k = int(np.argmax(y))
+    ep, h = float(x[k]), float(y[k])
+    dx = float(x[1] - x[0])
+    if 0 < k < x.size - 1:                                   # parabolic refinement of the maximum
+        den = y[k - 1] - 2 * y[k] + y[k + 1]
+        if den < 0:
+            d = 0.5 * (y[k - 1] - y[k + 1]) / den
+            ep, h = ep + d * dx, float(y[k] - 0.25 * (y[k - 1] - y[k + 1]) * d)
+    half = 0.5 * h
+    lo_i = np.flatnonzero(y[:k] < half)
+    hi_i = np.flatnonzero(y[k:] < half)
+    if not (lo_i.size and hi_i.size):
+        fwhm = float("nan")
+    else:
+        i, j = int(lo_i[-1]), k + int(hi_i[0])
+        xl = x[i] + (half - y[i]) / (y[i + 1] - y[i]) * dx
+        xr = x[j - 1] + (half - y[j - 1]) / (y[j] - y[j - 1]) * dx
+        fwhm = float(xr - xl)
+    return ep, h, fwhm, A * (tl + th)
+
+
+def peak_curve(res: dict, e) -> np.ndarray:
+    f, npk = _PEAK_FUNCS[res["shape"]]
+    return f(e, *res["popt"][:npk]) + res["offset"]
+
+
+def fit_peak(e, y, opts: PeakFitOpts, p0=None) -> Optional[dict]:
+    """Fit one peak of ``opts.shape`` to y(e) inside [opts.lo, opts.hi] eV.  ``p0`` = a previous
+    result's popt (same opts) to start from; else start values from the data and opts.
+    Returns a dict (same keys for every shape; τ = NaN unless Gauss ⊗ 2 exp) or None."""
+    if _curve_fit is None or (opts.shape == SHAPE_G2E and erfcx is None):
+        return None
+    e = np.asarray(e, float)
+    y = np.asarray(y, float)
+    m = np.isfinite(e) & np.isfinite(y) & (e >= opts.lo) & (e <= opts.hi)
+    f, npk = _PEAK_FUNCS[opts.shape]
+    g2e = opts.shape == SHAPE_G2E
+    n_par = npk + int(opts.offset)
+    if m.sum() < n_par + 4:
+        return None
+    x, yw = e[m], y[m]
+    span = max(opts.hi - opts.lo, 1e-3)
+    off0 = float(np.percentile(yw, 5)) if opts.offset else 0.0
+    ys = np.convolve(yw, np.ones(3) / 3.0, mode="same") if yw.size >= 5 else yw
+    amp = float(np.max(ys)) - off0
+    if p0 is None or len(p0) != n_par:
+        if not amp > 0:
+            return None
+        k = int(np.argmax(ys))
+        w0 = min(max(opts.width0, 2e-4), span)
+        if g2e:
+            tl0, th0 = min(max(opts.tau_lo0, 2e-4), span), min(max(opts.tau_hi0, 2e-4), span)
+            d, pk = _unit_peak(w0, tl0, th0)
+            p0 = [amp / max(pk, 1e-300), float(x[k]) - d, w0, tl0, th0]
+        else:
+            p0 = [amp, float(x[k]), w0]
+        if opts.offset:
+            p0.append(off0)
+    lower = [0.0, opts.lo, 1e-4] + ([1e-4, 1e-4] if g2e else [])
+    upper = [np.inf, opts.hi, span] + ([span, span] if g2e else [])
+    if opts.offset:
+        lower.append(-np.inf)
+        upper.append(np.inf)
+        model = lambda xx, *p: f(xx, *p[:-1]) + p[-1]           # noqa: E731
+    else:
+        model = f
+    p0 = _clip_into(p0, lower, upper)
+    try:
+        with warnings.catch_warnings(), np.errstate(all="ignore"):
+            warnings.simplefilter("ignore")
+            popt, pcov = _curve_fit(model, x, yw, p0=p0, bounds=(lower, upper), method="trf",
+                                    x_scale="jac", maxfev=4000)
+            yfit = model(x, *popt)
+    except Exception:
+        return None
+    if not np.all(np.isfinite(yfit)):
+        return None
+    ss_res = float(np.sum((yw - yfit) ** 2))
+    ss_tot = float(np.sum((yw - yw.mean()) ** 2))
+    with np.errstate(invalid="ignore"):
+        perr = np.sqrt(np.diag(pcov)) if pcov is not None else np.full(n_par, np.nan)
+    perr = np.where(np.isfinite(perr), perr, np.nan)
+    ep, h, fwhm, area = _peak_metrics(opts.shape, popt[:npk])
+    names = ["A", "E0", "σ" if opts.shape != SHAPE_LOR else "γ", "τ_lo", "τ_hi"][:npk]
+    at_bound = [nm for nm, v, lo, hi in zip(names, popt, lower, upper)
+                if nm != "A" and np.isfinite(lo) and np.isfinite(hi) and min(v - lo, hi - v) <= 1e-3 * (hi - lo)]
+    res = dict(shape=opts.shape, popt=[float(v) for v in popt], win=(opts.lo, opts.hi), n=int(m.sum()),
+               offset_fit=opts.offset, offset=float(popt[-1]) if opts.offset else 0.0,
+               offset_err=float(perr[-1]) if opts.offset else float("nan"),
+               E_peak=ep, height=h, fwhm=fwhm, area=area, r2=1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"),
+               at_bound=at_bound)
+    for i, nm in enumerate(_PEAK_PARAMS):
+        res[nm] = float(popt[i]) if i < npk else float("nan")
+        res[nm + "_err"] = float(perr[i]) if i < npk else float("nan")
+    return res
+
+
+def fit_spectra_line(e, Z, opts: PeakFitOpts, progress=None, cancelled=None) -> List[Optional[dict]]:
+    """Fit every column of Z (n_e, n_x): the brightest column first from the start values, then
+    outwards in both directions, each fit starting from its neighbour's result (and again from the
+    start values when that fails or fits poorly — the better one is kept)."""
+    e = np.asarray(e, float)
+    Z = np.asarray(Z, float)
+    nx = Z.shape[1]
+    out: List[Optional[dict]] = [None] * nx
+    m = (e >= opts.lo) & (e <= opts.hi)
+    W = Z[m]
+    valid = np.isfinite(W).sum(axis=0) >= 8
+    if not valid.any():
+        return out
+    score = np.where(valid, np.nansum(np.clip(W, 0, None), axis=0), -np.inf)
+    k0 = int(np.argmax(score))
+    out[k0] = fit_peak(e, Z[:, k0], opts)
+    done = 1
+    for step in (1, -1):
+        prev = out[k0]
+        k = k0 + step
+        while 0 <= k < nx:
+            if cancelled is not None and cancelled():
+                raise RuntimeError("cancelled")
+            if valid[k]:
+                r = fit_peak(e, Z[:, k], opts, p0=prev["popt"] if prev is not None else None)
+                if r is None or not r["r2"] >= 0.8:
+                    r2 = fit_peak(e, Z[:, k], opts) if prev is not None else None
+                    if r2 is not None and (r is None or r2["r2"] > r["r2"]):
+                        r = r2
+                out[k] = r
+                if r is not None and r["r2"] >= 0.5:
+                    prev = r
+            done += 1
+            if progress is not None:
+                progress(done, nx)
+            k += step
+    return out
+
+
+def peak_text(res: Optional[dict], sep: str = "\n") -> str:
+    """Readout of a peak fit: center, height, width first."""
+    if res is None:
+        return "fit failed"
+    wn = "γ" if res["shape"] == SHAPE_LOR else "σ"
+    l1 = (f"Center (peak max) {res['E_peak']:.4f} eV   ·   Height {_fmt(res['height'], '.4g')}   ·   "
+          f"FWHM {res['fwhm'] * 1e3:.2f} meV")
+    l2 = (f"E0 {res['E0']:.4f} ± {_fmt(res['E0_err'] * 1e3, '.2g')} meV   ·   {wn} {res['width'] * 1e3:.2f} meV   ·   "
+          f"area {_fmt(res['area'], '.4g')}")
+    if res["shape"] == SHAPE_G2E:
+        l2 += f"   ·   τ_lo {res['tau_lo'] * 1e3:.2f}   τ_hi {res['tau_hi'] * 1e3:.2f} meV"
+    l3 = f"{res['shape']}   ·   R² {_fmt(res['r2'], '.4f')}"
+    if res.get("offset_fit"):
+        l3 +=f"   ·   offset {_fmt(res['offset'], '.4g')}"
+    if res["at_bound"]:
+        l3 += "   ·   at bound: " + ", ".join(res["at_bound"])
+    return sep.join((l1, l2, l3))
+
+
+def _peak_html(res: Optional[dict]) -> str:
+    lines = peak_text(res).split("\n")
+    return f"<b>{lines[0]}</b>" + "".join(f"<br>{ln}" for ln in lines[1:])
+
+
+def _linfit(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float]:
+    """Least-squares straight line: (slope, intercept, 1σ error of the slope from the scatter)."""
+    xm, ym = float(x.mean()), float(y.mean())
+    sxx = float(np.sum((x - xm) ** 2))
+    if not sxx > 0:
+        return float("nan"), float("nan"), float("nan")
+    b = float(np.sum((x - xm) * (y - ym))) / sxx
+    a = ym - b * xm
+    dof = x.size - 2
+    err = float(np.sqrt(np.sum((y - a - b * x) ** 2) / dof / sxx)) if dof > 0 else float("nan")
+    return b, a, err
+
+
+def local_slope(x, y, n: int, order: int = 1) -> Tuple[np.ndarray, np.ndarray]:
+    """dy/dx at every point from a polynomial (order 1 = straight line, 3 = cubic; Savitzky–Golay)
+    fitted to the n nearest valid points (one-sided windows at the ends) and
+    differentiated at the point itself; 1σ error from the scatter about the fit.  NaN points are
+    skipped and get no slope."""
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    s, se = np.full(x.size, np.nan), np.full(x.size, np.nan)
+    idx = np.flatnonzero(np.isfinite(x) & np.isfinite(y))
+    order = int(order)
+    n = max(int(n), order + 1)
+    if idx.size < order + 1:
+        return s, se
+    n = min(n, idx.size)
+    h = n // 2
+    for pos, k in enumerate(idx):
+        a = max(0, min(pos - h, idx.size - n))
+        sel = idx[a:a + n]
+        dx = x[sel] - x[k]
+        X = np.vander(dx, order + 1, increasing=True)          # 1, dx, dx²
+        try:
+            coef, _res, rank, _sv = np.linalg.lstsq(X, y[sel], rcond=None)
+        except np.linalg.LinAlgError:
+            continue
+        if rank < order + 1:
+            continue
+        s[k] = coef[1]
+        dof = sel.size - (order + 1)
+        if dof > 0:
+            s2 = float(np.sum((y[sel] - X @ coef) ** 2)) / dof
+            cov = s2 * np.linalg.pinv(X.T @ X)
+            se[k] = float(np.sqrt(max(cov[1, 1], 0.0)))
+    return s, se
+
+
+SPLINE_GCV_GAMMA = 1.4      # modified GCV (Kim & Gu): guards against GCV's occasional under-smoothing
+
+
+def spline_slope(x, y, yerr=None, factor: float = 1.0):
+    """dy/dx from a weighted cubic smoothing spline through the valid points (natural spline,
+    penalty λ·∫f''²; Green & Silverman's Reinsch form).  λ is chosen by generalized cross-validation
+    and multiplied by ``factor`` (< 1 = more local, > 1 = smoother).  The spline is linear in y, so the
+    slope's ±1σ comes from exact error propagation: the y errors (``yerr``, scaled up when the scatter
+    about the spline is larger than they say), or the scatter alone when there are none.
+    Returns (slope, slope error, smoothed y, info dict with lam, dof = effective number of parameters)."""
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    out_s, out_se, out_f = np.full(x.size, np.nan), np.full(x.size, np.nan), np.full(x.size, np.nan)
+    info = {"lam": float("nan"), "dof": float("nan")}
+    idx = np.flatnonzero(np.isfinite(x) & np.isfinite(y))
+    n = idx.size
+    if n < 5:
+        return out_s, out_se, out_f, info
+    xs, ys = x[idx], y[idx]
+    if np.any(np.diff(xs) <= 0):
+        return out_s, out_se, out_f, info
+    err = None
+    if yerr is not None:
+        e = np.asarray(yerr, float)[idx]
+        good = np.isfinite(e) & (e > 0)
+        if good.sum() >= 3:
+            med = float(np.median(e[good]))
+            err = np.maximum(np.where(good, e, med), 0.2 * med)        # no point dominates on a tiny error
+    w = 1.0 / err ** 2 if err is not None else np.ones(n)
+    w = w / w.mean()
+    L = float(xs[-1] - xs[0])
+    t = (xs - xs[0]) / L                                               # [0, 1]: λ grid independent of units
+    h = np.diff(t)
+    Q = np.zeros((n, n - 2))
+    R = np.zeros((n - 2, n - 2))
+    for j in range(1, n - 1):
+        c = j - 1
+        Q[j - 1, c], Q[j, c], Q[j + 1, c] = 1.0 / h[j - 1], -1.0 / h[j - 1] - 1.0 / h[j], 1.0 / h[j]
+        R[c, c] = (h[j - 1] + h[j]) / 3.0
+        if j < n - 2:
+            R[c, c + 1] = R[c + 1, c] = h[j] / 6.0
+    RiQt = np.linalg.solve(R, Q.T)                                     # (n−2, n)
+    K = Q @ RiQt
+    W = np.diag(w)
+
+    def smoother(lam):
+        return np.linalg.solve(W + lam * K, W)                         # f = S·y
+
+    best, best_g = None, np.inf
+    for lam in np.logspace(-12, 3, 76):
+        S = smoother(lam)
+        r = ys - S @ ys
+        den = (1.0 - SPLINE_GCV_GAMMA * np.trace(S) / n) ** 2
+        if 1.0 - SPLINE_GCV_GAMMA * np.trace(S) / n <= 0:
+            continue
+        g = float(np.sum(w * r * r)) / n / den if den > 1e-12 else np.inf
+        if g < best_g:
+            best, best_g = lam, g
+    if best is None:
+        return out_s, out_se, out_f, info
+    lam = best * max(float(factor), 1e-6)
+    A = np.linalg.inv(W + lam * K)
+    S = A @ W
+    G = np.zeros((n, n))
+    G[1:-1] = RiQt                                                     # f'' at the knots from f (natural ends: 0)
+    M = np.zeros((n, n))                                               # f' at the knots from f
+    eye = np.eye(n)
+    for i in range(n - 1):
+        M[i] = (eye[i + 1] - eye[i]) / h[i] - h[i] * (2.0 * G[i] + G[i + 1]) / 6.0
+    M[n - 1] = (eye[n - 1] - eye[n - 2]) / h[n - 2] + h[n - 2] * (G[n - 2] + 2.0 * G[n - 1]) / 6.0
+    M /= L
+    f = S @ ys
+    r = ys - f
+    tr = float(np.trace(S))
+    dof_res = max(n - tr, 1.0)
+    # unit variance of the normalized weights: var_i = s2 / w_i
+    if err is not None:
+        chi2 = float(np.sum((r / err) ** 2)) / dof_res
+        s2 = max(chi2, 1.0) / float(np.mean(1.0 / err ** 2))
+    else:
+        s2 = float(np.sum(r * r)) / dof_res
+    out_s[idx] = M @ f
+    # Bayesian (Wahba) posterior covariance of f, s2·(W + λK)⁻¹: unlike the sampling covariance it also
+    # covers the smoothing bias on average, so the ±1σ band is closer to honest
+    out_se[idx] = np.sqrt(np.maximum(s2 * np.einsum("ij,jk,ik->i", M, A, M), 0.0))
+    out_f[idx] = f
+    info.update(lam=lam, lam_gcv=best, dof=tr)
+    return out_s, out_se, out_f, info
+
+
+def _uniform_rows(e: np.ndarray, Z: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Rows of Z (n_e, n_x) on an evenly spaced copy of the ascending axis e (for an ImageItem)."""
+    e = np.asarray(e, float)
+    if e.size < 2:
+        return e, Z
+    eu = np.linspace(e[0], e[-1], e.size)
+    out = np.full((eu.size, Z.shape[1]), np.nan)
+    for j in range(Z.shape[1]):
+        c = Z[:, j]
+        ok = np.isfinite(c)
+        if ok.sum() >= 2:
+            out[:, j] = np.interp(eu, e[ok], c[ok], left=np.nan, right=np.nan)
+    return eu, out
+
+
+# ══════════════════════════════════════════════════════════════════════
 # Gate calibration and the scan's linecut through the gate–gate plane
 # ══════════════════════════════════════════════════════════════════════
 #   u_n = V_f + r·V_b − u_n0 (density),  u_D = V_f − r·V_b − u_D0 (displacement), r = c_b/c_t.
@@ -1439,6 +1923,144 @@ def geometry_for(n_pixels: int) -> SpadGeometry:
         raise ValueError(f"{n_pixels} pixel columns: expected 23 (SPAD23) or 93 (SPAD93)")
     return g
 
+
+# ── spectral mode: the SPAD's centre line on a wavelength axis (as the SPAD93 / SPAD23 v2 GUIs) ──
+#   SPAD93: a spectral line = one of the 17 columns (same x), sampled at y = 92 µm (spad93_geometry.row_weights)
+#   SPAD23: a spectral line = one of the 5 rows (same y), sampled at x = 46 µm (spad23_geometry.column_weights)
+#   A pixel exactly at that height is used alone, otherwise the two straddling pixels are interpolated
+#   linearly (0.5 / 0.5 on the half-shifted lines); one of them excluded → the other alone; none → NaN.
+#   λ-calibration (WLCAL_*.json): λ = intercept_nm + slope_nm_per_um · (line position in µm: column x / row y).
+SPECTRAL_CENTER_UM = {"SPAD93": 92.0, "SPAD23": 46.0}
+SPECTRAL_CROSS_PITCH_UM = 23.0
+_LINE_W_CACHE: Dict[tuple, Tuple[np.ndarray, np.ndarray]] = {}
+
+
+def spectral_axes(geom: SpadGeometry) -> Tuple[np.ndarray, np.ndarray]:
+    """(along-line position, cross-line position) of every pixel: SPAD93 lines are columns, SPAD23 rows."""
+    return (geom.x_um, geom.y_um) if geom.name == "SPAD93" else (geom.y_um, geom.x_um)
+
+
+def line_name(geom: SpadGeometry) -> str:
+    return "col" if geom.name == "SPAD93" else "row"
+
+
+def center_line_weights(geom: SpadGeometry, excluded=()) -> Tuple[np.ndarray, np.ndarray]:
+    """(W [n_lines, n_pixels], line positions µm): ``counts @ W.T`` = the centre-line spectrum per time bin."""
+    ex = frozenset(int(p) for p in excluded)
+    key = (geom.name, ex)
+    hit = _LINE_W_CACHE.get(key)
+    if hit is not None:
+        return hit
+    pos_px, cross = spectral_axes(geom)
+    c0 = SPECTRAL_CENTER_UM[geom.name]
+    pos = np.unique(np.round(pos_px, 6))
+    w = np.zeros((pos.size, geom.num_pixels))
+    tol = 1e-6
+    for k, p in enumerate(pos):
+        ids = np.flatnonzero(np.abs(pos_px - p) < tol)
+        cs = cross[ids]
+        exact = ids[np.abs(cs - c0) < tol]
+        if exact.size:
+            q = int(exact[0])
+            if q in ex:
+                w[k] = np.nan
+            else:
+                w[k, q] = 1.0
+            continue
+        below, above = ids[cs < c0], ids[cs > c0]
+        if not below.size or not above.size:
+            w[k] = np.nan
+            continue
+        lo = int(below[np.argmax(cross[below])])
+        hi = int(above[np.argmin(cross[above])])
+        c_lo, c_hi = cross[lo], cross[hi]
+        if c_hi - c_lo > SPECTRAL_CROSS_PITCH_UM + tol:
+            w[k] = np.nan
+            continue
+        frac = (c0 - c_lo) / (c_hi - c_lo)
+        lo_ok, hi_ok = lo not in ex, hi not in ex
+        if lo_ok and hi_ok:
+            w[k, lo], w[k, hi] = 1.0 - frac, frac
+        elif lo_ok:
+            w[k, lo] = 1.0
+        elif hi_ok:
+            w[k, hi] = 1.0
+        else:
+            w[k] = np.nan
+    if len(_LINE_W_CACHE) > 256:
+        _LINE_W_CACHE.clear()
+    _LINE_W_CACHE[key] = (w, pos)
+    return w, pos
+
+
+def line_of_pixel(geom: SpadGeometry, p: int) -> int:
+    """Spectral line (column / row index) a pixel belongs to."""
+    pos_px, _ = spectral_axes(geom)
+    _w, pos = center_line_weights(geom)
+    return int(np.argmin(np.abs(pos - pos_px[int(p)])))
+
+
+def spectral_matrix(counts: np.ndarray, bgv: Optional[np.ndarray], geom: SpadGeometry, excluded=()) -> np.ndarray:
+    """Centre-line spectrum of every time bin: [bins, pixels] → [bins, lines] (background subtracted first)."""
+    w, _pos = center_line_weights(geom, excluded)
+    c = np.asarray(counts, dtype=np.float64)
+    if bgv is not None:
+        c = c - np.asarray(bgv, dtype=np.float64)[None, :]
+    return c @ w.T
+
+
+class WavelengthCal:
+    """Linear λ-calibration of the spectral lines (WLCAL_*.json of the SPAD GUIs)."""
+
+    def __init__(self, slope_nm_per_um: float, intercept_nm: float, device: str = "", source: str = "",
+                 created: str = ""):
+        self.slope, self.intercept = float(slope_nm_per_um), float(intercept_nm)
+        self.device, self.source, self.created = str(device or ""), str(source), str(created or "")
+
+    def wavelength(self, pos_um) -> np.ndarray:
+        return self.intercept + self.slope * np.asarray(pos_um, dtype=np.float64)
+
+    def problem(self, geom: SpadGeometry) -> str:
+        """Why this calibration does not fit the detector ('' = fine)."""
+        if self.device and self.device.upper() != geom.name.upper():
+            return f"calibration is for {self.device}, the data are {geom.name}"
+        return ""
+
+    def describe(self, geom: Optional[SpadGeometry] = None) -> str:
+        text = f"{self.source}: λ = {self.intercept:.2f} nm + {self.slope:.4g} nm/µm · x"
+        if geom is not None:
+            lam = self.wavelength(center_line_weights(geom)[1])
+            text += f"  ({lam.min():.1f}–{lam.max():.1f} nm, {abs(self.slope) * 19.92:.2f} nm per line)"
+        return text + (f", created {self.created}" if self.created else "")
+
+
+def wlcal_from_dict(d: dict, source: str) -> WavelengthCal:
+    try:
+        slope, icpt = float(d["slope_nm_per_um"]), float(d["intercept_nm"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("no slope_nm_per_um / intercept_nm") from None
+    if not (np.isfinite(slope) and np.isfinite(icpt)) or slope == 0:
+        raise ValueError("invalid slope / intercept")
+    return WavelengthCal(slope, icpt, d.get("device", ""), source, d.get("created", ""))
+
+
+def load_wlcal_json(path) -> WavelengthCal:
+    with open(path, "r", encoding="utf-8") as fh:
+        return wlcal_from_dict(json.load(fh), Path(path).name)
+
+
+def wlcal_from_header(meta: dict) -> Optional[WavelengthCal]:
+    """The calibration the measuring GUI wrote into the .asc header (a Python dict), or None."""
+    import ast
+    raw = (meta or {}).get("spad_wavelength_calibration")
+    if not raw:
+        return None
+    try:
+        d = ast.literal_eval(str(raw))
+        return wlcal_from_dict(d, "scan header") if isinstance(d, dict) else None
+    except (ValueError, SyntaxError):
+        return None
+
 MIN_FIT_PIXELS_2D = 6
 MIN_SNR           = 3.0          # amplitude / its standard error below this = "low signal" (flagged)
 UM2_NS_TO_CM2_S   = 10.0         # 1 µm²/ns = 10 cm²/s
@@ -1558,6 +2180,9 @@ def _read_session(folder: Path) -> dict:
                 out["hist_ns"] = (vals[0], vals[1])
             if len(vals) >= 3:
                 out["ref_ns"] = vals[2]
+            out["hist_after_t0"] = "t0 = 0" in low      # newer GUIs: times after time zero (else raw)
+        elif low == "reference":
+            out["ref_auto"] = not val.lower().startswith("manual")
         elif low.startswith("time-zero alignment"):
             out["align"] = val.lower().startswith("on")
         elif low.startswith("di/dp"):
@@ -1971,6 +2596,68 @@ def common_time_zero(t0s, period_ns: float) -> float:
     return float(v[0] + np.median(d))
 
 
+# With the alignment on, the views show t = raw time - offset: t = 0 ns at each point's signal peak
+# (brightest pixel, found after the first-peak alignment), on the bin grid.
+T0_REF_BINS = 5      # default reference frame: this many (shown) bins after time zero
+
+
+def t0_display_offset(time_ns: np.ndarray, target_ns: Optional[float]) -> Optional[float]:
+    """Raw time (ns) of the bin holding time zero ``target_ns`` (from bin 0); None without one."""
+    t = np.asarray(time_ns, dtype=np.float64)
+    if t.size < 2 or target_ns is None or not np.isfinite(target_ns):
+        return None
+    dt = float(np.median(np.diff(t)))
+    if not dt > 0:
+        return None
+    return float(t[int(np.round(float(target_ns) / dt)) % t.size])
+
+
+T0_PEAK_SMOOTH_NS = 0.5  # boxcar over which the brightest pixel's maximum is taken (the time zero shown)
+
+
+def peak_display_offset(counts: np.ndarray, time_ns: np.ndarray, excluded=()) -> Optional[float]:
+    """Raw time (ns) of the signal peak: the maximum of the brightest pixel (each pixel minus its median,
+    smoothed over T0_PEAK_SMOOTH_NS).  With the time-zero alignment on, the views put t = 0 here (the
+    pixels themselves stay aligned on their first-peak edge).  None without signal."""
+    c = np.asarray(counts, dtype=np.float64)
+    t = np.asarray(time_ns, dtype=np.float64)
+    if c.ndim != 2 or c.shape[0] < 4 or t.size != c.shape[0]:
+        return None
+    dt = float(np.median(np.diff(t)))
+    if not dt > 0:
+        return None
+    k = max(1, int(round(T0_PEAK_SMOOTH_NS / dt))) | 1
+    y = c - np.median(c, axis=0)
+    if k > 1:
+        cs = np.cumsum(np.vstack([np.zeros((1, y.shape[1])), y]), axis=0)
+        y = (cs[k:] - cs[:-k]) / k  # row i = mean of rows i .. i+k-1 (centre i + k // 2)
+    ex = [int(p) for p in excluded if 0 <= int(p) < y.shape[1]]
+    if ex:
+        y[:, ex] = -np.inf
+    p = int(np.argmax(y.max(axis=0)))
+    i = int(np.argmax(y[:, p]))
+    if not y[i, p] > 0:
+        return None
+    return float(t[i + k // 2])
+
+
+def view_offset(time_ns: np.ndarray, zero_ns: Optional[float]) -> Optional[float]:
+    """Raw time of the bin holding ``zero_ns`` (a raw time, circular): subtracted, it puts t = 0 there."""
+    t = np.asarray(time_ns, dtype=np.float64)
+    if t.size < 2 or zero_ns is None or not np.isfinite(zero_ns):
+        return None
+    period = t.size * float(np.median(np.diff(t)))
+    return t0_display_offset(t, (float(zero_ns) - float(t[0])) % period)
+
+
+def t0_ref_index(view_time_ns: np.ndarray, n_bins: int = T0_REF_BINS) -> int:
+    """Index of the default reference frame: ``n_bins`` bins after the first bin at or after t = 0."""
+    t = np.asarray(view_time_ns, dtype=np.float64)
+    if t.size == 0:
+        return 0
+    return int(min(int(np.searchsorted(t, -1e-9, side="left")) + int(n_bins), t.size - 1))
+
+
 class TrplStore:
     """Thread-safe cache of TRPL files (least recently used out first) and their time-zero alignments."""
 
@@ -1979,11 +2666,15 @@ class TrplStore:
         self._max   = max_files
         self._files: "OrderedDict[str, TrplData]" = OrderedDict()
         self._align: Dict[str, Tuple[Optional[TimeZero], float, float, str]] = {}  # tz, t_first, period, error
+        self._delay: Dict[str, Optional[float]] = {}      # signal-peak delay after the time zero, per file
+        self._sweep_delay: Dict[float, Optional[float]] = {}  # common_t0 -> median delay
 
     def clear(self) -> None:
         with self._lock:
             self._files.clear()
             self._align.clear()
+            self._delay.clear()
+            self._sweep_delay.clear()
 
     def load(self, path) -> TrplData:
         key = str(path)
@@ -2016,9 +2707,28 @@ class TrplStore:
             info = (align_first_peaks(data.counts, t), float(t[0]), period, "")
         except ValueError as exc:
             info = (None, float(t[0]), period, str(exc))
+        delay = None    # signal peak (brightest pixel) after the file's own time zero (first-peak edge)
+        if info[0] is not None and np.isfinite(info[0].target_ns):
+            pk = peak_display_offset(roll_bins(data.counts, info[0].shift_bins), t)
+            if pk is not None:
+                delay = float((pk - (float(t[0]) + info[0].target_ns) + period / 2.0) % period - period / 2.0)
         with self._lock:
             self._align[key] = info
+            self._delay[key] = delay
         return info
+
+    def zero_of(self, data: TrplData, tz: Optional["TimeZero"], t0_ref: Optional[float]) -> Optional[float]:
+        """Raw time shown as t = 0 (alignment on): this point's own signal peak (brightest pixel), so every
+        point has its peak at 0 even where the first-peak alignment locked onto another feature; a point
+        without a clear peak uses the sweep's median delay after its time zero.  None if neither is known."""
+        if tz is None or not np.isfinite(tz.target_ns):
+            return None
+        self.alignment(data.path, data)
+        with self._lock:
+            d = self._delay.get(str(data.path))
+            if d is None and t0_ref is not None and np.isfinite(t0_ref):
+                d = self._sweep_delay.get(round(float(t0_ref), 9))
+        return None if d is None else float(data.time_ns[0]) + tz.target_ns + d
 
     def common_t0(self, paths) -> Optional[float]:
         infos = [self.alignment(p) for p in paths]
@@ -2027,7 +2737,13 @@ class TrplStore:
             return None
         period = float(np.median([per for tz, _, per, _ in infos if tz is not None]))
         t0 = common_time_zero(t0s, period)
-        return t0 if np.isfinite(t0) else None
+        if not np.isfinite(t0):
+            return None
+        with self._lock:
+            ds = [self._delay.get(str(p)) for p in paths]
+            ds = [d for d in ds if d is not None]
+            self._sweep_delay[round(float(t0), 9)] = float(np.median(ds)) if ds else None
+        return t0
 
 
 class ViewSettings:
@@ -2043,9 +2759,13 @@ class ViewSettings:
 
 
 def point_view(store: TrplStore, data: TrplData, vs: ViewSettings):
-    """(time_ns, counts [bins, pixels], TimeZero or None, note) of one point."""
+    """(time_ns, counts [bins, pixels], TimeZero or None, note) of one point.
+
+    With the alignment on, t = 0 ns is the signal peak (TrplStore.zero_of; the pixels stay aligned on
+    their first-peak edge)."""
     tz, note = None, ""
     counts = data.counts
+    t_raw = data.time_ns
     if vs.align:
         tz0, _, _, err = store.alignment(data.path, data)
         if tz0 is None:
@@ -2053,7 +2773,13 @@ def point_view(store: TrplStore, data: TrplData, vs: ViewSettings):
         else:
             tz = move_to_t0(tz0, data.time_ns, vs.t0_ref)
             counts = roll_bins(counts, tz.shift_bins)
-    c, t = rebin_time(counts, data.time_ns, vs.rebin)
+        off = view_offset(data.time_ns, store.zero_of(data, tz, vs.t0_ref))
+        if off is not None:
+            t_raw = data.time_ns - off
+            if vs.rebin > 1:            # rebinned groups start at t = 0 (drop < rebin early bins)
+                s0 = int(np.argmin(np.abs(t_raw))) % vs.rebin
+                counts, t_raw = counts[s0:], t_raw[s0:]
+    c, t = rebin_time(counts, t_raw, vs.rebin)
     if vs.smooth is not None:
         c = smooth_traces(t, c, vs.smooth)
     return t, c, tz, note
@@ -2909,6 +3635,144 @@ def fit_point_x(t: np.ndarray, counts: np.ndarray, s, cancelled=None) -> PointDi
                           np.array(spans, dtype=int))
 
 
+# ── spectral view: 1D Gaussian width along one spectral line (as spad93 fit_all_column, method 1) ──
+#   SPAD93: the pixels of one column (same x = same λ) against y; SPAD23: one row against x.  Sites are
+#   23 µm apart.  σ² of a 1D cut of an isotropic spot grows as σ₀² + 2D·t, like σ_eq² of the 2D fits.
+LINE_FIT_MIN_PX = 3
+LINE_FIT_FREE_OFFSET_MIN_PX = 7          # fewer pixels: offset held at 0 (spad93 fit_column_profile rule)
+
+
+def line_pixels(geom: SpadGeometry, line: int, excluded=()) -> Tuple[np.ndarray, np.ndarray]:
+    """(pixel ids sorted by their cross position, cross positions µm) of spectral line ``line``."""
+    pos_px, cross = spectral_axes(geom)
+    _w, pos = center_line_weights(geom)
+    ex = {int(p) for p in excluded}
+    ids = np.array([p for p in np.flatnonzero(np.abs(pos_px - pos[int(line)]) < 1e-6) if int(p) not in ex], int)
+    ids = ids[np.argsort(cross[ids])] if ids.size else ids
+    return ids, cross[ids]
+
+
+def gauss1d(x, A, x0, s, off):
+    return A * np.exp(-((x - x0) ** 2) / (2.0 * s ** 2)) + off
+
+
+def _fit_gauss1d(x, z, p0, lower, upper, fix_offset: Optional[float]) -> Optional[FitResult]:
+    """Bounded 1D Gaussian (z scaled by max|z| for the fit); popt = A, x0, σ, offset; sigma_eq = |σ|."""
+    if _curve_fit is None or z.size < LINE_FIT_MIN_PX or np.allclose(z, z[0]):
+        return None
+    zs = max(float(np.max(np.abs(z))), 1e-300)
+    lo, hi = list(lower), list(upper)
+    p = [float(p0[0]) / zs, float(p0[1]), float(p0[2]), float(p0[3]) / zs]
+    lo[0], hi[0], lo[3], hi[3] = lo[0] / zs, hi[0] / zs, lo[3] / zs, hi[3] / zs
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if fix_offset is None:
+                popt, pcov = _curve_fit(gauss1d, x, z / zs, p0=_clip_into(p, lo, hi), bounds=(lo, hi), maxfev=20000)
+                full = np.asarray(popt, float)
+                n_free = 4
+            else:
+                off = float(fix_offset) / zs
+                popt, pcov = _curve_fit(lambda xx, A, c, s: gauss1d(xx, A, c, s, off), x, z / zs,
+                                        p0=_clip_into(p[:3], lo[:3], hi[:3]), bounds=(lo[:3], hi[:3]), maxfev=20000)
+                full = np.append(np.asarray(popt, float), off)
+                n_free = 3
+    except Exception:
+        return None
+    at_bound = _hit_bound(full[:n_free], lo[:n_free], hi[:n_free])
+    full[[0, 3]] *= zs
+    dof = int(z.size) - n_free
+    var = float(pcov[0, 0]) * zs ** 2 if np.size(pcov) else float("nan")
+    snr = (float("nan") if dof <= 0 else                     # no degrees of freedom → flagged
+           0.0 if not np.isfinite(var) or var <= 0 else float(full[0] / np.sqrt(var)))
+    full[2] = abs(full[2])
+    return FitResult(full, float(full[2]), snr, at_bound)
+
+
+def fit_gaussian_1d_free(x, z, pitch: float, fix_offset: Optional[float]) -> Optional[FitResult]:
+    """Free fit from moment start values (the reference frame); σ within 0.25–8 pitches (as spad93)."""
+    bg = float(np.percentile(z, 10)) if fix_offset is None else float(fix_offset)
+    w = np.clip(z - bg, 0.0, None)
+    tot = float(w.sum())
+    c0 = float((w * x).sum() / tot) if tot > 0 else float(x[int(np.argmax(z))])
+    s0 = float(np.sqrt((w * (x - c0) ** 2).sum() / tot)) if tot > 0 else float(np.ptp(x)) / 4.0
+    lower = [0.0, float(x.min()) - pitch, 0.25 * pitch, -np.inf]
+    upper = [np.inf, float(x.max()) + pitch, 8.0 * pitch, np.inf]
+    guess = [max(float(np.max(z)) - bg, 1e-9), c0, max(s0, 0.5 * pitch), bg]
+    return _fit_gauss1d(x, z, guess, lower, upper, fix_offset)
+
+
+def fit_gaussian_1d_next(x, z, prev: np.ndarray, tightness: float, pitch: float,
+                         fix_offset: Optional[float]) -> Optional[FitResult]:
+    """Next frame from the previous fit, small bounds around it (spad93 fit_gaussian_1d_constrained_next)."""
+    A, c, s, off = (float(v) for v in prev)
+    s = max(s, 1e-3)
+    dA, dc = max(abs(A) * 0.18 * tightness, 1e-3), max(pitch * 0.18 * tightness, 0.8)
+    ds, doff = max(s * 0.18 * tightness, 0.5), max(abs(off) * 0.25 * tightness, 0.5)
+    lower = [max(0.0, A - dA), c - dc, max(1e-3, s - ds), off - doff]
+    upper = [A + dA, c + dc, s + ds, off + doff]
+    return _fit_gauss1d(x, z, [A, c, s, off], lower, upper, fix_offset)
+
+
+def fit_line_x(t: np.ndarray, counts: np.ndarray, s, line: int, free_offset: bool = False,
+               cancelled=None) -> PointDiffusion:
+    """fit_point_x for one spectral line: sequential 1D Gaussian of the line's pixels against their cross
+    position (reference frame free, later frames stepped from the previous one; late grouping as
+    FitSettingsX.late).  The offset is 0 (after the background subtraction) unless ``free_offset`` and the
+    line has ≥ 7 enabled pixels (as spad93's column fits; FitSettings.fix_offset is the 2D fits' and is
+    not used).  PointDiffusion.popt = (frames, 4): A, centre (µm), σ (µm), offset; sigma2 = σ²."""
+    geom = geometry_for(counts.shape[1])
+    r0, r1 = range_bins(t, s.t_range)
+    ref = int(np.clip(np.argmin(np.abs(t - s.ref_ns)), r0, r1))
+    if max(r0, ref) > r1:
+        raise ValueError("the time range has no frames after the reference")
+    ids, x = line_pixels(geom, line, s.excluded)
+    if ids.size < LINE_FIT_MIN_PX:
+        raise ValueError(f"{line_name(geom)} {line} has {ids.size} enabled pixels (need ≥ {LINE_FIT_MIN_PX})")
+    if s.dark_ref is not None and np.size(s.dark_ref) != counts.shape[1]:
+        raise ValueError(f"the dark reference has {np.size(s.dark_ref)} pixels, the data {counts.shape[1]}")
+    bg, bg_note = _bg_vector(t, counts, s)
+    notes = ["pre-t0 window empty: no offset subtracted"] if bg_note.startswith("pre-t0 window empty") else []
+    frames = np.asarray(counts[: r1 + 1][:, ids], dtype=np.float64) - bg[ids]
+    free_off = bool(free_offset) and ids.size >= LINE_FIT_FREE_OFFSET_MIN_PX
+    if free_offset and not free_off:
+        notes.append(f"offset held at 0 ({ids.size} pixels < {LINE_FIT_FREE_OFFSET_MIN_PX})")
+    fix = None if free_off else 0.0
+    pitch = SPECTRAL_CROSS_PITCH_UM
+    prev = fit_gaussian_1d_free(x, frames[ref], pitch, fix)
+    if prev is None:
+        raise ValueError("could not fit the reference frame")
+    S = frames.sum(axis=1)
+    i_start = max(r0, ref) + 1
+    late = getattr(s, "late", None)
+    if late is not None and i_start <= r1:
+        groups, ith = late_groups(S, i_start, r1, ref, late)
+        if ith <= r1:
+            notes.append(f"frames after {t[ith]:.1f} ns grouped ({sum(1 for g in groups if g[0] >= ith)} groups)")
+    else:
+        groups = [(i, i) for i in range(i_start, r1 + 1)]
+    times, fits, spans, failures = [float(t[ref])], [prev], [(ref, ref)], 0
+    for i0, i1 in groups:
+        if cancelled is not None and cancelled():
+            break
+        z = frames[i0:i1 + 1].mean(axis=0)
+        fit = fit_gaussian_1d_next(x, z, prev.popt, 1.0, pitch, fix)
+        if fit is None:
+            fit = fit_gaussian_1d_next(x, z, prev.popt, 1.8, pitch, fix)
+        if fit is None:
+            failures += 1
+            continue
+        prev = fit
+        tt, w = t[i0:i1 + 1], np.clip(S[i0:i1 + 1], 0.0, None)
+        times.append(float((w * tt).sum() / w.sum()) if w.sum() > 0 else float(tt.mean()))
+        fits.append(fit)
+        spans.append((i0, i1))
+    return PointDiffusion(np.array(times), np.array([f.sigma_eq ** 2 for f in fits]),
+                          np.array([bool(f.at_bound) or not f.quality_ok for f in fits]), float(t[ref]), failures,
+                          "; ".join(notes), np.array([f.popt for f in fits], dtype=np.float64),
+                          np.array(spans, dtype=int))
+
+
 def ref_width_median(store: TrplStore, paths, s: FitSettings, progress=None, cancelled=None) -> dict:
     """Free fits of every point's reference frame → median σx, σy over the unflagged ones (all if none is)."""
     rows = []
@@ -2988,6 +3852,15 @@ class XMapPlot(QtWidgets.QWidget):
         super().__init__(parent)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        bar = QtWidgets.QHBoxLayout()
+        bar.addStretch(1)
+        self.exportBtn = _export_button("Export this colour map with its true x (sweep) and y values")
+        self.exportBtn.setStyleSheet("padding: 1px 8px")
+        self.exportBtn.clicked.connect(self._on_export)
+        bar.addWidget(self.exportBtn)
+        lay.addLayout(bar)
+        self._export = None
         self._glw = pg.GraphicsLayoutWidget()
         lay.addWidget(self._glw)
         self.plot = self._glw.addPlot(row=0, col=0)
@@ -3013,6 +3886,8 @@ class XMapPlot(QtWidgets.QWidget):
         self.img.clear()
         self._has_img = False
         self._x = None
+        self._export = None
+        self.exportBtn.setEnabled(False)
         self.plot.setTitle(title)
         self.msg.setText(text)
         vr = self.plot.getViewBox().viewRange()
@@ -3026,6 +3901,8 @@ class XMapPlot(QtWidgets.QWidget):
         if x.size == 0 or y.size == 0 or z.shape != (y.size, x.size) or not np.isfinite(z).any():
             self.show_message("no data", title)
             return
+        self._export = (x.copy(), y.copy(), z.copy(), title or "map")
+        self.exportBtn.setEnabled(True)
         if x.size > 1 and np.any(np.diff(x) <= 0):     # not strictly increasing: draw by index
             x_label = f"point # (x not monotonic: {x_label})"
             x = np.arange(x.size, dtype=float)
@@ -3054,6 +3931,15 @@ class XMapPlot(QtWidgets.QWidget):
             self.plot.setYRange(*y_range, padding=0.0)
         else:
             self.plot.setYRange(float(y[0]) - 0.5 * dy, float(y[-1]) + 0.5 * dy, padding=0.0)
+
+    def export_csv(self, fn) -> None:
+        """The map's data (not the display resampling): x = the sweep values, y = energy / time / ..."""
+        x, y, z, _t = self._export
+        export_matrix_csv(fn, x, y, z)
+
+    def _on_export(self) -> None:
+        if self._export is not None:
+            _export_csv_dialog(self, self._export[3], self.export_csv)
 
     def set_marker(self, x: Optional[float]) -> None:
         self.marker.setVisible(bool(x is not None and np.isfinite(x)))     # Qt wants a Python bool
@@ -3097,12 +3983,668 @@ class ContourPixelMap(PixelMapPlot):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# Peak-fit widgets: fit settings row, and a spectrum-vs-sweep map with its fitted
+# intensity / center / width / local slope
+# ══════════════════════════════════════════════════════════════════════
+
+class PeakFitControls(QtWidgets.QWidget):
+    """Lineshape + start values (+ optionally the fit window); saved in QSettings under ``prefix``."""
+    changed = QtCore.pyqtSignal()
+
+    def __init__(self, prefix: str, window: bool = False, offset: bool = False, parent=None):
+        super().__init__(parent)
+        self._prefix = prefix
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.shapeCombo = QtWidgets.QComboBox()
+        self.shapeCombo.addItems(PEAK_SHAPES)
+        self.shapeCombo.setToolTip(
+            "Single-peak lineshape:\n"
+            "• Gauss ⊗ 2 exp: Gaussian (σ) convolved with an asymmetric exponential — low-energy tail τ_lo,\n"
+            "  high-energy tail τ_hi (gauss_2exp, erfcx form).  The peak maximum is not at E0 when τ_lo ≠ τ_hi.\n"
+            "• Gaussian: A·exp(−(E−E0)²/2σ²)\n"
+            "• Lorentzian: A·γ²/((E−E0)² + γ²), γ = half width at half maximum")
+        self.lo = _dspin(0.5, 3.5, 1.28, 3, 0.005, " eV") if window else None
+        self.hi = _dspin(0.5, 3.5, 1.52, 3, 0.005, " eV") if window else None
+        self.w0 = _dspin(0.0002, 0.5, 0.0115, 4, 0.0005, " eV", width=100)
+        self.tlo = _dspin(0.0002, 0.5, 0.021, 4, 0.001, " eV", width=100)
+        self.thi = _dspin(0.0002, 0.5, 0.010, 4, 0.001, " eV", width=100)
+        self.w0.setToolTip("Start value of the width: σ (Gaussian, Gauss ⊗ 2 exp) or γ (Lorentzian).\n"
+                           "Start values are used for the first (brightest) spectrum of a linecut; the others\n"
+                           "start from their neighbour's fit.")
+        self.tlo.setToolTip("Start value of the low-energy exponential tail τ_lo (Gauss ⊗ 2 exp only)")
+        self.thi.setToolTip("Start value of the high-energy exponential tail τ_hi (Gauss ⊗ 2 exp only)")
+        self.offsetCheck = QtWidgets.QCheckBox("Fit offset")
+        self.offsetCheck.setChecked(offset)
+        self.offsetCheck.setToolTip("Also fit a constant background (needed unless the spectra are background-\n"
+                                    "subtracted: the n-D map's are; the scan's PL only with tab 2's Baseline on)")
+        self.wLbl = QtWidgets.QLabel("σ₀")
+        self.tloLbl, self.thiLbl = QtWidgets.QLabel("τ_lo₀"), QtWidgets.QLabel("τ_hi₀")
+        lay.addWidget(QtWidgets.QLabel("Lineshape"))
+        lay.addWidget(self.shapeCombo)
+        if window:
+            for lab, w in (("Fit window", self.lo), ("to", self.hi)):
+                lay.addWidget(QtWidgets.QLabel(lab))
+                lay.addWidget(w)
+        for lab, w in ((self.wLbl, self.w0), (self.tloLbl, self.tlo), (self.thiLbl, self.thi)):
+            lay.addWidget(lab)
+            lay.addWidget(w)
+        lay.addWidget(self.offsetCheck)
+        self._restore()
+        self._update_enabled()
+        self.shapeCombo.currentIndexChanged.connect(lambda _i: self._on_change())
+        for w in self._spins():
+            w.valueChanged.connect(lambda _v: self._on_change())
+        self.offsetCheck.toggled.connect(lambda _c: self._on_change())
+
+    def _spins(self):
+        return [s for s in (self.lo, self.hi, self.w0, self.tlo, self.thi) if s is not None]
+
+    _KEYS = (("lo", "lo"), ("hi", "hi"), ("width0", "w0"), ("tau_lo0", "tlo"), ("tau_hi0", "thi"))
+
+    def _restore(self) -> None:
+        st = _settings()
+        for key, attr in self._KEYS:
+            w, v = getattr(self, attr), st.value(f"{self._prefix}/{key}")
+            if w is not None and v is not None:
+                try:
+                    w.setValue(float(v))
+                except (TypeError, ValueError):
+                    pass
+        sh = st.value(f"{self._prefix}/shape")
+        if sh in PEAK_SHAPES:
+            self.shapeCombo.setCurrentText(sh)
+        off = st.value(f"{self._prefix}/offset")
+        if off is not None:
+            self.offsetCheck.setChecked(str(off).lower() in ("true", "1"))
+
+    def save(self) -> None:
+        st = _settings()
+        for key, attr in self._KEYS:
+            w = getattr(self, attr)
+            if w is not None:
+                st.setValue(f"{self._prefix}/{key}", float(w.value()))
+        st.setValue(f"{self._prefix}/shape", self.shapeCombo.currentText())
+        st.setValue(f"{self._prefix}/offset", self.offsetCheck.isChecked())
+
+    def _update_enabled(self) -> None:
+        sh = self.shapeCombo.currentText()
+        self.wLbl.setText("γ₀" if sh == SHAPE_LOR else "σ₀")
+        for w in (self.tlo, self.thi, self.tloLbl, self.thiLbl):
+            w.setEnabled(sh == SHAPE_G2E)
+
+    def _on_change(self) -> None:
+        self._update_enabled()
+        self.save()
+        self.changed.emit()
+
+    def opts(self, lo: Optional[float] = None, hi: Optional[float] = None) -> PeakFitOpts:
+        if lo is None:
+            lo = self.lo.value() if self.lo is not None else 1.28
+        if hi is None:
+            hi = self.hi.value() if self.hi is not None else 1.52
+        return PeakFitOpts(self.shapeCombo.currentText(), lo, hi, self.w0.value(), self.tlo.value(),
+                           self.thi.value(), self.offsetCheck.isChecked())
+
+
+SLOPE_METHODS = ("Smoothing spline", "Local cubic", "Local line")
+# (a local parabola gives the same slope as a line at the centre of a symmetric window, so the local
+#  polynomial option is cubic — Savitzky–Golay order 3 — which removes the line's curvature bias)
+
+
+def _axis_unit(label: str) -> str:
+    """Unit of an axis label 'name (unit)', bracketed when it has a slash (for 'meV/<unit>')."""
+    m = re.search(r"\(([^()]*)\)\s*$", label or "")
+    u = m.group(1) if m else "unit"
+    return f"({u})" if "/" in u else u
+
+
+class LinecutFitView(QtWidgets.QWidget):
+    """Spectra along a sweep (x = n, D, V or power; y = photon energy) with a single-peak fit of every
+    column ("Fit linecut"): the fitted centers drawn on the map, and intensity, center, width and the
+    local slope dE/dx versus x below it (x-linked).  Right: the selected column's spectrum + fit.
+
+    When x is (proportional to) D/ε₀, the slope is shown as the out-of-plane dipole moment
+    p = −ε_⊥·dE/d(D/ε₀)  (E = E0 − p·D/(ε₀ε_⊥); eV per V/nm = e·nm)."""
+    column_clicked = QtCore.pyqtSignal(int)
+    slider_changed = QtCore.pyqtSignal(int)
+
+    def __init__(self, run, opts_fn, *, slider: bool = False, color: str = "#06b6d4", key: str = "linecut",
+                 parent=None):
+        super().__init__(parent)
+        self._run, self._opts_fn, self._key = run, opts_fn, key
+        self._x = self._xd = self._e = self._Z = None
+        self._xlabel, self._title, self._dip = "", "", None
+        self._fits: Optional[List[Optional[dict]]] = None
+        self._fits_key = None
+        self._job = None
+        self._token = 0
+        self._sel: Optional[int] = None
+        self._single: Optional[Tuple[int, tuple, Optional[dict]]] = None
+        self._q = None
+        self._build(slider, color)
+
+    # ── UI ────────────────────────────────────────────────────────────
+    def _build(self, slider: bool, color: str) -> None:
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(2, 2, 2, 2)
+        v.setSpacing(3)
+        self.slider = None
+        if slider:
+            r0 = QtWidgets.QHBoxLayout()
+            self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.slider.setRange(0, ND_CUT_N - 1)
+            self.slider.setValue(ND_CUT_N // 2)
+            self.sliderLbl = QtWidgets.QLabel("—")
+            self.sliderLbl.setStyleSheet(f"color:{color}; font-weight:bold; font-size:11pt")
+            self.sliderLbl.setMinimumWidth(330)
+            r0.addWidget(QtWidgets.QLabel("Cut at"))
+            r0.addWidget(self.slider, 1)
+            r0.addWidget(self.sliderLbl)
+            v.addLayout(r0)
+            self.slider.valueChanged.connect(self.slider_changed.emit)
+        r1 = QtWidgets.QHBoxLayout()
+        self.fitBtn = QtWidgets.QPushButton("Fit linecut")
+        self.fitBtn.setToolTip("Fit every spectrum of this linecut (lineshape, window and start values above)")
+        self.cancelBtn = QtWidgets.QPushButton("Cancel")
+        self.cancelBtn.setEnabled(False)
+        self.saveBtn = QtWidgets.QPushButton("Save CSV…")
+        self.saveBtn.setEnabled(False)
+        self.intCombo = QtWidgets.QComboBox()
+        self.intCombo.addItems(["Area", "Peak height"])
+        self.cenCombo = QtWidgets.QComboBox()
+        self.cenCombo.addItems(["Peak max", "E0"])
+        self.cenCombo.setToolTip("Peak max = energy of the fitted curve's maximum;  E0 = the lineshape's E0 parameter\n"
+                                 "(the same for Gaussian / Lorentzian; for Gauss ⊗ 2 exp they differ when τ_lo ≠ τ_hi)")
+        self.widCombo = QtWidgets.QComboBox()
+        self.widCombo.addItems(["FWHM", "σ / γ"])
+        self.slopeMethod = QtWidgets.QComboBox()
+        self.slopeMethod.addItems(SLOPE_METHODS)
+        self.slopeMethod.setToolTip(
+            "How the slope dE/dx of the center is taken:\n"
+            "• Smoothing spline: cubic spline through the centers (weighted by their fit errors), as smooth\n"
+            "  as cross-validation (GCV) says the noise needs, differentiated analytically; ±1σ by exact\n"
+            "  error propagation.  'smoothing ×' < 1 = more local (noisier), > 1 = smoother.\n"
+            "  A real jump of the center (another state) shows up as a slope spike.\n"
+            "• Local cubic: cubic over the N nearest points (Savitzky–Golay order 3), slope at the point;\n"
+            "  less curvature bias than the line for the same N, but noisier (N ≥ 5).\n"
+            "• Local line: straight line over the N nearest points.\n"
+            "On the n-D map linecuts the points are interpolated between measured gate points, so nothing is\n"
+            "more local than the measured grid spacing along the cut.")
+        self.slopeParLbl = QtWidgets.QLabel("")
+        self.slopeSpin = QtWidgets.QSpinBox()
+        self.slopeSpin.setRange(3, 101)
+        self.slopeSpin.setValue(5)
+        self.slopeSpin.setFixedWidth(60)
+        self.slopeSpin.setKeyboardTracking(False)
+        self.slopeSpin.setToolTip("Local fits: number of neighbouring fitted points")
+        self.smoothFac = _dspin(0.001, 1000.0, 1.0, 3, 0.1, width=80)
+        self.smoothFac.setStepType(QtWidgets.QAbstractSpinBox.AdaptiveDecimalStepType)
+        self.smoothFac.setToolTip("Smoothing strength relative to the cross-validated one (1 = GCV choice;\n"
+                                  "< 1 = more local / noisier, > 1 = smoother)")
+        self.epsSpin = _dspin(0.1, 100.0, 1.0, 2, 0.1, width=70)
+        self.epsSpin.setToolTip("Out-of-plane dielectric constant ε_⊥ of the layer, for p = −ε_⊥·dE/d(D/ε₀)\n"
+                                "(ε_⊥ = 1: p/ε_⊥ is shown).  Only used when the sweep axis is D.")
+        for w in (self.fitBtn, self.cancelBtn, self.saveBtn):
+            r1.addWidget(w)
+        r1.addSpacing(10)
+        for lab, w in (("Intensity", self.intCombo), ("Center", self.cenCombo), ("Width", self.widCombo),
+                       ("Slope", self.slopeMethod)):
+            r1.addWidget(QtWidgets.QLabel(lab))
+            r1.addWidget(w)
+        for w in (self.slopeParLbl, self.slopeSpin, self.smoothFac, QtWidgets.QLabel("ε_⊥"), self.epsSpin):
+            r1.addWidget(w)
+        r1.addStretch(1)
+        v.addLayout(r1)
+        self.status = QtWidgets.QLabel("")
+        self.status.setStyleSheet("color:#555")
+        v.addWidget(self.status)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        left = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.map = XMapPlot("magma")
+        self.map.plot.getAxis("left").setWidth(70)
+        self._cenLine = pg.PlotDataItem(pen=pg.mkPen("#22d3ee", width=1.5))
+        self._cenPts = pg.ScatterPlotItem(size=6, pen=pg.mkPen("k", width=0.8), brush=pg.mkBrush("#22d3ee"))
+        self._winLines = [pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("w", width=1, style=QtCore.Qt.DashLine))
+                          for _ in range(2)]
+        for it in (self._cenLine, self._cenPts, *self._winLines):
+            it.setZValue(12)
+            self.map.plot.addItem(it)
+        left.addWidget(self.map)
+        self.glw = pg.GraphicsLayoutWidget()
+        self.pInt = self.glw.addPlot(row=0, col=0)
+        self.pCen = self.glw.addPlot(row=1, col=0)
+        self.pWid = self.glw.addPlot(row=2, col=0)
+        self.pSlope = self.glw.addPlot(row=3, col=0)
+        self._curves, self._vlines = [], []
+        colors = ("#1f77b4", "#d62728", "#2ca02c", "#9467bd")
+        for p, c in zip((self.pInt, self.pCen, self.pWid, self.pSlope), colors):
+            _style(p)
+            p.getAxis("left").setWidth(70)
+            p.setXLink(self.map.plot)
+            if p is not self.pSlope:
+                p.getAxis("bottom").setStyle(showValues=False)
+            cv = p.plot(pen=pg.mkPen(c, width=1.5), symbol="o", symbolSize=5, symbolBrush=c, symbolPen=None)
+            self._curves.append(cv)
+            vl = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#06b6d4", width=1.2))
+            vl.setVisible(False)
+            p.addItem(vl, ignoreBounds=True)
+            self._vlines.append(vl)
+        self._slopeErr = pg.ErrorBarItem(pen=pg.mkPen("#9467bd", width=1))
+        self.pSlope.addItem(self._slopeErr)
+        self.pSlope.addItem(pg.InfiniteLine(pos=0.0, angle=0, pen=pg.mkPen("#999", width=1)), ignoreBounds=True)
+        self._region = pg.LinearRegionItem(brush=pg.mkBrush(255, 179, 0, 45))
+        self._region.setZValue(-5)
+        self.pCen.addItem(self._region, ignoreBounds=True)
+        self._regionFit = pg.PlotDataItem(pen=pg.mkPen("#f59e0b", width=2.2, style=QtCore.Qt.DashLine))
+        self.pCen.addItem(self._regionFit)
+        self._splineCurve = pg.PlotDataItem(pen=pg.mkPen("#7c3aed", width=1.6))
+        self.pCen.addItem(self._splineCurve)
+        self._region_set = False
+        left.addWidget(self.glw)
+        left.setStretchFactor(0, 3)
+        left.setStretchFactor(1, 4)
+        split.addWidget(left)
+
+        right = QtWidgets.QWidget()
+        rv = QtWidgets.QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        self.specPlot = pg.PlotWidget()
+        _style(self.specPlot.getPlotItem(), "PL (counts)", "Photon energy (eV)")
+        self.specPlot.addLegend(offset=(-10, 10))
+        self._cData = self.specPlot.plot(pen=pg.mkPen("#1f77b4", width=1.6), name="data")
+        self._cFit = self.specPlot.plot(pen=pg.mkPen("#e08a00", width=2.0, style=QtCore.Qt.DashLine), name="fit")
+        self._specWin = pg.LinearRegionItem(brush=pg.mkBrush(255, 179, 0, 40), movable=False)
+        self._specWin.setZValue(-10)
+        self.specPlot.addItem(self._specWin)
+        rv.addWidget(self.specPlot, 1)
+        self.readout = QtWidgets.QLabel("Click a column of the map (or a point of the plots below it).")
+        self.readout.setWordWrap(True)
+        self.readout.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.readout.setStyleSheet("font-size:10pt")
+        rv.addWidget(self.readout)
+        self.slopeLbl = QtWidgets.QLabel("")
+        self.slopeLbl.setWordWrap(True)
+        self.slopeLbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.slopeLbl.setStyleSheet("color:#b45309; font-size:10pt; font-weight:bold")
+        rv.addWidget(self.slopeLbl)
+        split.addWidget(right)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        v.addWidget(split, 1)
+
+        self.fitBtn.clicked.connect(self._on_fit)
+        self.cancelBtn.clicked.connect(self._on_cancel)
+        self.saveBtn.clicked.connect(self._on_save)
+        for c in (self.intCombo, self.cenCombo, self.widCombo):
+            c.currentIndexChanged.connect(lambda _i: self._draw_fits())
+        st = _settings()
+        m = st.value(f"{self._key}/slope_method")
+        if m in SLOPE_METHODS:
+            self.slopeMethod.setCurrentText(m)
+        for key, w in (("slope_window", self.slopeSpin), ("slope_smooth", self.smoothFac)):
+            val = st.value(f"{self._key}/{key}")
+            if val is not None:
+                try:
+                    w.setValue(type(w.value())(float(val)))
+                except (TypeError, ValueError):
+                    pass
+        self._update_slope_controls()
+        self.slopeMethod.currentIndexChanged.connect(lambda _i: self._on_slope_setting())
+        self.slopeSpin.valueChanged.connect(lambda _v: self._on_slope_setting())
+        self.smoothFac.valueChanged.connect(lambda _v: self._on_slope_setting())
+        self.epsSpin.valueChanged.connect(lambda _v: self._draw_fits())
+        self._region.sigRegionChangeFinished.connect(lambda _r: self._update_region_fit())
+        self.map.column_clicked.connect(self._on_column)
+        self.glw.scene().sigMouseClicked.connect(self._on_plots_click)
+
+    # ── public ────────────────────────────────────────────────────────
+    def set_slider(self, idx: int, text: str) -> None:
+        if self.slider is None:
+            return
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(idx))
+        self.slider.blockSignals(False)
+        self.sliderLbl.setText(text)
+
+    def has_data(self) -> bool:
+        return self._Z is not None
+
+    def show_message(self, text: str, title: str = "") -> None:
+        self._token += 1
+        self._x = self._xd = self._e = self._Z = None
+        self._fits, self._sel, self._single = None, None, None
+        self.map.show_message(text, title)
+        self._clear_fit_items()
+        self._cData.setData([], [])
+        self._cFit.setData([], [])
+        self.readout.setText(text)
+        self.saveBtn.setEnabled(False)
+
+    def set_spectra(self, x, e, Z, *, x_label: str, title: str, dip_scale: Optional[float] = None) -> None:
+        """Columns Z[:, k] (counts on the ascending energy axis e, eV) at sweep positions x[k].
+        Fits are kept when the data are the same as before."""
+        x, e, Z = np.asarray(x, float), np.asarray(e, float), np.asarray(Z, float)
+        same = (self._Z is not None and Z.shape == self._Z.shape and np.array_equal(x, self._x)
+                and np.array_equal(e, self._e) and np.array_equal(Z, self._Z, equal_nan=True))
+        if not same:
+            self._token += 1
+            self._fits, self._single = None, None
+            self._x, self._e, self._Z = x, e, Z
+            if self._sel is not None and self._sel >= x.size:
+                self._sel = None
+            self._region_set = False
+        self._xlabel, self._title, self._dip = x_label, title, dip_scale
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Redraw everything; fits made with other settings are dropped."""
+        if self._Z is None:
+            return
+        if self._fits is not None and self._fits_key != self._opts_fn().key():
+            self._fits = None
+            self.status.setText("Fit settings changed: press Fit linecut again.")
+        self._draw_map()
+        self._draw_fits()
+        if self._sel is not None:
+            self.select_column(self._sel)
+
+    def select_column(self, k: Optional[int]) -> None:
+        """Mark column k and show its spectrum + fit (no signal)."""
+        if self._Z is None or k is None or not (0 <= k < self._Z.shape[1]):
+            return
+        self._sel = int(k)
+        xd = self._xd
+        xv = float(xd[k]) if xd is not None else None
+        self.map.set_marker(xv)
+        for vl in self._vlines:
+            vl.setVisible(xv is not None)
+            if xv is not None:
+                vl.setValue(xv)
+        opts = self._opts_fn()
+        y = self._Z[:, k]
+        self._cData.setData(self._e, np.where(np.isfinite(y), y, np.nan), connect="finite")
+        self._specWin.setRegion((opts.lo, opts.hi))
+        res, src = None, ""
+        if self._fits is not None:
+            res, src = self._fits[k], "linecut fit"
+        else:
+            key = (k, opts.key(), self._token)
+            if self._single is None or self._single[:2] != key[:2] or self._single[3] != self._token:
+                self._single = (k, opts.key(), fit_peak(self._e, y, opts), self._token)
+            res, src = self._single[2], "single fit (not from Fit linecut)"
+        if res is not None:
+            ef = np.linspace(opts.lo, opts.hi, 600)
+            self._cFit.setData(ef, peak_curve(res, ef))
+        else:
+            self._cFit.setData([], [])
+        span = opts.hi - opts.lo
+        self.specPlot.setXRange(opts.lo - 0.15 * span, opts.hi + 0.15 * span, padding=0)
+        win = (self._e >= opts.lo - 0.15 * span) & (self._e <= opts.hi + 0.15 * span) & np.isfinite(y)
+        if win.any():
+            lo_y, hi_y = float(np.min(y[win])), float(np.max(y[win]))
+            pad = 0.06 * (hi_y - lo_y or 1.0)
+            self.specPlot.setYRange(lo_y - pad, hi_y + pad, padding=0)
+        self.specPlot.setTitle(f"{self._xlabel.split(' (')[0]} = {_fmt(self._x[k], '.4g')}")
+        head = f"<b>{self._xlabel.split(' (')[0]} = {_fmt(self._x[k], '.4g')}</b>  ({src})<br>"
+        self.readout.setText(head + _peak_html(res))
+
+    # ── drawing ───────────────────────────────────────────────────────
+    def _draw_map(self) -> None:
+        opts = self._opts_fn()
+        eu, Zu = _uniform_rows(self._e, self._Z)
+        if not np.isfinite(Zu).any():
+            self.map.show_message("no data", self._title)
+            self._xd = None
+            return
+        win = (eu >= opts.lo) & (eu <= opts.hi)
+        fin = Zu[win][np.isfinite(Zu[win])] if win.any() else Zu[np.isfinite(Zu)]
+        levels = None
+        if fin.size:
+            lo, hi = float(np.percentile(fin, 1)), float(np.percentile(fin, 99.5))
+            levels = (lo, hi if hi > lo else lo + 1.0)
+        span = opts.hi - opts.lo
+        yr = (max(float(eu[0]), opts.lo - 0.25 * span), min(float(eu[-1]), opts.hi + 0.25 * span))
+        self.map.set_data(self._x, eu, Zu, x_label=self._xlabel, y_label="Photon energy (eV)",
+                          title=self._title, levels=levels, y_range=yr if yr[1] > yr[0] else None)
+        self._xd = self.map._x
+        for ln, val in zip(self._winLines, (opts.lo, opts.hi)):
+            ln.setValue(val)
+        self.pSlope.setLabel("bottom", self.map.plot.getAxis("bottom").labelText)
+
+    def _clear_fit_items(self) -> None:
+        for cv in self._curves:
+            cv.setData([], [])
+        self._cenLine.setData([], [])
+        self._cenPts.setData([], [])
+        self._slopeErr.setData(x=np.zeros(0), y=np.zeros(0), height=np.zeros(0))
+        self._regionFit.setData([], [])
+        self._splineCurve.setData([], [])
+        self._region.setVisible(False)
+        self.slopeLbl.setText("")
+        self._q = None
+
+    def _quantities(self):
+        """(intensity, center (eV), width (meV), center error (eV; E0's, also used for the peak max))."""
+        f = self._fits
+
+        def col(key):
+            return np.array([r[key] if r is not None else np.nan for r in f], float)
+        inten = col("area") if self.intCombo.currentIndex() == 0 else col("height")
+        cen = col("E_peak") if self.cenCombo.currentIndex() == 0 else col("E0")
+        wid = (col("fwhm") if self.widCombo.currentIndex() == 0 else col("width")) * 1e3
+        return inten, cen, wid, col("E0_err")
+
+    def _update_slope_controls(self) -> None:
+        spline = self.slopeMethod.currentIndex() == 0
+        self.slopeParLbl.setText("smoothing ×" if spline else "points")
+        self.smoothFac.setVisible(spline)
+        self.slopeSpin.setVisible(not spline)
+
+    def _on_slope_setting(self) -> None:
+        self._update_slope_controls()
+        st = _settings()
+        st.setValue(f"{self._key}/slope_method", self.slopeMethod.currentText())
+        st.setValue(f"{self._key}/slope_window", int(self.slopeSpin.value()))
+        st.setValue(f"{self._key}/slope_smooth", float(self.smoothFac.value()))
+        self._draw_fits()
+
+    def _slope(self, xd, cen, cen_err):
+        """(dE/dx, its 1σ, smoothed center or None, description) with the chosen method."""
+        m = self.slopeMethod.currentIndex()
+        if m == 0:
+            s, se, f, info = spline_slope(xd, cen, cen_err, self.smoothFac.value())
+            fac = self.smoothFac.value()
+            desc = (f"smoothing spline (GCV{'' if fac == 1 else f' ×{fac:g}'}, "
+                    f"{_fmt(info['dof'], '.1f')} eff. parameters)")
+            return s, se, f, desc
+        order = 3 if m == 1 else 1
+        n = max(self.slopeSpin.value(), order + 2)
+        s, se = local_slope(xd, cen, n, order)
+        return s, se, None, f"local {'cubic' if order == 3 else 'line'}, {n} points"
+
+    def _slope_units(self):
+        """(factor applied to dE/dx [eV per x unit], y label, short) for the slope plot."""
+        unit = _axis_unit(self._xlabel)
+        by_index = self._xd is not None and self._x is not None and not np.array_equal(self._xd, self._x)
+        if self._dip and not by_index:
+            eps = float(self.epsSpin.value())
+            return -eps / self._dip, f"p (e·nm)  [= −ε_⊥·dE/d(D/ε₀), ε_⊥ = {eps:g}]", "p"
+        return 1e3, f"dE/dx (meV / {unit if not by_index else 'point'})", "dE/dx"
+
+    def _draw_fits(self) -> None:
+        self._clear_fit_items()
+        if self._fits is None or self._xd is None:
+            self.saveBtn.setEnabled(False)
+            for p in (self.pInt, self.pCen, self.pWid, self.pSlope):
+                p.setTitle("")
+            return
+        self.saveBtn.setEnabled(True)
+        xd = self._xd
+        inten, cen, wid, cen_err = self._quantities()
+        ok = np.isfinite(cen)
+        self._cenLine.setData(xd[ok], cen[ok])
+        self._cenPts.setData(xd[ok], cen[ok])
+        s, se, smooth, sdesc = self._slope(xd, cen, cen_err)
+        if smooth is not None:
+            m = np.isfinite(smooth)
+            self._splineCurve.setData(xd[m], smooth[m])
+        fac, slab, _short = self._slope_units()
+        sv, sev = s * fac, se * abs(fac)
+        for cv, yv in zip(self._curves, (inten, cen, wid, sv)):
+            m = np.isfinite(yv)
+            cv.setData(xd[m], yv[m])
+        m = np.isfinite(sv) & np.isfinite(sev)
+        self._slopeErr.setData(x=xd[m], y=sv[m], height=2 * sev[m])
+        fin = sv[np.isfinite(sv)]
+        if fin.size:                              # scale to the slopes, not to the (wide) end error bars
+            lo, hi = (float(v) for v in np.percentile(fin, [2, 98]))
+            pad = 0.15 * (hi - lo) or 0.1 * abs(hi) or 1.0
+            self.pSlope.setYRange(lo - pad, hi + pad, padding=0)
+        for p, t in ((self.pInt, "Intensity: " + ("area (counts·eV)" if self.intCombo.currentIndex() == 0
+                                                  else "peak height (counts)")),
+                     (self.pCen, "Center: " + ("peak max" if self.cenCombo.currentIndex() == 0 else "E0") + " (eV)"),
+                     (self.pWid, "Width: " + ("FWHM" if self.widCombo.currentIndex() == 0 else "σ / γ") + " (meV)"),
+                     (self.pSlope, f"Slope, {sdesc}: {slab}  (±1σ)")):
+            p.setTitle(t, size="10pt")
+        self._q = (xd, cen, s, se)
+        if ok.sum() >= 2:
+            self._region.setVisible(True)
+            lo, hi = float(np.nanmin(xd[ok])), float(np.nanmax(xd[ok]))
+            a, b = self._region.getRegion()
+            if not self._region_set or b < lo or a > hi:
+                self._region.blockSignals(True)
+                self._region.setRegion((lo + 0.25 * (hi - lo), hi - 0.25 * (hi - lo)))
+                self._region.blockSignals(False)
+                self._region_set = True
+            self._update_region_fit()
+
+    def _update_region_fit(self) -> None:
+        if self._q is None:
+            return
+        xd, cen, _s, _se = self._q
+        a, b = self._region.getRegion()
+        sel = np.isfinite(cen) & (xd >= a) & (xd <= b)
+        if sel.sum() < 2:
+            self._regionFit.setData([], [])
+            self.slopeLbl.setText("Linear fit: fewer than 2 fitted points in the shaded range.")
+            return
+        slope, icpt, err = _linfit(xd[sel], cen[sel])
+        self._regionFit.setData([a, b], [icpt + slope * a, icpt + slope * b])
+        unit = _axis_unit(self._xlabel)
+        txt = (f"Linear fit of the center over {_fmt(a, '.3g')} … {_fmt(b, '.3g')} ({int(sel.sum())} points): "
+               f"dE/dx = {_fmt(slope * 1e3, '.4g')} ± {_fmt(err * 1e3, '.2g')} meV/{unit}")
+        fac, _l, short = self._slope_units()
+        if short == "p":
+            eps = float(self.epsSpin.value())
+            p, pe = slope * fac, err * abs(fac)
+            txt += (f"<br>→ dipole p = −ε_⊥·dE/d(D/ε₀) = {_fmt(p, '.4g')} ± {_fmt(pe, '.2g')} e·nm "
+                    f"= {_fmt(p * E_NM_DEBYE, '.4g')} ± {_fmt(pe * E_NM_DEBYE, '.2g')} D   (ε_⊥ = {eps:g})")
+        self.slopeLbl.setText(txt)
+
+    # ── interaction ───────────────────────────────────────────────────
+    def _on_column(self, k: int) -> None:
+        self.select_column(k)
+        self.column_clicked.emit(int(k))
+
+    def _on_plots_click(self, ev) -> None:
+        if self._xd is None or ev.button() != QtCore.Qt.LeftButton:
+            return
+        for p in (self.pInt, self.pCen, self.pWid, self.pSlope):
+            vb = p.getViewBox()
+            if vb.sceneBoundingRect().contains(ev.scenePos()):
+                xv = vb.mapSceneToView(ev.scenePos()).x()
+                self._on_column(int(np.argmin(np.abs(self._xd - xv))))
+                return
+
+    def _on_fit(self) -> None:
+        if self._Z is None or self._job is not None:
+            return
+        if _curve_fit is None:
+            self.status.setText("scipy is needed for the fits")
+            return
+        opts = self._opts_fn()
+        e, Z, token = self._e.copy(), self._Z.copy(), self._token
+        t0 = time.monotonic()
+
+        def work(progress, cancelled):
+            return fit_spectra_line(e, Z, opts, progress, cancelled)
+
+        def done(res, err):
+            self._job = None
+            self.fitBtn.setEnabled(True)
+            self.cancelBtn.setEnabled(False)
+            if err:
+                self.status.setText(f"Fit {'cancelled' if err == 'cancelled' else 'failed: ' + err}")
+                return
+            if token != self._token or opts.key() != self._opts_fn().key():
+                self.status.setText("The data or fit settings changed during the fit: press Fit linecut again.")
+                return
+            self._fits, self._fits_key = res, opts.key()
+            n_ok = sum(r is not None for r in res)
+            self.status.setText(f"{n_ok}/{len(res)} spectra fitted ({opts.describe()}) in "
+                                f"{time.monotonic() - t0:.1f} s.  Drag the shaded range on the center plot "
+                                "for a straight-line fit.")
+            self._draw_fits()
+            if self._sel is not None:
+                self.select_column(self._sel)
+
+        self.fitBtn.setEnabled(False)
+        self.cancelBtn.setEnabled(True)
+        self.status.setText("Fitting …")
+        self._job = self._run(work, done, lambda d, n: self.status.setText(f"Fitting {d}/{n} …"))
+
+    def _on_cancel(self) -> None:
+        if self._job is not None:
+            self._job.cancel()
+
+    def _on_save(self) -> None:
+        if self._fits is None:
+            return
+        st = _settings()
+        start = str(st.value(f"{self._key}/csv_dir") or "")
+        fn, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save linecut fit", str(Path(start) / "linecut_fit.csv"),
+                                                      "CSV (*.csv)")
+        if not fn:
+            return
+        st.setValue(f"{self._key}/csv_dir", str(Path(fn).parent))
+        try:
+            self.save_csv(fn)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "Save linecut fit", str(exc))
+            return
+        self.status.setText(f"Saved {fn}")
+
+    def save_csv(self, fn) -> None:
+        f = self._fits
+        keys = ("E_peak", "E0", "E0_err", "height", "area", "fwhm", "width", "width_err", "tau_lo", "tau_lo_err",
+                "tau_hi", "tau_hi_err", "A", "A_err", "offset", "r2")
+        rows = np.array([[r[k] if r is not None else np.nan for k in keys] for r in f], float)
+        _i, cen, _w, cen_err = self._quantities()
+        s, se, _f, sdesc = self._slope(self._xd, cen, cen_err)
+        fac, _l, short = self._slope_units()
+        cols = [self._x[:, None], rows, (s * 1e3)[:, None], (se * 1e3)[:, None]]
+        names = ["x"] + list(keys) + ["dEdx_meV_per_x", "dEdx_err"]
+        if short == "p":
+            cols += [(s * fac)[:, None], (se * abs(fac))[:, None]]
+            names += ["dipole_e_nm", "dipole_err_e_nm"]
+        opts = self._opts_fn()
+        head = (f"{self._title}\nx = {self._xlabel}\nfit: {opts.describe()}; energies in eV (width, fwhm, tau too); "
+                f"center for the slope = {self.cenCombo.currentText()}; slope: {sdesc}"
+                + (f"; dipole with eps_perp = {self.epsSpin.value():g}" if short == "p" else "")
+                + "\n" + ",".join(names))
+        np.savetxt(fn, np.hstack(cols), delimiter=",", header=head, comments="# ", fmt="%.8g", encoding="utf-8")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # Tab 1: n-D map + gate calibration
 # ══════════════════════════════════════════════════════════════════════
 
 ND_QUANTITIES = ["Integrated intensity (window)", "Peak height (max)", "Peak energy (argmax)",
                  "Centroid energy", "Linewidth (2nd moment)"]
 _ND_ENERGY_Q = {"Peak energy (argmax)", "Centroid energy"}
+ND_CUT_N = 81                 # positions of a linecut, and of its slider (as WF_NGRID in the gate grids viewer)
 _ND_CAL_DIR = HERE / "gate grids viewer" / "calibration"
 
 
@@ -3124,6 +4666,10 @@ class NDMapTab(QtWidgets.QWidget):
         self.cal_path: Optional[str] = None
         self._scan = (np.zeros(0), np.zeros(0), np.zeros(0, int), None)
         self._overlay_fit = False
+        self._interp = None                       # (LinearNDInterpolator of spec_bs over (u_n, u_D), ranges)
+        self._cut_idx = {"n": ND_CUT_N // 2, "D": ND_CUT_N // 2}
+        self._cut_s: Dict[str, Optional[np.ndarray]] = {"n": None, "D": None}    # swept u of the drawn columns
+        self._cut_ends: Dict[str, Optional[np.ndarray]] = {"n": None, "D": None}
         self._build_ui()
         self._restore_settings()
         self._wire()
@@ -3224,6 +4770,14 @@ class NDMapTab(QtWidgets.QWidget):
             r5.addWidget(w)
         r5.addStretch(1)
         g.addLayout(r5)
+        r6 = QtWidgets.QHBoxLayout()
+        self.fitCtl = PeakFitControls("ndmap/fit")
+        fl = QtWidgets.QLabel("Peak fit (in the Window):")
+        fl.setStyleSheet("font-weight:bold")
+        r6.addWidget(fl)
+        r6.addWidget(self.fitCtl)
+        r6.addStretch(1)
+        g.addLayout(r6)
         root.addWidget(box)
 
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -3244,20 +4798,51 @@ class NDMapTab(QtWidgets.QWidget):
         for z, it in enumerate((self._selMark, self._cutLine, self._cutPts, self._cutCur)):
             it.setZValue(10 + z)
             self._mapPlot.addItem(it)
+        self._sliceItems = {kind: pg.PlotDataItem(pen=pg.mkPen(col, width=2.2, style=QtCore.Qt.DashLine))
+                            for kind, col in (("n", "#00b3cc"), ("D", "#d43bb0"))}
+        for it in self._sliceItems.values():
+            it.setZValue(9)
+            self._mapPlot.addItem(it)
         self._cutPts.sigClicked.connect(self._on_cut_point_clicked)
         self._mapPlot.scene().sigMouseClicked.connect(self._on_map_click)
-        split.addWidget(self._glw)
+        mapBox = QtWidgets.QWidget()
+        mv = QtWidgets.QVBoxLayout(mapBox)
+        mv.setContentsMargins(0, 0, 0, 0)
+        mv.setSpacing(0)
+        mbar = QtWidgets.QHBoxLayout()
+        mbar.addStretch(1)
+        self.exportMapBtn = _export_button(
+            "Export the n-D map as shown (the 'Colour by' quantity, unmeasured points empty).\n"
+            "Raw axes (calibration off): the exact V_front × V_back grid.\n"
+            "u_n/u_D or n/D axes: the gate grid is a parallelogram there, so it is sampled as drawn onto a\n"
+            "regular grid (4× finer than the gate grid; cells outside the measured area empty).")
+        self.exportMapBtn.setStyleSheet("padding: 1px 8px")
+        self.exportMapBtn.clicked.connect(self._on_export_map)
+        mbar.addWidget(self.exportMapBtn)
+        mv.addLayout(mbar)
+        mv.addWidget(self._glw, 1)
+        split.addWidget(mapBox)
 
         right = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        specBox = QtWidgets.QWidget()
+        sv = QtWidgets.QVBoxLayout(specBox)
+        sv.setContentsMargins(0, 0, 0, 0)
         self._specPlot = pg.PlotWidget()
         self._specPlot.addLegend(offset=(-10, 10))
         self._cRaw = self._specPlot.plot(pen=pg.mkPen("#8a8aa6", width=1.2), name="raw")
         self._cBs = self._specPlot.plot(pen=pg.mkPen("#1f77b4", width=1.8), name="bkg-sub")
+        self._cFit = self._specPlot.plot(pen=pg.mkPen("#e08a00", width=2.0, style=QtCore.Qt.DashLine), name="fit")
         self._winReg = pg.LinearRegionItem(brush=pg.mkBrush(255, 179, 0, 40), movable=False)
         self._winReg.setZValue(-10)
         self._specPlot.addItem(self._winReg)
         _style(self._specPlot.getPlotItem(), "PL (counts, bkg-subtracted)", "Photon energy (eV)")
-        right.addWidget(self._specPlot)
+        sv.addWidget(self._specPlot, 1)
+        self.fitLbl = QtWidgets.QLabel("Click a point of the map: its spectrum is fitted.")
+        self.fitLbl.setWordWrap(True)
+        self.fitLbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.fitLbl.setStyleSheet("font-size:11pt; color:#7c2d12")
+        sv.addWidget(self.fitLbl)
+        right.addWidget(specBox)
         self._spatPlot = pg.PlotWidget()
         self._cProf = self._spatPlot.plot(pen=pg.mkPen("#1f77b4", width=1.5))
         self._bandReg = pg.LinearRegionItem(brush=pg.mkBrush(255, 140, 0, 55))
@@ -3266,9 +4851,18 @@ class NDMapTab(QtWidgets.QWidget):
         right.addWidget(self._spatPlot)
         right.setStretchFactor(0, 3)
         right.setStretchFactor(1, 2)
-        split.addWidget(right)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 2)
+        self.rightTabs = QtWidgets.QTabWidget()
+        self.rightTabs.addTab(right, "Spectrum")
+        self.cutViews: Dict[str, LinecutFitView] = {}
+        for kind, title, col in (("n", "Spectrum vs n (const D)", "#00b3cc"),
+                                 ("D", "Spectrum vs D (const n)", "#d43bb0")):
+            view = LinecutFitView(self._run, self._fit_opts, slider=True, color=col, key=f"ndcut_{kind}")
+            view.show_message("Load an n-D map.")
+            self.cutViews[kind] = view
+            self.rightTabs.addTab(view, title)
+        split.addWidget(self.rightTabs)
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 3)
         root.addWidget(split, 1)
 
     def _wire(self) -> None:
@@ -3288,6 +4882,10 @@ class NDMapTab(QtWidgets.QWidget):
             w.valueChanged.connect(lambda _v: self._on_window_changed())
         self.quantity.currentTextChanged.connect(lambda _t: self._refresh_map())
         self._bandReg.sigRegionChangeFinished.connect(self._on_region_changed)
+        self.fitCtl.changed.connect(self._on_fit_settings)
+        self.rightTabs.currentChanged.connect(lambda _i: self._on_right_tab())
+        for kind, view in self.cutViews.items():
+            view.slider_changed.connect(lambda v, k=kind: self._on_cut_slider(k, v))
 
     # ── settings ──────────────────────────────────────────────────────
     _SAVED = (("r", "rSpin"), ("un0", "nOrig"), ("uD0", "dOrig"), ("dF", "dF"), ("eps", "eps"),
@@ -3391,8 +4989,10 @@ class NDMapTab(QtWidgets.QWidget):
     def _on_coords_changed(self) -> None:
         self._update_phys_info()
         self._apply_axes()
+        self._interp = None
         self._refresh_map()
         self._show_spectrum(*self.sel)
+        self._refresh_cuts()
         self._overlay_fit = True
         self.calib_changed.emit()
         self.save_settings()
@@ -3539,6 +5139,7 @@ class NDMapTab(QtWidgets.QWidget):
         self._overlay_fit = True
         self._refresh_map()
         self._show_spectrum(*self.sel)
+        self._refresh_cuts()
         self.save_settings()
         self.status.emit(f"n-D map loaded: {self.ndInfo.text()}")
 
@@ -3564,6 +5165,7 @@ class NDMapTab(QtWidgets.QWidget):
         if mask.any():
             band = band - np.nanmean(band[:, :, mask], axis=2, keepdims=True)
         self.spec_bs = band[:, :, nd["order"]]
+        self._interp = None
 
     def _raw_map(self, name: str) -> np.ndarray:
         nd = self.nd
@@ -3611,7 +5213,9 @@ class NDMapTab(QtWidgets.QWidget):
             self._selMark.setData([])
             self._mapPlot.setTitle("no n-D map loaded: only the scan's linecut is drawn")
             self._draw_overlay()
+            self.exportMapBtn.setEnabled(False)
             return
+        self.exportMapBtn.setEnabled(True)
         name = self.quantity.currentText()
         arr = np.where(self.nd["measured"], np.asarray(self._raw_map(name), float), np.nan)
         self._img.setImage(arr, autoLevels=False)
@@ -3637,6 +5241,43 @@ class NDMapTab(QtWidgets.QWidget):
         self._overlay_fit = False
         self._mapPlot.autoRange()
 
+    def map_matrix(self, oversample: int = 4):
+        """(x, y, z (ny, nx)) of the shown n-D map.  Raw axes: the gate grid itself.  Sheared axes: the
+        image sampled as drawn on a regular grid (each sample takes the gate cell it falls in)."""
+        nd = self.nd
+        name = self.quantity.currentText()
+        arr = np.where(nd["measured"], np.asarray(self._raw_map(name), float), np.nan)     # (nvf, nvb)
+        if self.calib().mode == "raw":
+            return nd["vf"].copy(), nd["vb"].copy(), arr.T
+        tr = self._transform()
+        nvf, nvb = arr.shape
+        corners = [tr.map(float(a), float(b)) for a in (0, nvf) for b in (0, nvb)]
+        xs, ys = [c[0] for c in corners], [c[1] for c in corners]
+        n = oversample * max(nvf, nvb)
+        dx, dy = (max(xs) - min(xs)) / n, (max(ys) - min(ys)) / n
+        x = min(xs) + (np.arange(n) + 0.5) * dx
+        y = min(ys) + (np.arange(n) + 0.5) * dy
+        inv, ok = tr.inverted()
+        if not ok:
+            raise ValueError("the map transform is not invertible")
+        X, Y = np.meshgrid(x, y)                                       # (ny, nx)
+        I = np.floor(inv.m11() * X + inv.m21() * Y + inv.dx()).astype(int)
+        J = np.floor(inv.m12() * X + inv.m22() * Y + inv.dy()).astype(int)
+        inside = (I >= 0) & (I < nvf) & (J >= 0) & (J < nvb)
+        z = np.full(X.shape, np.nan)
+        z[inside] = arr[I[inside], J[inside]]
+        return x, y, z
+
+    def _on_export_map(self) -> None:
+        if self.nd is None or self.spec_bs is None:
+            return
+        mode = {"raw": "Vf_Vb", "gate": "un_uD", "phys": "n_D"}[self.calib().mode]
+        src = Path(self.nd_source).stem if self.nd_source else "ndmap"
+
+        def write(fn):
+            export_matrix_csv(fn, *self.map_matrix())
+        _export_csv_dialog(self, f"{src}_{self.quantity.currentText()}_{mode}", write)
+
     def _cell_xy(self, i: int, j: int):
         nd = self.nd
         x, y = self.calib().display_xy(nd["vf"][i:i + 1], nd["vb"][j:j + 1])
@@ -3653,6 +5294,7 @@ class NDMapTab(QtWidgets.QWidget):
         if self.nd is None or self.spec_bs is None:
             self._cRaw.setData([], [])
             self._cBs.setData([], [])
+            self._cFit.setData([], [])
             self._specPlot.setTitle("")
             return
         nd = self.nd
@@ -3671,6 +5313,147 @@ class NDMapTab(QtWidgets.QWidget):
         self._specPlot.setTitle(f"Vf={nd['vf'][i]:+.3f} Vb={nd['vb'][j]:+.3f} | u_n={float(un):+.3f} "
                                 f"u_D={float(uD):+.3f} | n={sN * float(un):+.3g}×10¹² D/ε₀={sD * float(uD):+.3g} V/nm{meas}")
         self._update_sel_marker()
+        if not nd["measured"][i, j]:
+            self._cFit.setData([], [])
+            self.fitLbl.setText("(not measured: no fit)")
+            return
+        opts = self._fit_opts()
+        res = fit_peak(nd["e"], self.spec_bs[i, j], opts)
+        if res is not None:
+            ef = np.linspace(opts.lo, opts.hi, 600)
+            self._cFit.setData(ef, peak_curve(res, ef))
+        else:
+            self._cFit.setData([], [])
+        self.fitLbl.setText(_peak_html(res))
+
+    # ── peak fit + linecuts through the n-D map ───────────────────────
+    def _fit_opts(self) -> PeakFitOpts:
+        return self.fitCtl.opts(self.eLo.value(), self.eHi.value())
+
+    def _on_fit_settings(self) -> None:
+        if self.nd is not None:
+            self._show_spectrum(*self.sel)
+        kind = self._active_cut()
+        if kind is not None:
+            self.cutViews[kind].refresh()
+
+    def _active_cut(self) -> Optional[str]:
+        return {1: "n", 2: "D"}.get(self.rightTabs.currentIndex())
+
+    def _on_right_tab(self) -> None:
+        kind = self._active_cut()
+        if kind is not None:
+            self._update_cut_view(kind)
+        self._draw_slices()
+
+    def _refresh_cuts(self) -> None:
+        """Recompute the shown linecut (the hidden one is recomputed when it is shown)."""
+        kind = self._active_cut()
+        if kind is not None:
+            self._update_cut_view(kind)
+        else:
+            self._draw_slices()
+
+    def _on_cut_slider(self, kind: str, v: int) -> None:
+        self._cut_idx[kind] = int(v)
+        self._update_cut_view(kind)
+
+    def _cut_interp(self):
+        """Linear interpolation of the background-subtracted spectra over the measured (u_n, u_D) points
+        (as the gate grids viewer's waterfall maps), with the measured u_n and u_D ranges."""
+        if self._interp is not None:
+            return self._interp
+        nd = self.nd
+        if nd is None or self.spec_bs is None or _LinearND is None:
+            return None
+        VF, VB = np.meshgrid(nd["vf"], nd["vb"], indexing="ij")
+        un, uD = self.calib().u(VF, VB)
+        meas = nd["measured"]
+        if meas.sum() < 3:
+            return None
+        try:
+            ip = _LinearND(np.column_stack([un[meas], uD[meas]]), np.asarray(self.spec_bs[meas], float))
+        except Exception:                       # points on a line: no triangulation
+            return None
+        self._interp = (ip, (float(un[meas].min()), float(un[meas].max())),
+                        (float(uD[meas].min()), float(uD[meas].max())))
+        return self._interp
+
+    def _update_cut_view(self, kind: str) -> None:
+        view = self.cutViews[kind]
+        self._cut_s[kind] = self._cut_ends[kind] = None
+        if self.nd is None:
+            view.show_message("Load an n-D map.")
+            self._draw_slices()
+            return
+        ip = self._cut_interp()
+        if ip is None:
+            view.show_message("scipy.interpolate is needed for linecuts" if _LinearND is None
+                              else "Not enough measured points (spanning an area) for a linecut.")
+            self._draw_slices()
+            return
+        interp, (n_lo, n_hi), (d_lo, d_hi) = ip
+        k = int(np.clip(self._cut_idx[kind], 0, ND_CUT_N - 1))
+        cal = self.calib()
+        sN, sD = cal.scale()
+        phys = cal.mode == "phys"
+        if kind == "n":                                   # sweep n at constant D
+            c = d_lo + (d_hi - d_lo) * k / (ND_CUT_N - 1)
+            s = np.linspace(n_lo, n_hi, ND_CUT_N)
+            pts = np.column_stack([s, np.full_like(s, c)])
+            const = f"const D:  D/ε₀ = {sD * c:+.4g} V/nm   (u_D = {c:+.3f} V)"
+            xs, xl = (sN * s, "n (10¹² cm⁻²)") if phys else (s, "u_n = V_f + r·V_b (V)")
+            dip = None
+        else:                                             # sweep D at constant n
+            c = n_lo + (n_hi - n_lo) * k / (ND_CUT_N - 1)
+            s = np.linspace(d_lo, d_hi, ND_CUT_N)
+            pts = np.column_stack([np.full_like(s, c), s])
+            const = f"const n:  n = {sN * c:+.4g}×10¹² cm⁻²   (u_n = {c:+.3f} V)"
+            xs, xl = (sD * s, "D/ε₀ (V/nm)") if phys else (s, "u_D = V_f − r·V_b (V)")
+            dip = 1.0 if phys else sD                     # d(D/ε₀)/dx
+        view.set_slider(k, const)
+        with np.errstate(all="ignore"):
+            Zc = np.asarray(interp(pts), float)           # (ND_CUT_N, n_e); NaN outside the measured area
+        keep = np.isfinite(Zc).any(axis=1)
+        if keep.sum() < 2:
+            view.show_message(f"This cut misses the measured area ({const}).")
+            self._draw_slices()
+            return
+        self._cut_s[kind] = s[keep]
+        self._cut_ends[kind] = pts[keep][[0, -1]]
+        view.set_spectra(xs[keep], self.nd["e"], Zc[keep].T, x_label=xl,
+                         title=f"n-D map linecut, {const}", dip_scale=dip)
+        self._draw_slices()
+
+    def _draw_slices(self) -> None:
+        """The shown linecut as a dashed line on the n-D map (any axes mode)."""
+        act = self._active_cut()
+        cal = self.calib()
+        for kind, item in self._sliceItems.items():
+            ends = self._cut_ends.get(kind)
+            if self.nd is None or kind != act or ends is None:
+                item.setData([], [])
+                continue
+            a, b = ends[:, 0] + cal.un0, ends[:, 1] + cal.uD0
+            vf, vb = 0.5 * (a + b), (a - b) / (2.0 * cal.r)
+            x, y = cal.display_xy(vf, vb)
+            item.setData(x, y)
+
+    def _move_cut_to(self, i: int, j: int) -> None:
+        """Put the shown linecut through grid point (i, j) and select the column nearest to it."""
+        kind = self._active_cut()
+        ip = self._cut_interp() if kind is not None else None
+        if ip is None:
+            return
+        _interp, (n_lo, n_hi), (d_lo, d_hi) = ip
+        un, uD = (float(v) for v in self.calib().u(self.nd["vf"][i], self.nd["vb"][j]))
+        c, lo, hi, sw = (uD, d_lo, d_hi, un) if kind == "n" else (un, n_lo, n_hi, uD)
+        k = int(np.clip(round((c - lo) / (hi - lo) * (ND_CUT_N - 1)), 0, ND_CUT_N - 1)) if hi > lo else ND_CUT_N // 2
+        self._cut_idx[kind] = k
+        self._update_cut_view(kind)
+        s = self._cut_s[kind]
+        if s is not None:
+            self.cutViews[kind].select_column(int(np.argmin(np.abs(s - sw))))
 
     def _update_band_region(self) -> None:
         if self.nd is None:
@@ -3700,16 +5483,18 @@ class NDMapTab(QtWidgets.QWidget):
         self._update_band_region()
         self._refresh_map()
         self._show_spectrum(*self.sel)
+        self._refresh_cuts()
 
     def _on_spectra_changed(self) -> None:
         self._recompute_spectra()
         self._refresh_map()
         self._show_spectrum(*self.sel)
+        self._refresh_cuts()
         self.save_settings()
 
     def _on_window_changed(self) -> None:
         self._refresh_map()
-        self._show_spectrum(*self.sel)
+        self._on_fit_settings()
         self.save_settings()
 
     def _on_map_click(self, ev) -> None:
@@ -3722,6 +5507,7 @@ class NDMapTab(QtWidgets.QWidget):
         i, j = int(np.floor(pt.x())), int(np.floor(pt.y()))
         if 0 <= i < self.nd["vf"].size and 0 <= j < self.nd["vb"].size:
             self._show_spectrum(i, j)
+            self._move_cut_to(i, j)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -3747,6 +5533,8 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self._align_job = None
         self._sweep_t0: Optional[float] = None
         self._t0_ready = False
+        self._times_after_t0 = False      # Begin / End / Ref are after time zero (aligned view) or raw times
+        self._last_off: Optional[float] = None
         self._pump2 = P2_OFF
         self._angle_calib: Optional[Tuple[np.ndarray, np.ndarray]] = None
         # sweep axes
@@ -3808,6 +5596,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self.tabs.addTab(self._make_point_tab(), "2  Point (PL + TRPL)")
         self.tabs.addTab(self._make_fit_tab(), "3  Spatial fit")
         self.tabs.addTab(self._make_dep_tab(), "4  Dependence")
+        self.tabs.addTab(self._make_scanfit_tab(), "5  PL fit (scan)")
         root.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -3886,14 +5675,18 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self.beginEdit, self.endEdit, self.refEdit = (QtWidgets.QLineEdit() for _ in range(3))
         for w, tip in ((self.beginEdit, "Begin of the time range (ns): time axes, time scrollbar, last fitted frame"),
                        (self.endEdit, "End of the time range (ns)"),
-                       (self.refEdit, "Reference time (ns): first frame of the σ²(t) fit, t_ref of the D line")):
+                       (self.refEdit, "Reference time (ns): first frame of the σ²(t) fit, t_ref of the D line.\n"
+                                      f"Empty: signal peak (t = 0) + {T0_REF_BINS} bins with 'Align t0' on (the begin of the "
+                                      "range without it)")):
             w.setValidator(val)
             w.setFixedWidth(70)
             w.setToolTip(tip)
         self.alignCheck = QtWidgets.QCheckBox("Align t0")
         self.alignCheck.setChecked(True)
         self.alignCheck.setToolTip("Time-zero alignment on each pixel's first peak; every point is then moved to "
-                                   "the scan's common time zero")
+                                   "the scan's common time zero; t = 0 ns is then the signal peak (brightest\n"
+                                   "pixel) of each point.\n"
+                                   "Begin / End / Ref are converted when this is switched.")
         self.rebinSpin = QtWidgets.QSpinBox()
         self.rebinSpin.setRange(1, 200)
         self.rebinSpin.setValue(1)
@@ -4018,7 +5811,35 @@ class DualGateViewer(QtWidgets.QMainWindow):
         split.addWidget(top)
 
         mid = QtWidgets.QWidget()
-        mh = QtWidgets.QHBoxLayout(mid)
+        mv = QtWidgets.QVBoxLayout(mid)
+        mv.setContentsMargins(0, 0, 0, 0)
+        mv.setSpacing(2)
+        vrow = QtWidgets.QHBoxLayout()
+        self.viewCombo = QtWidgets.QComboBox()
+        self.viewCombo.addItems(["2D", "Spectral"])
+        self.viewCombo.setToolTip("2D: the SPAD as an image (2D Gaussian fits).\n"
+                                  "Spectral: the SPAD's centre line on a wavelength axis (SPAD93: the 17 columns "
+                                  "at y = 92 µm; SPAD23: the 5 rows at x = 46 µm), as the SPAD GUIs' spectral mode.\n"
+                                  "Set from the scan's header (spad_view_mode) when a scan is loaded.")
+        self.wlcalLbl = QtWidgets.QLabel("λ-cal: none")
+        self.wlcalLbl.setStyleSheet("color:#555")
+        self.wlcalBtn = QtWidgets.QPushButton("Load λ-cal…")
+        self.wlcalBtn.setToolTip("Wavelength calibration (WLCAL_*.json of the SPAD GUIs). Default: the newest one in "
+                                 "the scan folder, else the one written into the scan's header.")
+        self.wlcalClearBtn = QtWidgets.QPushButton("Clear")
+        self.wlcalClearBtn.setToolTip("No calibration: the spectral axis is the line position (µm)")
+        self.specLogCheck = QtWidgets.QCheckBox("Log image")
+        self.specLogCheck.setToolTip("Spectral image as log10(1 + counts − background)")
+        self.specLogCheck.setChecked(str(_settings().value("spectral/log_image", "false")).lower() == "true")
+        vrow.addWidget(QtWidgets.QLabel("TRPL view"))
+        vrow.addWidget(self.viewCombo)
+        vrow.addSpacing(10)
+        vrow.addWidget(self.wlcalBtn)
+        vrow.addWidget(self.wlcalClearBtn)
+        vrow.addWidget(self.specLogCheck)
+        vrow.addWidget(self.wlcalLbl, 1)
+        mv.addLayout(vrow)
+        mh = QtWidgets.QHBoxLayout()
         mh.setContentsMargins(0, 0, 0, 0)
         self.pixMap = ContourPixelMap()
         self.pixMap.setMinimumWidth(320)
@@ -4027,7 +5848,40 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self.frameFitLbl.setWordWrap(True)
         self.frameFitLbl.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
         self.frameFitLbl.setTextFormat(QtCore.Qt.RichText)
-        mh.addWidget(self.frameFitLbl, 2)
+        # spectral view: time-resolved spectrum image + spectrum at the time cursor
+        specW = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.specMap = XMapPlot("inferno")
+        self.specMap.marker.setVisible(False)
+        self._specCursor = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#06b6d4", width=1.3))
+        self._specCursor.setZValue(12)
+        self.specMap.plot.addItem(self._specCursor)
+        self._specLineItems: list = []
+        specW.addWidget(self.specMap)
+        sr = QtWidgets.QWidget()
+        srv = QtWidgets.QVBoxLayout(sr)
+        srv.setContentsMargins(0, 0, 0, 0)
+        self.specPlot = pg.PlotWidget()
+        _style(self.specPlot.getPlotItem(), "Counts − background", "Wavelength (nm)")
+        self._specPts = pg.PlotDataItem(pen=pg.mkPen("#1f77b4", width=1.6), symbol="o", symbolSize=6,
+                                        symbolBrush="#1f77b4", symbolPen=None)
+        self._specFit = pg.PlotDataItem(pen=pg.mkPen("#dc2626", width=1.6, style=QtCore.Qt.DashLine))
+        self.specPlot.addItem(self._specPts)
+        self.specPlot.addItem(self._specFit)
+        self._specMarks: list = []
+        srv.addWidget(self.specPlot, 1)
+        self.specLbl = QtWidgets.QLabel("")
+        self.specLbl.setWordWrap(True)
+        self.specLbl.setTextFormat(QtCore.Qt.RichText)
+        srv.addWidget(self.specLbl)
+        specW.addWidget(sr)
+        specW.setStretchFactor(0, 3)
+        specW.setStretchFactor(1, 2)
+        self.midStack = QtWidgets.QStackedWidget()
+        self.midStack.addWidget(self.frameFitLbl)
+        self.midStack.addWidget(specW)
+        mh.addWidget(self.midStack, 2)
+        self._midLay = mh
+        mv.addLayout(mh, 1)
         split.addWidget(mid)
 
         bot = QtWidgets.QWidget()
@@ -4057,9 +5911,85 @@ class DualGateViewer(QtWidgets.QMainWindow):
         for it in (self._traceRegion, self._traceRef, self._traceCursor):
             self.tracePlot.addItem(it)
         self.tracePlot.addItem(self._traceBg)
-        bv.addWidget(self.tracePlot, 1)
+        botSplit = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        botSplit.addWidget(self.tracePlot)
+        # spectral view: 1D Gaussian width along the active line → profile map + σ²(t)
+        self.lineFitW = QtWidgets.QWidget()
+        lw = QtWidgets.QVBoxLayout(self.lineFitW)
+        lw.setContentsMargins(0, 0, 0, 0)
+        lw.setSpacing(2)
+        self.lineCtlW = QtWidgets.QWidget()           # in the row above the decay plot (spectral view only)
+        lrow = QtWidgets.QHBoxLayout(self.lineCtlW)
+        lrow.setContentsMargins(0, 0, 0, 0)
+        self.lineProfCombo = QtWidgets.QComboBox()
+        self.lineProfCombo.addItems(["Fitted Gaussian", "Measured counts"])
+        self.lineProfCombo.setToolTip("Fitted: A·exp(−d²/2σ²) of each frame's 1D fit (offset left out).\n"
+                                      "Measured: the line's background-subtracted counts against the distance "
+                                      "from that frame's fitted centre (linear between pixels).")
+        self.lineProfNorm = QtWidgets.QCheckBox("Normalize each time")
+        self.lineProfNorm.setToolTip("Fitted: exp(−d²/2σ²); measured: (counts − offset) / A, so the fitted peak = 1")
+        self.lineProfRSpin = _dspin(0.0, 100000.0, 0.0, 1, 10.0, " µm", width=90)
+        self.lineProfRSpin.setSpecialValueText("auto")
+        self.lineProfRSpin.setToolTip("Fix the profile map's x axis to −max … +max (µm). 0 = auto.")
+        st = _settings()
+        try:
+            self.lineProfCombo.setCurrentIndex(int(st.value("spectral/prof_mode", 1)))
+            self.lineProfNorm.setChecked(str(st.value("spectral/prof_norm", "true")).lower() == "true")
+            self.lineProfRSpin.setValue(float(st.value("spectral/prof_r_max", 0.0)))
+        except (TypeError, ValueError):
+            pass
+        lrow.addWidget(QtWidgets.QLabel("Profile"))
+        lrow.addWidget(self.lineProfCombo)
+        lrow.addWidget(self.lineProfNorm)
+        lrow.addWidget(QtWidgets.QLabel("x max ±"))
+        lrow.addWidget(self.lineProfRSpin)
+        self.lineFreeOffCheck = QtWidgets.QCheckBox("Free offset (≥ 7 px)")
+        self.lineFreeOffCheck.setToolTip(
+            "1D fit of the active line: offset fitted (only on lines with ≥ 7 enabled pixels) instead of held at 0\n"
+            "after the background subtraction (as spad93's column fits). Steps of the sequential fit limit the\n"
+            "offset to ±25 % per frame, so most frames end up flagged with it free.")
+        self.lineFreeOffCheck.setChecked(str(st.value("spectral/free_offset", "false")).lower() == "true")
+        lrow.addWidget(self.lineFreeOffCheck)
+        lrow.addSpacing(16)
+        brow.insertWidget(1, self.lineCtlW)
+        self.lineCtlW.setVisible(False)
+        lsplit = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.lineProfMap = XMapPlot("inferno")
+        self.lineProfMap.marker.setVisible(False)
+        self._lineProfPlus = pg.PlotDataItem(pen=pg.mkPen("w", width=1.8), connect="finite")
+        self._lineProfMinus = pg.PlotDataItem(pen=pg.mkPen("w", width=1.8), connect="finite")
+        self._lineProfCursor = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#06b6d4", width=1.2))
+        for it in (self._lineProfPlus, self._lineProfMinus, self._lineProfCursor):
+            it.setZValue(15)
+            self.lineProfMap.plot.addItem(it)
+        lsplit.addWidget(self.lineProfMap)
+        self.lineSigPlot = pg.PlotWidget()
+        _style(self.lineSigPlot.getPlotItem(), "σ² (µm²)", "Time (ns)")
+        self._lineSigGood = pg.ScatterPlotItem(size=6, pen=pg.mkPen("#1f77b4"), brush=pg.mkBrush("#1f77b4"))
+        self._lineSigBad = pg.ScatterPlotItem(size=6, pen=pg.mkPen("#1f77b4"), brush=None)
+        self._lineSigLine = pg.PlotDataItem(pen=pg.mkPen("#dc2626", width=2, style=QtCore.Qt.DashLine))
+        self._lineSigSmooth = pg.PlotDataItem(pen=pg.mkPen("#f59e0b", width=2.2))
+        self._lineSigCursor = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#f97316", width=1.2))
+        self._lineSigRef = pg.InfiniteLine(angle=90, movable=False,
+                                           pen=pg.mkPen("#16a34a", width=1.2, style=QtCore.Qt.DashDotLine))
+        for it in (self._lineSigGood, self._lineSigBad, self._lineSigSmooth, self._lineSigLine,
+                   self._lineSigCursor, self._lineSigRef):
+            self.lineSigPlot.addItem(it)
+        lsplit.addWidget(self.lineSigPlot)
+        lw.addWidget(lsplit, 1)
+        self.lineFitLbl = QtWidgets.QLabel("")
+        self.lineFitLbl.setWordWrap(True)
+        self.lineFitLbl.setTextFormat(QtCore.Qt.RichText)
+        lw.addWidget(self.lineFitLbl)
+        botSplit.addWidget(self.lineFitW)
+        botSplit.setStretchFactor(0, 1)
+        botSplit.setStretchFactor(1, 2)
+        self.lineFitW.setVisible(False)
+        bv.addWidget(botSplit, 1)
         split.addWidget(bot)
-        split.setSizes([430, 330, 260])
+        split.setSizes([400, 320, 320])
+        self._pointSplit = split
+        self._view_was_spec = False
         v.addWidget(split)
 
         self.cropApplyBtn.clicked.connect(self._on_apply_crop)
@@ -4073,6 +6003,26 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self.rawCheck.toggled.connect(lambda _c: self._draw_trace())
         self._traceCursor.sigPositionChangeFinished.connect(
             lambda ln: self._set_cursor_time(float(ln.value())))
+        self._specTraceCurves: list = []
+        self.tracePlot.getPlotItem().addLegend(offset=(-8, 8), brush=pg.mkBrush(255, 255, 255, 210),
+                                               pen=pg.mkPen("#9ca3af"))
+        self._wlcal: Optional[WavelengthCal] = None
+        self._wlcal_note = ""
+        self._spec_lines: List[int] = []         # selected spectral lines (the last one = active)
+        self.viewCombo.currentIndexChanged.connect(lambda _i: self._on_view_mode())
+        self.wlcalBtn.clicked.connect(self._on_load_wlcal)
+        self.wlcalClearBtn.clicked.connect(self._on_clear_wlcal)
+        self.specLogCheck.toggled.connect(self._on_spec_log)
+        self.specMap.plot.scene().sigMouseClicked.connect(self._on_spec_map_click)
+        self._line_cache: "OrderedDict" = OrderedDict()    # (path, fit key, line) → (PointDiffusion | None, error)
+        self._line_req = None
+        self._line_text = ""
+        self._line_job = None
+        self._line_pending = None
+        self.lineProfCombo.currentIndexChanged.connect(self._on_line_prof_setting)
+        self.lineProfNorm.toggled.connect(self._on_line_prof_setting)
+        self.lineProfRSpin.valueChanged.connect(self._on_line_prof_setting)
+        self.lineFreeOffCheck.toggled.connect(self._on_line_free_offset)
         return w
 
     def _make_fit_tab(self) -> QtWidgets.QWidget:
@@ -4193,6 +6143,15 @@ class DualGateViewer(QtWidgets.QMainWindow):
         row2.addWidget(QtWidgets.QLabel("Profile map (right of σ_eq²(t)):"))
         row2.addWidget(self.profCombo)
         row2.addWidget(self.profNormCheck)
+        self.profRSpin = _dspin(0.0, 100000.0, 0.0, 1, 10.0, " µm", width=100)
+        self.profRSpin.setSpecialValueText("auto")
+        self.profRSpin.setToolTip("Fix the map's x axis to −max … +max (µm). 0 = auto (fit the data).")
+        try:
+            self.profRSpin.setValue(float(_settings().value("profile/r_max", 0.0)))
+        except (TypeError, ValueError):
+            pass
+        row2.addWidget(QtWidgets.QLabel("x max ±"))
+        row2.addWidget(self.profRSpin)
         row2.addWidget(QtWidgets.QLabel("— white lines: ±σ_eq(t) of the σ² used for the D line"))
         row2.addStretch(1)
         v.addLayout(row2)
@@ -4251,6 +6210,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self._update_ref_info()
         self.profCombo.currentIndexChanged.connect(lambda _i: self._draw_profile_map())
         self.profNormCheck.toggled.connect(lambda _c: self._draw_profile_map())
+        self.profRSpin.valueChanged.connect(self._on_prof_range)
         self.flaggedCheck.toggled.connect(lambda _c: (self._draw_sigma_plot(), self._mark_dep_dirty()))
         return w
 
@@ -4273,6 +6233,15 @@ class DualGateViewer(QtWidgets.QMainWindow):
         row.addWidget(QtWidgets.QLabel("Decay map:"))
         row.addWidget(self.normCheck)
         row.addWidget(self.logColCheck)
+        row.addSpacing(12)
+        self.pickCheck = QtWidgets.QCheckBox("Click picks linecuts")
+        self.pickCheck.setChecked(True)
+        self.pickCheck.setToolTip("On: clicking a column of any map adds it to the linecut plots on the right "
+                                  "(click it again to remove it); Shift+click moves the voltage / power cursor.\n"
+                                  "Off: clicking moves the cursor.")
+        self.clearPicksBtn = QtWidgets.QPushButton("Clear linecuts")
+        row.addWidget(self.pickCheck)
+        row.addWidget(self.clearPicksBtn)
         row.addWidget(self.depInfo, 1)
         v.addLayout(row)
         split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
@@ -4281,11 +6250,56 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self.sigmaMap = XMapPlot("viridis")
         for m in (self.plMap, self.decayMap, self.sigmaMap):
             split.addWidget(m)
-            m.column_clicked.connect(self._on_dep_column_clicked)
-        v.addWidget(split, 1)
+            m.column_clicked.connect(self._on_dep_map_click)
+        # second column: the picked columns as curves
+        self._picks: List[int] = []
+        self._picks_key = None
+        self._pick_lines: Dict[int, list] = {}
+        self._dep_pl = self._dep_decay = self._dep_sig = None
+        right = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.pickPlPlot = pg.PlotWidget()
+        _style(self.pickPlPlot.getPlotItem(), "PL counts", "Photon energy (eV)")
+        self.pickDecayPlot = pg.PlotWidget()
+        _style(self.pickDecayPlot.getPlotItem(), "Counts", "Time (ns)")
+        self.pickSigPlot = pg.PlotWidget()
+        _style(self.pickSigPlot.getPlotItem(), "σ_eq² (µm²)", "Time (ns)")
+        for p in (self.pickPlPlot, self.pickDecayPlot, self.pickSigPlot):
+            p.getPlotItem().addLegend(offset=(-8, 8), brush=pg.mkBrush(255, 255, 255, 210),
+                                      pen=pg.mkPen("#9ca3af"))
+            right.addWidget(p)
+        outer = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        outer.addWidget(split)
+        outer.addWidget(right)
+        outer.setStretchFactor(0, 3)
+        outer.setStretchFactor(1, 2)
+        v.addWidget(outer, 1)
         self.depCombo.currentIndexChanged.connect(lambda _i: self._on_dep_mode_changed())
         self.normCheck.toggled.connect(lambda _c: self._draw_decay_map())
         self.logColCheck.toggled.connect(lambda _c: self._draw_decay_map())
+        self.clearPicksBtn.clicked.connect(self._clear_picks)
+        return w
+
+    def _make_scanfit_tab(self) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(2, 2, 2, 2)
+        row = QtWidgets.QHBoxLayout()
+        fl = QtWidgets.QLabel("Peak fit:")
+        fl.setStyleSheet("font-weight:bold")
+        self.scanFitCtl = PeakFitControls("scanfit", window=True, offset=True)
+        self.scanFitInfo = QtWidgets.QLabel("")
+        self.scanFitInfo.setStyleSheet("color:#555")
+        self.scanFitInfo.setWordWrap(True)
+        row.addWidget(fl)
+        row.addWidget(self.scanFitCtl)
+        row.addWidget(self.scanFitInfo, 1)
+        v.addLayout(row)
+        self.scanFitView = LinecutFitView(self._run, self.scanFitCtl.opts, key="scanfit")
+        self.scanFitView.show_message("Load a scan.")
+        v.addWidget(self.scanFitView, 1)
+        self._scanfit_dirty = True
+        self.scanFitCtl.changed.connect(self.scanFitView.refresh)
+        self.scanFitView.column_clicked.connect(self._on_dep_column_clicked)
         return w
 
     # ══ jobs ═══════════════════════════════════════════════════════════
@@ -4390,16 +6404,35 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"Loaded {model.folder.name}: {model.describe()}", 15000)
 
     def _apply_session(self, model: ScanModel) -> None:
-        ses = model.session
+        ses = dict(model.session)
+        # no session.md (scan still running / aborted): the same values from the .asc header
+        hm = model.meta or {}
+        h_acq, h0, h1, href = (_parse_float(hm, k) for k in ("tcspc_acq_s", "hist_start_ns", "hist_end_ns",
+                                                             "hist_ref_ns"))
+        if "acq_s" not in ses and h_acq is not None and h_acq > 0:
+            ses["acq_s"] = h_acq
+        if "hist_ns" not in ses and h0 is not None and h1 is not None and h1 > h0:
+            ses["hist_ns"] = (h0, h1)
+        if "ref_ns" not in ses and href is not None:
+            ses["ref_ns"] = href
+        if "hist_after_t0" not in ses and "hist_times_after_t0" in hm:
+            ses["hist_after_t0"] = str(hm.get("hist_times_after_t0")).strip().lower() in ("true", "1", "yes")
+        if "ref_auto" not in ses and "hist_ref_auto" in hm:
+            ses["ref_auto"] = str(hm.get("hist_ref_auto")).strip().lower() in ("true", "1", "yes")
         if "hist_ns" in ses:
             self.beginEdit.setText(f"{ses['hist_ns'][0]:g}")
             self.endEdit.setText(f"{ses['hist_ns'][1]:g}")
         else:
             self.beginEdit.setText("")
             self.endEdit.setText("")
-        self.refEdit.setText(f"{ses['ref_ns']:g}" if "ref_ns" in ses else "")
+        align = bool(ses.get("align", True))
+        # reference: empty = time zero + T0_REF_BINS bins (aligned); the GUI's value only if it was set by hand
+        # (older GUIs without the flag: only when the view is not aligned, as before)
+        manual = ses.get("ref_auto") is False or ("ref_auto" not in ses and not align)
+        self.refEdit.setText(f"{ses['ref_ns']:g}" if "ref_ns" in ses and manual else "")
+        self._times_after_t0 = bool(ses.get("hist_after_t0", False))   # older GUIs: raw times
         self.alignCheck.blockSignals(True)
-        self.alignCheck.setChecked(bool(ses.get("align", True)))
+        self.alignCheck.setChecked(align)
         self.alignCheck.blockSignals(False)
         self._acq_s = ses.get("acq_s")
         # dark reference: the newest DARK_TRPL_*.csv the measuring GUI copied into the folder
@@ -4416,6 +6449,23 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self.bgCombo.blockSignals(False)
         self._bg_fallback = False
         self._update_dark_label()
+        # SPAD spectral mode: view from the header, λ-cal = newest WLCAL_*.json in the folder, else the header's
+        meta = model.meta or {}
+        self._wlcal, self._wlcal_note = None, ""
+        cals = sorted(model.folder.glob("WLCAL_*.json"), key=lambda p: p.stat().st_mtime)
+        if cals:
+            try:
+                self._wlcal = load_wlcal_json(cals[-1])
+            except Exception as exc:
+                self._wlcal_note = f"{cals[-1].name}: {exc}"
+        if self._wlcal is None:
+            self._wlcal = wlcal_from_header(meta)
+        self._spec_lines = []
+        self.viewCombo.blockSignals(True)
+        self.viewCombo.setCurrentIndex(1 if str(meta.get("spad_view_mode", "")).strip().lower() == "spectral" else 0)
+        self.viewCombo.blockSignals(False)
+        self._apply_view_layout()
+        self._update_wlcal_label()
         # PL crop and linecut as in the measuring GUI
         meta = model.meta or {}
         crop = tuple(_parse_int(meta, k, d) for k, d in zip(("crop_top", "crop_bottom", "crop_left", "crop_right"),
@@ -4738,6 +6788,8 @@ class DualGateViewer(QtWidgets.QMainWindow):
         r = self._num(self.refEdit)
         if r is not None:
             return r
+        if self.alignCheck.isChecked() and self._times_after_t0 and self._t.size:
+            return float(self._t[t0_ref_index(self._t)])      # time zero + T0_REF_BINS bins
         tr = self._t_range()
         if tr is not None:
             return tr[0]
@@ -4817,7 +6869,9 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self.excluded = set()
         self.exclEdit.setText("")
         self.pixMap.set_geometry(geom)
+        self._spec_lines = []
         self._update_dark_label()
+        self._update_wlcal_label()
 
     def _load_point(self) -> None:
         m = self.model
@@ -4835,6 +6889,10 @@ class DualGateViewer(QtWidgets.QMainWindow):
                 data = self.store.load(path)
                 self._set_geometry(data.geom)
                 self._t, self._c, self._tz, note = point_view(self.store, data, vs)
+                off = view_offset(data.time_ns, self.store.zero_of(data, self._tz, vs.t0_ref)) if vs.align else None
+                # aligned: converted once the sweep's time zero is known (a point's own differs by a few ns)
+                if not vs.align or (off is not None and self._t0_ready):
+                    self._sync_time_frame(off)
                 if vs.smooth is not None:
                     self._c_raw = point_view(self.store, data, ViewSettings(vs.align, vs.t0_ref, vs.rebin))[1]
             except Exception as exc:
@@ -4854,11 +6912,28 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self._update_dark_label()
         self._setup_time_bar()
         self._update_bg()
-        self.pixMap.set_selected({self.sel_pixel}, self.excluded)
+        self.pixMap.set_selected(self._sel_pixels(), self.excluded)
         self._draw_trace()
+        self._draw_spectral()
         self._update_cursor()
         self._draw_sigma_plot()
         self._request_frame_fit()
+
+    def _sync_time_frame(self, off: Optional[float]) -> None:
+        """The view switches between raw times (off None) and times after time zero: move Begin / End / Ref
+        by the offset so they stay on the same data."""
+        after = off is not None
+        if after:
+            self._last_off = off
+        self.refEdit.setPlaceholderText(f"t0+{T0_REF_BINS}" if after else "begin")
+        if after == self._times_after_t0:
+            return
+        d = -float(off) if after else float(self._last_off or 0.0)
+        for e in (self.beginEdit, self.endEdit, self.refEdit):
+            v = self._num(e)
+            if v is not None:
+                e.setText(f"{round(v + d, 6):g}")
+        self._times_after_t0 = after
 
     def _update_bg(self) -> None:
         if not self._t.size:
@@ -4922,14 +6997,19 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self._traceCursor.setValue(t)
         self._sigCursor.setValue(t)
         self._profCursor.setValue(t)
+        self._lineSigCursor.setValue(t)
+        self._lineProfCursor.setValue(t)
+        self._update_line_fit_text()
         self.pixMap.set_values(self._c[i].astype(float) - self._bgv, self.excluded)
         self.pixMap.getPlotItem().setTitle(f"t = {t:.2f} ns, counts − background")
+        self._draw_spec_at_t()
 
     def _on_times_edited(self) -> None:
         if self.model is None:
             return
         self._setup_time_bar()
         self._draw_trace()
+        self._draw_spectral()
         self._update_cursor()
         # the adaptive smoothing kernel depends on the reference time: the counts change too
         self._on_fit_setting_changed(reload_view=self.smoothCombo.currentData() == "adapt")
@@ -4951,6 +7031,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
             self._update_bg()
             self._update_cursor()
             self._draw_trace()
+            self._draw_spectral()
             self._draw_sigma_plot()
             self._request_frame_fit()
         self._mark_dep_dirty()
@@ -5046,6 +7127,16 @@ class DualGateViewer(QtWidgets.QMainWindow):
             self._set_excluded(self.excluded ^ {p})
             return
         self.sel_pixel = p
+        if self._spectral():                     # toggle the pixel's spectral line
+            k = line_of_pixel(self.geom, p)
+            lines = list(self._active_lines())
+            if k in lines and len(lines) > 1:
+                lines.remove(k)
+            elif k not in lines:
+                lines.append(k)
+            self._spec_lines = lines
+            self._spec_lines_changed()
+            return
         self.pixMap.set_selected({p}, self.excluded)
         self._draw_trace()
         self._draw_decay_map()
@@ -5053,7 +7144,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
     def _set_excluded(self, ex: set) -> None:
         self.excluded = set(ex)
         self.exclEdit.setText(", ".join(str(p) for p in sorted(self.excluded)))
-        self.pixMap.set_selected({self.sel_pixel}, self.excluded)
+        self.pixMap.set_selected(self._sel_pixels(), self.excluded)
         self._on_fit_setting_changed()
 
     def _on_excl_edited(self) -> None:
@@ -5068,6 +7159,13 @@ class DualGateViewer(QtWidgets.QMainWindow):
         pi = self.tracePlot.getPlotItem()
         log = self.logCheck.isChecked()
         pi.setLogMode(y=log)
+        if self._spectral():
+            self._traceCurve.setData([], [])
+            self._traceRaw.setData([], [])
+            self._traceBg.setVisible(False)
+            self._draw_spec_traces()
+            return
+        self._draw_spec_traces()                 # removes the spectral curves
         if not self._t.size:
             self._traceCurve.setData([], [])
             self._traceRaw.setData([], [])
@@ -5105,6 +7203,477 @@ class DualGateViewer(QtWidgets.QMainWindow):
         sm = f", {self.smoothCombo.currentText().lower()} smoothed" if raw is not None else ""
         self.traceLbl.setText(f"Pixel {p}{excl}: aligned counts{sm} (not background-subtracted; dashed = "
                               f"background {bg:.3g}/bin). Shaded = begin–end, green = reference.")
+
+    # ── spectral view (the SPAD's centre line on a wavelength axis) ───
+    def _spectral(self) -> bool:
+        return self.viewCombo.currentIndex() == 1
+
+    def _wlcal_ok(self) -> Optional[WavelengthCal]:
+        cal = self._wlcal
+        return cal if cal is not None and not cal.problem(self.geom) else None
+
+    def _spec_x(self) -> Tuple[np.ndarray, str, str]:
+        """(x of every spectral line, axis label, unit): λ (nm) with a calibration, else the line position (µm)."""
+        _w, pos = center_line_weights(self.geom)
+        cal = self._wlcal_ok()
+        if cal is not None:
+            return cal.wavelength(pos), "Wavelength (nm)", "nm"
+        return pos, f"Line position ({'column x' if self.geom.name == 'SPAD93' else 'row y'}, µm)", "µm"
+
+    def _active_lines(self) -> List[int]:
+        n = center_line_weights(self.geom)[1].size
+        lines = [k for k in self._spec_lines if 0 <= k < n]
+        return lines if lines else [line_of_pixel(self.geom, self.geom.center_pixel)]
+
+    def _active_line(self) -> int:
+        return self._active_lines()[-1]
+
+    def _line_label(self, k: int) -> str:
+        x, _xl, unit = self._spec_x()
+        return f"{line_name(self.geom)} {k} ({x[k]:.1f} {unit})"
+
+    def _line_color(self, i: int) -> str:
+        return self.PICK_COLORS[i % len(self.PICK_COLORS)]
+
+    def _sel_pixels(self) -> set:
+        """Pixels ringed on the count map: the selected pixel, or the pixels of the selected spectral lines."""
+        if not self._spectral():
+            return {self.sel_pixel}
+        w, _pos = center_line_weights(self.geom, self.excluded)
+        return {int(p) for k in self._active_lines() for p in np.flatnonzero(np.nan_to_num(w[k]) != 0)}
+
+    def _apply_view_layout(self) -> None:
+        spec = self._spectral()
+        self.midStack.setCurrentIndex(1 if spec else 0)
+        self._midLay.setStretch(0, 2 if spec else 3)
+        self._midLay.setStretch(1, 5 if spec else 2)
+        for w in (self.wlcalBtn, self.wlcalClearBtn, self.specLogCheck, self.wlcalLbl):
+            w.setEnabled(spec)
+        self.lineFitW.setVisible(spec)
+        self.lineCtlW.setVisible(spec)
+        self.traceLbl.setWordWrap(spec)
+        if spec != self._view_was_spec:          # spectral: give the bottom row (decays, profile, σ²) more room
+            self._view_was_spec = spec
+            sp = self._pointSplit
+            tot = sum(sp.sizes()) or 1000
+            sp.setSizes([int(tot * f) for f in ((0.24, 0.36, 0.40) if spec else (0.42, 0.31, 0.27))])
+
+    def _update_wlcal_label(self) -> None:
+        cal = self._wlcal
+        if cal is None:
+            self.wlcalLbl.setText("λ-cal: none (axis = line position in µm)" +
+                                  (f" — {self._wlcal_note}" if self._wlcal_note else ""))
+            self.wlcalLbl.setStyleSheet("color:#555")
+            return
+        why = cal.problem(self.geom)
+        if why:
+            self.wlcalLbl.setText(f"λ-cal not used: {why}")
+            self.wlcalLbl.setStyleSheet("color:#b91c1c")
+        else:
+            self.wlcalLbl.setText("λ-cal " + cal.describe(self.geom))
+            self.wlcalLbl.setStyleSheet("color:#555")
+
+    def _on_view_mode(self) -> None:
+        self._apply_view_layout()
+        self.pixMap.set_selected(self._sel_pixels(), self.excluded)
+        self._draw_frame_fit()
+        self._draw_spectral()
+        self._draw_trace()
+        self._mark_dep_dirty()
+
+    def _on_load_wlcal(self) -> None:
+        start = str(self.model.folder) if self.model else ""
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Wavelength calibration", start,
+                                                      "λ-calibration (WLCAL_*.json *.json)")
+        if not fn:
+            return
+        try:
+            cal = load_wlcal_json(fn)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "λ-calibration", f"{Path(fn).name}: {exc}")
+            return
+        why = cal.problem(self.geom)
+        if why:
+            QtWidgets.QMessageBox.warning(self, "λ-calibration", f"{Path(fn).name}: {why}")
+            return
+        self.set_wlcal(cal)
+
+    def _on_clear_wlcal(self) -> None:
+        self._wlcal_note = "cleared"
+        self.set_wlcal(None)
+
+    def set_wlcal(self, cal: Optional[WavelengthCal]) -> None:
+        self._wlcal = cal
+        self._update_wlcal_label()
+        self._draw_spectral()
+        self._draw_trace()
+        self._mark_dep_dirty()
+
+    def _on_spec_log(self, on: bool) -> None:
+        _settings().setValue("spectral/log_image", bool(on))
+        self._draw_spectral()
+
+    def _spec_lines_changed(self) -> None:
+        self.pixMap.set_selected(self._sel_pixels(), self.excluded)
+        self._draw_spec_markers()
+        self._draw_spec_at_t()
+        self._draw_trace()
+        self._request_line_fit()
+        self._draw_decay_map()
+        if self.tabs.currentIndex() == 3:
+            self._draw_picks()
+
+    def _on_spec_click(self, k: int, t: Optional[float] = None, remove: bool = False) -> None:
+        """Click on the spectral image column k (sorted order): that line becomes the active one (``remove``
+        = Ctrl+click: drop it) and the time cursor moves to ``t``."""
+        order = getattr(self, "_spec_order", None)
+        if order is None or not (0 <= k < order.size):
+            return
+        line = int(order[k])
+        lines = list(self._active_lines())
+        if remove:
+            if line in lines and len(lines) > 1:
+                lines.remove(line)
+        else:
+            if line in lines:
+                lines.remove(line)
+            lines.append(line)
+        self._spec_lines = lines
+        if t is not None:
+            self._set_cursor_time(t)
+        self._spec_lines_changed()
+
+    def _on_spec_map_click(self, ev) -> None:
+        mp = self.specMap
+        vb = mp.plot.getViewBox()
+        if mp._x is None or ev.button() != QtCore.Qt.LeftButton or not vb.sceneBoundingRect().contains(ev.scenePos()):
+            return
+        pt = vb.mapSceneToView(ev.scenePos())
+        k = int(np.argmin(np.abs(mp._x - pt.x())))
+        ctrl = bool(QtWidgets.QApplication.keyboardModifiers() & QtCore.Qt.ControlModifier)
+        self._on_spec_click(k, float(pt.y()), remove=ctrl)
+
+    def _draw_spectral(self) -> None:
+        """Time-resolved spectrum image (x = λ or line position, y = time over Begin–End)."""
+        if not self._spectral():
+            return
+        mp = self.specMap
+        self._spec_order = None
+        self._request_line_fit()
+        if not self._t.size:
+            mp.show_message("No TRPL data at this point.", "Time-resolved spectrum")
+            self._draw_spec_markers()
+            self._draw_spec_at_t()
+            return
+        r0, r1 = self._range_idx()
+        S = spectral_matrix(self._c[r0:r1 + 1], self._bgv, self.geom, self.excluded)
+        x, xl, _unit = self._spec_x()
+        order = np.argsort(x)
+        self._spec_order = order
+        z = S[:, order]
+        log = self.specLogCheck.isChecked()
+        if log:
+            with np.errstate(invalid="ignore"):
+                z = np.log10(1.0 + np.clip(z, 0, None))
+        what = "log10(1 + counts − background)" if log else "counts − background"
+        mp.set_data(x[order], self._t[r0:r1 + 1], z, x_label=xl, y_label="Time (ns)",
+                    title=f"Time-resolved spectrum ({what}; {self.geom.name} centre line)")
+        self._draw_spec_markers()
+        self._draw_spec_at_t()
+
+    def _draw_spec_markers(self) -> None:
+        for it in self._specLineItems:
+            self.specMap.plot.removeItem(it)
+        for it in self._specMarks:
+            self.specPlot.removeItem(it)
+        self._specLineItems, self._specMarks = [], []
+        if not self._spectral() or not self._t.size:
+            return
+        x, _xl, _u = self._spec_x()
+        for i, k in enumerate(self._active_lines()):
+            pen = pg.mkPen(self._line_color(i), width=2, style=QtCore.Qt.DashLine)
+            if self.specMap._x is not None:
+                ln = pg.InfiniteLine(pos=float(x[k]), angle=90, movable=False, pen=pen)
+                ln.setZValue(11)
+                self.specMap.plot.addItem(ln)
+                self._specLineItems.append(ln)
+            mk = pg.InfiniteLine(pos=float(x[k]), angle=90, movable=False, pen=pen)
+            self.specPlot.addItem(mk)
+            self._specMarks.append(mk)
+
+    def _draw_spec_at_t(self) -> None:
+        """Spectrum at the time cursor + its maximum and a Gaussian fit (centre, FWHM)."""
+        if not self._spectral():
+            return
+        i = self._ti()
+        pi = self.specPlot.getPlotItem()
+        if i is None:
+            self._specPts.setData([], [])
+            self._specFit.setData([], [])
+            self.specLbl.setText("")
+            pi.setTitle("")
+            return
+        t = float(self._t[i])
+        self._specCursor.setValue(t)
+        s = spectral_matrix(self._c[i:i + 1], self._bgv, self.geom, self.excluded)[0]
+        x, xl, unit = self._spec_x()
+        order = np.argsort(x)
+        xs, ys = x[order], s[order]
+        self._specPts.setData(xs, ys, connect="finite")
+        pi.setLabel("bottom", xl)
+        pi.setTitle(f"Spectrum at t = {t:.2f} ns")
+        fin = np.isfinite(ys)
+        if not fin.any():
+            self._specFit.setData([], [])
+            self.specLbl.setText("no usable line at this time")
+            return
+        km = int(np.nanargmax(np.where(fin, ys, -np.inf)))
+        text = f"Maximum {ys[km]:.4g} at <b>{xs[km]:.1f} {unit}</b> ({line_name(self.geom)} {int(order[km])})"
+        dx = float(np.median(np.abs(np.diff(xs)))) if xs.size > 1 else 1.0
+        res = fit_peak(xs, ys, PeakFitOpts(SHAPE_GAUSS, float(xs.min()), float(xs.max()), width0=1.5 * dx))
+        if res is not None and res["at_bound"] == [] and np.isfinite(res["fwhm"]):
+            xx = np.linspace(xs.min(), xs.max(), 400)
+            self._specFit.setData(xx, peak_curve(res, xx))
+            text += (f"<br>Gaussian: centre <b>{res['E0']:.1f} ± {_fmt(res['E0_err'], '.2g')} {unit}</b>, "
+                     f"FWHM {res['fwhm']:.1f} {unit}, R² {_fmt(res['r2'], '.3f')}")
+        else:
+            self._specFit.setData([], [])
+            text += "<br>Gaussian fit: none (peak at the edge, too few lines or no signal)"
+        text += f"<br><span style='color:#555'>Background: {self._bg_note}</span>"
+        self.specLbl.setText(text)
+
+    def _draw_spec_traces(self) -> None:
+        """Bottom plot in the spectral view: the decay of every selected line (background subtracted)."""
+        pi = self.tracePlot.getPlotItem()
+        for it in self._specTraceCurves:
+            pi.removeItem(it)
+        self._specTraceCurves = []
+        if not self._spectral() or not self._t.size:
+            return
+        log = self.logCheck.isChecked()
+        S = spectral_matrix(self._c, self._bgv, self.geom, self.excluded)
+        r0, r1 = self._range_idx()
+        lo, hi = np.inf, -np.inf
+        for i, k in enumerate(self._active_lines()):
+            y = S[:, k]
+            if log:
+                y = np.clip(y, 0.5, None)
+            it = pi.plot(self._t, y, pen=pg.mkPen(self._line_color(i), width=1.4), name=self._line_label(k),
+                         connect="finite")
+            self._specTraceCurves.append(it)
+            seg = y[r0:r1 + 1]
+            if np.isfinite(seg).any():
+                lo, hi = min(lo, float(np.nanmin(seg))), max(hi, float(np.nanmax(seg)))
+        t0, t1 = float(self._t[r0]), float(self._t[r1])
+        self._traceRegion.setRegion((t0, t1))
+        self._traceRef.setValue(self._ref_ns())
+        pad = 0.02 * max(t1 - t0, 1e-9)
+        pi.setXRange(t0 - pad, t1 + pad, padding=0)
+        if np.isfinite(lo) and np.isfinite(hi):
+            if log:
+                pi.setYRange(np.log10(max(lo, 0.5)), np.log10(max(hi, 1.0)) + 0.1, padding=0)
+            else:
+                pi.setYRange(lo, hi + 0.05 * (hi - lo + 1), padding=0)
+        sm = f", {self.smoothCombo.currentText().lower()} smoothed" if getattr(self, "_c_raw", None) is not None else ""
+        self.traceLbl.setText(f"Spectral lines (centre line{sm}; background: {self._bg_note}). Click a pixel / the "
+                              f"image adds a line, Ctrl+click removes; the last one is fitted (right).")
+
+    # ── spectral view: 1D Gaussian width along the active line (profile map + σ²(t)) ──
+    def _cross_name(self) -> str:
+        return "y" if self.geom.name == "SPAD93" else "x"
+
+    def _line_fit_req(self):
+        if not self._spectral() or self._path is None or not self._t.size:
+            return None
+        return (self._path, self._fit_settings().key(), int(self._active_line()), self.lineFreeOffCheck.isChecked())
+
+    def _on_line_free_offset(self, on: bool) -> None:
+        _settings().setValue("spectral/free_offset", bool(on))
+        self._request_line_fit()
+
+    def _request_line_fit(self) -> None:
+        """Fit the active line (background job, cached per point / settings / line) and redraw."""
+        if not hasattr(self, "_line_cache"):
+            return
+        req = self._line_fit_req()
+        self._line_req = req
+        if req is None or req in self._line_cache:
+            self._line_pending = None
+            self._draw_line_fit()
+            return
+        self._line_pending = (req, self._t, self._c, self._fit_settings(), int(req[2]), bool(req[3]))
+        if self._line_job is not None:
+            self._line_job.cancel()                 # its done handler starts the pending fit
+        else:
+            self._start_line_job()
+        self._draw_line_fit()
+
+    def _start_line_job(self) -> None:
+        if self._line_job is not None or self._line_pending is None:
+            return
+        req, t, c, s, line, free_off = self._line_pending
+        self._line_pending = None
+
+        def work(_progress, cancelled):
+            res = fit_line_x(t, c, s, line, free_off, cancelled)
+            return res, bool(cancelled())
+
+        self._line_job = self._run(work, lambda res, err: self._on_line_fit_done(req, res, err))
+
+    def _on_line_fit_done(self, req, res, err: str) -> None:
+        self._line_job = None
+        if err:
+            self._line_cache[req] = (None, err)
+        elif res is not None and not res[1]:
+            self._line_cache[req] = (res[0], "")
+        while len(self._line_cache) > 200:
+            self._line_cache.popitem(last=False)
+        if req == self._line_req:
+            self._draw_line_fit()
+        self._start_line_job()
+
+    def _line_fit(self) -> Optional[PointDiffusion]:
+        req = getattr(self, "_line_req", None)
+        e = self._line_cache.get(req) if req is not None else None
+        return None if e is None else e[0]
+
+    def _on_line_prof_setting(self, *_a) -> None:
+        st = _settings()
+        st.setValue("spectral/prof_mode", int(self.lineProfCombo.currentIndex()))
+        st.setValue("spectral/prof_norm", bool(self.lineProfNorm.isChecked()))
+        st.setValue("spectral/prof_r_max", float(self.lineProfRSpin.value()))
+        self._draw_line_fit()
+
+    def _draw_line_fit(self) -> None:
+        """Spectral view, bottom right: σ²(t) of the active line's 1D fits (+ the D line with tab 3's settings)
+        and the profile along the line vs time."""
+        if not hasattr(self, "_line_cache") or not self._spectral():
+            return
+        mp, pi = self.lineProfMap, self.lineSigPlot.getPlotItem()
+        for it in (self._lineSigGood, self._lineSigBad):
+            it.setData([])
+        for it in (self._lineSigLine, self._lineSigSmooth, self._lineProfPlus, self._lineProfMinus):
+            it.setData([], [])
+        self._line_text = ""
+        req = self._line_req
+        if req is None:
+            mp.show_message("No TRPL data at this point.", "Profile along the line")
+            pi.setTitle("σ²(t)")
+            self.lineFitLbl.setText("")
+            return
+        name, ax = self._line_label(req[2]), self._cross_name()
+        e = self._line_cache.get(req)
+        f = None if e is None else e[0]
+        if f is None:
+            msg = f"Fit of {name} failed: {e[1]}" if e is not None else f"Fitting {name} …"
+            mp.show_message(msg, f"Profile along {name}")
+            pi.setTitle(f"σ²(t) of {name}")
+            self.lineFitLbl.setText(msg)
+            return
+        # σ²(t)
+        good = ~f.flagged
+        self._lineSigGood.setData(f.t_ns[good], f.sigma2[good])
+        self._lineSigBad.setData(f.t_ns[~good], f.sigma2[~good])
+        self._lineSigRef.setValue(f.ref_ns)
+        r0, r1 = self._range_idx()
+        pad = 0.02 * max(float(self._t[r1] - self._t[r0]), 1e-9)
+        pi.setXRange(float(self._t[r0]) - pad, float(self._t[r1]) + pad, padding=0)
+        sg = self._sg_spec()
+        s0_fixed = float(f.sigma2[0]) if self.s0FixCheck.isChecked() and f.sigma2.size else None
+        ln, factor, _sm = d_line(f, self._line_window(), self.flaggedCheck.isChecked(), sg, self._corr_for(f),
+                                 s0_fixed)
+        s2c = self._contour_s2(f)
+        if sg is not None:
+            self._lineSigSmooth.setData(f.t_ns, s2c, connect="finite")
+        good_s2 = f.sigma2[good] if good.any() else f.sigma2
+        if good_s2.size:
+            lo, hi = np.percentile(good_s2, [1, 99])
+            if hi > lo:
+                pi.setYRange(lo - 0.1 * (hi - lo), hi + 0.1 * (hi - lo), padding=0)
+        pi.setTitle(f"σ²(t) along {ax}, {name}")
+        n_px = line_pixels(self.geom, req[2], self.excluded)[0].size
+        text = (f"<b>{name}</b>: 1D Gaussian along {ax} ({n_px} pixels), {f.t_ns.size} frames fitted from "
+                f"{f.ref_ns:.2f} ns ({int(f.flagged.sum())} flagged = hollow), {f.failures} failed.  ")
+        if ln is None:
+            text += "Fewer than 3 usable frames in the D line window."
+        else:
+            w0, w1 = self._line_window()
+            rel = f.t_ns - f.ref_ns
+            hi_t = float(rel.max()) if w1 is None else min(w1, float(rel.max()))
+            xx = np.array([w0, hi_t])
+            self._lineSigLine.setData(xx + f.ref_ns, ln["s0"] + ln["slope"] * xx)
+            corr = f", errors × {factor:.2f}" if factor > 1.0 + 1e-9 else ""
+            text += (f"<b>D = {ln['D']:.3g} ± {ln['D_err']:.2g} cm²/s</b> (σ² = σ₀² + 2D(t − t_ref){corr}; "
+                     f"σ₀² = {ln['s0']:.3g} µm², {ln['n']} frames; D window / σ² smoothing / flagged as in tab 3)")
+        if f.note:
+            text += f"  [{f.note}]"
+        self._line_text = text
+        self._draw_line_profile(f, s2c, req[2], name)
+        self._update_line_fit_text()
+
+    def _draw_line_profile(self, f: PointDiffusion, s2c: np.ndarray, line: int, name: str) -> None:
+        mp = self.lineProfMap
+        r0, r1 = self._range_idx()
+        t = self._t[r0:r1 + 1]
+        spans = self._fit_spans(f)
+        inside = (spans[:, 1] >= r0) & (spans[:, 0] <= r1) & (spans[:, 1] < self._t.size)
+        use = np.isfinite(f.sigma2) & (True if self.flaggedCheck.isChecked() else ~f.flagged) & inside
+        if not use.any():
+            mp.show_message("No usable fitted frames in the time range.", f"Profile along {name}")
+            return
+        ids, xc = line_pixels(self.geom, line, self.excluded)
+        P = f.popt
+        d = xc[None, :] - P[:, 1:2]                      # signed distance from each frame's fitted centre
+        R_fix = float(self.lineProfRSpin.value())
+        R = R_fix if R_fix > 0 else float(max(np.abs(d[use]).max(), 3.0 * np.sqrt(P[use, 2].max() ** 2)))
+        x = np.linspace(-R, R, 241)
+        z = np.full((t.size, x.size), np.nan)
+        measured = self.lineProfCombo.currentIndex() == 1
+        norm = self.lineProfNorm.isChecked()
+        for k in np.flatnonzero(use):
+            A, s, off = float(P[k, 0]), float(P[k, 2]), float(P[k, 3])
+            i0, i1 = int(spans[k, 0]), int(spans[k, 1])
+            if measured:
+                zz = self._c[i0:i1 + 1][:, ids].astype(np.float64).mean(axis=0) - self._bgv[ids]
+                row = np.interp(x, d[k], zz, left=np.nan, right=np.nan)
+                if norm:
+                    row = (row - off) / A if A > 0 else row * np.nan
+            else:
+                gauss = np.exp(-x ** 2 / (2.0 * s ** 2))
+                row = gauss if norm else A * gauss
+            z[max(i0, r0) - r0:min(i1, r1) - r0 + 1] = row
+        what = "measured counts" if measured else "fitted Gaussian"
+        mp.set_data(x, t, z, x_label=f"{self._cross_name()} − fitted centre (µm)", y_label="Time (ns)",
+                    levels=(0.0, 1.0) if norm else None,
+                    title=f"Profile along {name} ({what}{', normalized' if norm else ''})")
+        if R_fix > 0:
+            mp.plot.setXRange(-R_fix, R_fix, padding=0.0)
+        sc = np.where(inside, np.sqrt(np.clip(s2c, 0, None)), np.nan)
+        self._lineProfPlus.setData(sc, f.t_ns, connect="finite")
+        self._lineProfMinus.setData(-sc, f.t_ns, connect="finite")
+        if self._t_cursor is not None:
+            self._lineProfCursor.setValue(self._t_cursor)
+
+    def _update_line_fit_text(self) -> None:
+        """The line fit's summary + its fit at the time cursor."""
+        if not hasattr(self, "_line_cache") or not self._spectral() or self._line_req is None:
+            return
+        f = self._line_fit()
+        if f is None:
+            return
+        i = self._ti()
+        extra = ""
+        if i is not None:
+            spans = self._fit_spans(f)
+            k = np.flatnonzero((spans[:, 0] <= i) & (i <= spans[:, 1]))
+            if k.size:
+                A, c, s, off = (float(v) for v in f.popt[k[0]])
+                flag = " <span style='color:#b45309'>(flagged)</span>" if f.flagged[k[0]] else ""
+                extra = (f"At t = {self._t[i]:.2f} ns: {self._cross_name()}₀ = {c:.1f} µm, <b>σ = {s:.2f} µm</b> "
+                         f"(σ² = {s * s:.4g} µm²), A = {A:.4g}, offset {off:.3g}{flag}")
+            else:
+                extra = f"At t = {self._t[i]:.2f} ns: no fitted frame (before the reference or a failed fit)"
+        self.lineFitLbl.setText(self._line_text + ("<br>" + extra if extra else ""))
 
     # ── 2D fit of the frame at the time cursor (contours + radial) ────
     def _valid_fit(self, pt) -> Optional[PointDiffusion]:
@@ -5183,7 +7752,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
     def _draw_frame_fit(self, msg: Optional[str] = None) -> None:
         res = self._frame_res
         i = self._ti()
-        self.pixMap.set_contours(None if res is None else res["popt"])
+        self.pixMap.set_contours(None if res is None or self._spectral() else res["popt"])
         if res is None:
             self.frameFitLbl.setText(msg or ("" if i is not None else "No TRPL data at this point."))
             self._radPts.setData([])
@@ -5362,6 +7931,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
                                  "Not fitted. ") + "Click 'Fit this point', or 'Fit all' for the whole sweep line.")
             pi.setTitle("σ_eq²(t)")
             self._draw_profile_map()
+            self._draw_line_fit()
             return
         good = ~f.flagged
         self._sigGood.setData(f.t_ns[good], f.sigma2[good])
@@ -5403,6 +7973,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
                 pi.setYRange(lo - 0.1 * (hi - lo), hi + 0.1 * (hi - lo), padding=0)
         pi.setTitle(f"σ_eq²(t) at {self._point_text(self._b)}")
         self._draw_profile_map()
+        self._draw_line_fit()
 
     def _corr_for(self, f: PointDiffusion) -> float:
         """Trace-smoothing correlation length in fitted frames: bins ÷ the mean group size in the D window."""
@@ -5431,6 +8002,10 @@ class DualGateViewer(QtWidgets.QMainWindow):
         s2s, ok = sg_sigma2(f.t_ns, f.sigma2, use, sg[0], sg[1], f.t_ns)
         return np.where(ok, s2s, np.nan)
 
+    def _on_prof_range(self, v: float) -> None:
+        _settings().setValue("profile/r_max", float(v))
+        self._draw_profile_map()
+
     def _draw_profile_map(self) -> None:
         """Tab 3, right: radial profile vs time from the sequential fit of this point, ±σ_eq(t) lines."""
         mp = self.profMap
@@ -5453,7 +8028,8 @@ class DualGateViewer(QtWidgets.QMainWindow):
         P = f.popt
         sig2 = (P[:, 3] ** 2 + P[:, 4] ** 2) / 2.0
         dist = np.hypot(g.x_um[mask][None, :] - P[:, 1:2], g.y_um[mask][None, :] - P[:, 2:3])
-        R = float(max(dist[use].max(), 3.0 * np.sqrt(sig2[use].max())))
+        R_fix = float(self.profRSpin.value())
+        R = R_fix if R_fix > 0 else float(max(dist[use].max(), 3.0 * np.sqrt(sig2[use].max())))
         x = np.linspace(-R, R, 241)
         z = np.full((t.size, x.size), np.nan)
         measured = self.profCombo.currentIndex() == 1
@@ -5476,6 +8052,8 @@ class DualGateViewer(QtWidgets.QMainWindow):
         mp.set_data(x, t, z, x_label="Distance from the fitted centre (µm)", y_label="Time (ns)",
                     levels=(0.0, 1.0) if norm else None,
                     title=f"Radial profile ({what}{', normalized each time' if norm else ''})")
+        if R_fix > 0:
+            mp.plot.setXRange(-R_fix, R_fix, padding=0.0)
         s2c = self._contour_s2(f)
         sc = np.where(inside, np.sqrt(np.clip(s2c, 0, None)), np.nan)
         self._profPlus.setData(sc, f.t_ns, connect="finite")
@@ -5516,6 +8094,11 @@ class DualGateViewer(QtWidgets.QMainWindow):
             x = float(pts.index(cur)) if cur in pts else None
         for mp in (self.plMap, self.decayMap, self.sigmaMap):
             mp.set_marker(x)
+        if not self._scanfit_dirty and self.scanFitView.has_data():
+            pts = self._line()[0]
+            cur = (self._pi, self._b)
+            if cur in pts:
+                self.scanFitView.select_column(pts.index(cur))
 
     def _on_dep_column_clicked(self, k: int) -> None:
         pts = self._line()[0]
@@ -5527,18 +8110,128 @@ class DualGateViewer(QtWidgets.QMainWindow):
         else:
             self.powerBar.setValue(int(np.flatnonzero(self._porder == pi)[0]))
 
+    # ── tab 4, second column: picked linecuts ──────────────────────────
+    PICK_COLORS = ("#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b", "#e377c2",
+                   "#17becf", "#bcbd22", "#7f7f7f")
+
+    def _on_dep_map_click(self, k: int) -> None:
+        shift = bool(QtWidgets.QApplication.keyboardModifiers() & QtCore.Qt.ShiftModifier)
+        if not self.pickCheck.isChecked() or shift:
+            self._on_dep_column_clicked(k)
+            return
+        if k in self._picks:
+            self._picks.remove(k)
+        else:
+            self._picks.append(k)
+        self._draw_picks()
+
+    def _decay_source(self) -> str:
+        """What tab 4's decays show: the selected pixel, or (spectral view) the active spectral line."""
+        if self._spectral():
+            return f"spectral {self._line_label(self._active_line())}"
+        return f"pixel {int(self.sel_pixel)}"
+
+    def _clear_picks(self) -> None:
+        self._picks = []
+        self._draw_picks()
+
+    def _draw_picks(self) -> None:
+        """Curves of the picked sweep columns next to the tab-4 maps + coloured lines on the maps."""
+        if self.model is not None:
+            _pts, x, xl, _ctx = self._line()
+        else:
+            x, xl = np.zeros(0), ""
+        self._picks = [k for k in self._picks if k < x.size]
+        mu = re.search(r"\(([^()]*)\)\s*$", xl)
+        unit = f" {mu.group(1)}" if mu else ""
+        name = xl[:mu.start()].strip() if mu else xl
+        labels = {k: f"{_fmt(x[k])}{unit}" for k in self._picks}
+        colors = {k: self.PICK_COLORS[i % len(self.PICK_COLORS)] for i, k in enumerate(self._picks)}
+        # lines on the maps
+        for mp in (self.plMap, self.decayMap, self.sigmaMap):
+            for ln in self._pick_lines.pop(id(mp), []):
+                mp.plot.removeItem(ln)
+            lines = []
+            if mp._x is not None:
+                for k in self._picks:
+                    if k < mp._x.size:
+                        ln = pg.InfiniteLine(pos=float(mp._x[k]), angle=90, movable=False,
+                                             pen=pg.mkPen(colors[k], width=2, style=QtCore.Qt.DashLine))
+                        ln.setZValue(12)
+                        mp.plot.addItem(ln)
+                        lines.append(ln)
+            self._pick_lines[id(mp)] = lines
+        hint = "click map columns to add linecuts" if not self._picks else name
+
+        def reset(pw, title):
+            pi = pw.getPlotItem()
+            pi.clear()
+            if pi.legend is not None:
+                pi.legend.clear()
+            pi.setTitle(title)
+            return pi
+
+        # PL spectra
+        pi = reset(self.pickPlPlot, f"PL spectrum — {hint}")
+        if self._dep_pl is not None:
+            y, z, yl = self._dep_pl
+            pi.setLabel("bottom", yl)
+            for k in self._picks:
+                if k < z.shape[1]:
+                    pi.plot(y, z[:, k], pen=pg.mkPen(colors[k], width=2), name=labels[k], connect="finite")
+        elif self._picks:
+            pi.setTitle("PL spectrum — no PL map")
+        # decay at the selected pixel
+        norm, log = self.normCheck.isChecked(), self.logColCheck.isChecked()
+        pi = reset(self.pickDecayPlot, f"Decay of {self._decay_source()} — {hint}")
+        pi.setLogMode(x=False, y=log)
+        pi.setLabel("left", ("Normalized counts" if norm else "Counts"))
+        if self._dep_decay is not None:
+            t, z = self._dep_decay
+            for k in self._picks:
+                if k >= z.shape[1]:
+                    continue
+                col = z[:, k].astype(float)
+                with np.errstate(all="ignore"):
+                    if norm:
+                        mx = np.nanmax(col) if np.isfinite(col).any() else np.nan
+                        col = col / mx if mx > 0 else col * np.nan
+                    if log:
+                        col = np.clip(col, 1e-3 if norm else 0.5, None)
+                fin = np.isfinite(col)
+                pi.plot(t[fin], col[fin], pen=None, symbol="o", symbolSize=3, symbolPen=None,
+                        symbolBrush=colors[k], name=labels[k])
+        elif self._picks:
+            pi.setTitle("Decay — TRPL not loaded yet")
+        # σ_eq²(t)
+        pi = reset(self.pickSigPlot, f"σ_eq²(t) — {hint}")
+        if self._dep_sig is not None:
+            for k in self._picks:
+                if k < len(self._dep_sig) and self._dep_sig[k] is not None and self._dep_sig[k][0].size:
+                    tp, s2p = self._dep_sig[k]
+                    pi.plot(tp, s2p, pen=None, symbol="o", symbolSize=5, symbolPen=None,
+                            symbolBrush=colors[k], name=labels[k])
+        elif self._picks:
+            pi.setTitle("σ_eq²(t) — run 'Fit all' in tab 3")
+
     def _on_dep_mode_changed(self) -> None:
+        self._picks = []
         self._mark_dep_dirty()
 
     def _on_tab_changed(self, idx: int) -> None:
         self.bar.setVisible(idx != 0)
         if idx == 3 and self._dep_dirty:
             self._redraw_dep()
+        if idx == 4 and self._scanfit_dirty:
+            self._redraw_scanfit()
 
     def _mark_dep_dirty(self) -> None:
         self._dep_dirty = True
+        self._scanfit_dirty = True
         if self.tabs.currentIndex() == 3:
             self._redraw_dep()
+        elif self.tabs.currentIndex() == 4:
+            self._redraw_scanfit()
 
     def _redraw_dep(self) -> None:
         self._dep_dirty = False
@@ -5548,23 +8241,27 @@ class DualGateViewer(QtWidgets.QMainWindow):
             return
         pts, x, xl, ctx = self._line()
         self._drawn_line = tuple(pts)
+        key = (str(self.model.folder), self._dep_mode(), len(pts))
+        if key != self._picks_key:            # another scan / sweep kind: the picked columns mean nothing now
+            self._picks, self._picks_key = [], key
         self.depInfo.setText(f"{len(pts)} points: {ctx}")
         self._draw_pl_map()
         self._draw_decay_map()
         self._draw_sigma_map()
         self._update_dep_markers()
+        self._draw_picks()
 
-    def _draw_pl_map(self) -> None:
+    def _line_pl_columns(self):
+        """PL linecuts of the current sweep line, resampled onto the first frame's wavelength axis:
+        (pts, x, x label, context, wl, columns (n_wl, n_pts), has wavelength, CCD row, width), or a message."""
         m = self.model
         pts, x, xl, ctx = self._line()
         if not m.has_pl:
-            self.plMap.show_message("No PL in this scan.", "PL spectrum")
-            return
+            return "No PL in this scan."
         frames = [m.frame(*pt) for pt in pts]
         ref = next((f for f in frames if f is not None), None)
         if ref is None:
-            self.plMap.show_message("No PL on this sweep line.", "PL spectrum")
-            return
+            return "No PL on this sweep line."
         _img, wl_ref = self._pl_image(ref)
         wl_ref = np.asarray(wl_ref, float)
         row_d = self.frameView.linecut_row()
@@ -5580,12 +8277,67 @@ class DualGateViewer(QtWidgets.QMainWindow):
             lc = _linecut_h(img, h - 1 - rd, width)
             cols.append(np.full(wl_ref.shape, np.nan) if lc is None else np.asarray(_resample(wl, lc, wl_ref), float))
         mp = np.stack(cols, axis=1)
-        if ref.wavelength_nm is not None:
+        return pts, x, xl, ctx, wl_ref, mp, ref.wavelength_nm is not None, row_d, width
+
+    def _draw_pl_map(self) -> None:
+        r = self._line_pl_columns()
+        if isinstance(r, str):
+            self.plMap.show_message(r, "PL spectrum")
+            self._dep_pl = None
+            return
+        _pts, x, xl, ctx, wl_ref, mp, has_wl, row_d, width = r
+        if has_wl:
             y, z, yl = *_nm_to_ev(wl_ref, mp), "Photon energy (eV)"
         else:
             y, z, yl = wl_ref, mp, "Pixel"
+        self._dep_pl = (np.asarray(y, float), np.asarray(z, float), yl)
         self.plMap.set_data(x, y, z, x_label=xl, y_label=yl,
                             title=f"PL linecut (CCD row {row_d}, width {width}) — {ctx}")
+
+    # ── tab 5: peak fits of the scan's PL along the sweep line ─────────
+    def _scan_dip_scale(self) -> Optional[float]:
+        """d(D/ε₀)/dx of the sweep axis when it is D (for the dipole moment), else None."""
+        if self._dep_mode() != self.MODE_GATE and self.model.n_powers >= 2:
+            return None
+        c = self._cut
+        if c is None or c.kind != "D":
+            return None
+        if c.short == "D/ε₀":
+            return 1.0
+        if c.short == "u_D":
+            return self.ndTab.calib().scale()[1]
+        return None
+
+    def _redraw_scanfit(self) -> None:
+        self._scanfit_dirty = False
+        view = self.scanFitView
+        if self.model is None:
+            view.show_message("Load a scan.")
+            self.scanFitInfo.setText("")
+            return
+        r = self._line_pl_columns()
+        if isinstance(r, str):
+            view.show_message(r)
+            self.scanFitInfo.setText("")
+            return
+        pts, x, xl, ctx, wl_ref, mp, has_wl, row_d, width = r
+        if not has_wl:
+            view.show_message("This scan's PL frames have no wavelength axis: no energy fits.")
+            return
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ev = EV_NM / np.asarray(wl_ref, float)
+        ok = np.isfinite(ev)
+        order = np.argsort(ev[ok])
+        e, Z = ev[ok][order], mp[ok][order]
+        dip = self._scan_dip_scale()
+        view.set_spectra(x, e, Z, x_label=xl, title=f"PL linecut (CCD row {row_d}, width {width}) — {ctx}",
+                         dip_scale=dip)
+        self.scanFitInfo.setText(f"{len(pts)} points: {ctx}.  Spectra = tab 2's PL linecut (row, width, crop, "
+                                 "baseline); sweep line as in tab 4 (Gate / Power dependence)."
+                                 + ("  Sweep axis is D: the slope gives the dipole moment." if dip else ""))
+        cur = (self._pi, self._b)
+        if cur in pts:
+            view.select_column(pts.index(cur))
 
     def _draw_decay_map(self) -> None:
         if self.model is None:
@@ -5606,11 +8358,16 @@ class DualGateViewer(QtWidgets.QMainWindow):
             if self._traces_job is None:
                 self._start_traces_job(missing, vs)
             self.decayMap.show_message(f"Loading {len(missing)} TRPL files …", "Decay at the selected pixel")
+            self._dep_decay = None
             return
         p = int(self.sel_pixel)
+        line_w = None                       # spectral view: the active line's centre-line weights
+        if self._spectral():
+            line_w = center_line_weights(self.geom, self.excluded)[0][self._active_line()]
         avail = [str(pp) for pp in paths if pp is not None]
         if not avail:
             self.decayMap.show_message("No TRPL on this sweep line.", "Decay at the selected pixel")
+            self._dep_decay = None
             return
         t_ref = self._traces_t[avail[0]]
         tr = self._t_range()
@@ -5622,13 +8379,19 @@ class DualGateViewer(QtWidgets.QMainWindow):
                 continue
             c = self._traces[str(pp)]
             tt = self._traces_t[str(pp)]
-            if p >= c.shape[1]:
+            if line_w is not None:
+                if c.shape[1] != line_w.size:
+                    continue
+                col = c.astype(np.float64) @ line_w
+            elif p >= c.shape[1]:
                 continue
-            col = c[:, p].astype(float)
+            else:
+                col = c[:, p].astype(float)
             if tt.size == t_ref.size and np.allclose(tt, t_ref):
                 z[:, k] = col[r0:r1 + 1]
             else:
                 z[:, k] = np.interp(t, tt, col, left=np.nan, right=np.nan)
+        self._dep_decay = (t.copy(), z.copy())
         norm, log = self.normCheck.isChecked(), self.logColCheck.isChecked()
         levels = None
         with np.errstate(all="ignore"):
@@ -5641,8 +8404,9 @@ class DualGateViewer(QtWidgets.QMainWindow):
                     levels = (-3.0, 0.0)
         what = ("normalized, " if norm else "") + ("log₁₀ " if log else "") + "counts"
         self.decayMap.set_data(x, t, z, x_label=xl, y_label="Time (ns)", levels=levels,
-                               title=f"Decay at pixel {p} ({what}) — {ctx}")
+                               title=f"Decay of {self._decay_source()} ({what}) — {ctx}")
         self._update_dep_markers()
+        self._draw_picks()
 
     def _start_traces_job(self, paths: List[str], vs: ViewSettings) -> None:
         store = self.store
@@ -5693,6 +8457,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
         snap = self._sigma_snap
         pts, x, xl, ctx = self._line()
         title = "σ_eq²(t) (µm²)"
+        self._dep_sig = None
         if snap is None:
             self.sigmaMap.show_message("Run 'Fit all' in tab 3 to fill this map.", title)
             return
@@ -5707,10 +8472,19 @@ class DualGateViewer(QtWidgets.QMainWindow):
         z = np.full((t.size, len(pts)), np.nan)
         use_flagged = self.flaggedCheck.isChecked()
         sg = self._sg_spec()
+        pts_k = [None] * len(pts)          # one point per fitted frame / late group, for the picked-linecut plot
         for k, f in enumerate(fits):
             if f is None:
                 continue
             ok = np.isfinite(f.sigma2) if use_flagged else (np.isfinite(f.sigma2) & ~f.flagged)
+            sel = ok & (f.t_ns >= t[0] - 1e-6) & (f.t_ns <= t[-1] + 1e-6)
+            if sel.any():
+                tp = np.asarray(f.t_ns[sel], float)
+                if sg is not None:
+                    s2p, fp = sg_sigma2(f.t_ns, f.sigma2, ok, sg[0], sg[1], tp)
+                    pts_k[k] = (tp[fp], np.asarray(s2p, float)[fp])
+                else:
+                    pts_k[k] = (tp, np.asarray(f.sigma2[sel], float))
             if sg is not None:   # S-G curve at every bin with good frames around it (fills the gaps between them)
                 s2s, fill = sg_sigma2(f.t_ns, f.sigma2, ok, sg[0], sg[1], t)
                 z[fill, k] = s2s[fill]
@@ -5735,9 +8509,11 @@ class DualGateViewer(QtWidgets.QMainWindow):
                                        title + note)
             return
         sm = f", S-G smoothed ({sg[0]} frames, order {sg[1]})" if sg is not None else ""
+        self._dep_sig = pts_k
         self.sigmaMap.set_data(x, t, z, x_label=xl, y_label="Time (ns)",
                                title=f"{title} — {ctx}" + (", flagged hidden" if not use_flagged else "") + sm + note)
         self._update_dep_markers()
+        self._draw_picks()
 
     # ══ closing ════════════════════════════════════════════════════════
     def closeEvent(self, event) -> None:

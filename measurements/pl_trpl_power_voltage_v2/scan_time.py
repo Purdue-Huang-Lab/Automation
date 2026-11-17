@@ -173,6 +173,11 @@ class ScanSpec:
     start_vf: Optional[float] = None
     start_vb: Optional[float] = None
     detector: str = "SPAD23"  # TRPL overhead is learned per detector (SPAD23 / SPAD93)
+    # dynamic TRPL time: chunks (first, step, step, ... up to max) until the peak reaches the target
+    trpl_dynamic: bool = False
+    dyn_first_s: float = 0.0
+    dyn_step_s: float = 0.0
+    dyn_max_s: float = 0.0
 
     def key(self) -> tuple:
         return tuple((k, tuple(v) if isinstance(v, list) else v) for k, v in self.__dict__.items())
@@ -199,8 +204,17 @@ class ScanSpec:
             ramp_step_deg=th.ramp_step_deg, measure_pl=th.measure_pl, measure_trpl=th.measure_trpl,
             exposure_ms=th.exposure_ms, accum_n=th.accum_n, tcspc_acq_s=th.tcspc_acq_s, didp=th.didp,
             flipper_settle_ms=th.flipper_settle_ms, ramp_micro_read=th.ramp_micro_read,
-            long_ramp_steps=th.long_ramp_steps, detector=th.detector.key, **extra,
+            long_ramp_steps=th.long_ramp_steps, detector=th.detector.key,
+            **cls.dynamic_fields(getattr(th, "trpl_dynamic", None)), **extra,
         )
+
+    @staticmethod
+    def dynamic_fields(dyn) -> dict:
+        """ScanSpec fields of a ``trpl_dynamic.DynamicSettings`` (or None = fixed TRPL time)."""
+        if dyn is None:
+            return {}
+        return {"trpl_dynamic": True, "dyn_first_s": float(dyn.first_s), "dyn_step_s": float(dyn.step_s),
+                "dyn_max_s": float(dyn.max_s)}
 
 
 @dataclass
@@ -465,6 +479,9 @@ class TimingModel:
         self._gate: Dict[str, _Ridge] = {}  # by "read" / "noread" (V/I read after every microstep or not)
         self._read: Dict[str, _Mean] = {}  # by gate type "2400" / "other"
         self._trpl: Dict[str, _Mean] = {}  # TRPL overhead by detector; prior = the global trpl_oh
+        # dynamic TRPL time: (seconds, chunks) per acquisition, this scan only (depends on the sample);
+        # prior = midway between the first chunk and the max time
+        self._dyn: Dict[tuple, Tuple[_Mean, _Mean]] = {}
 
     # ---- persistence
     @classmethod
@@ -553,8 +570,25 @@ class TimingModel:
             m = self._trpl[key] = _Mean(self.trpl_oh.value, 0.0) if prior is None else _Mean(prior, n)
         return m
 
+    def dyn_model(self, spec: ScanSpec) -> Tuple[_Mean, _Mean]:
+        """Dynamic TRPL: expected requested seconds and chunks per acquisition (learned during the scan)."""
+        key = (spec.dyn_first_s, spec.dyn_step_s, spec.dyn_max_s)
+        m = self._dyn.get(key)
+        if m is None:
+            first, step = max(spec.dyn_first_s, 1e-3), max(spec.dyn_step_s, 1e-3)
+            top = max(spec.dyn_max_s, first)
+            mid = 0.5 * (first + top)
+            chunks = 1.0 + math.ceil(max(0.0, mid - first) / step - 1e-9)
+            m = self._dyn[key] = (_Mean(mid, 0.0), _Mean(chunks, 0.0))
+        return m
+
     def trpl_s(self, spec: ScanSpec) -> float:
-        return (spec.tcspc_acq_s + self.trpl_model(spec).value) if spec.measure_trpl else 0.0
+        if not spec.measure_trpl:
+            return 0.0
+        if getattr(spec, "trpl_dynamic", False):
+            secs, chunks = self.dyn_model(spec)
+            return secs.value + chunks.value * self.trpl_model(spec).value
+        return spec.tcspc_acq_s + self.trpl_model(spec).value
 
     def acq_s(self, spec: ScanSpec) -> float:
         """One acquisition (PL and TRPL run in parallel: the longer one)."""
@@ -634,7 +668,16 @@ class TimingModel:
                                                    weight=n_acq)
         if spec.measure_pl and "save" in ev:
             self.save.add(float(ev["save"]) / n_acq, weight=n_acq)
-        if spec.measure_trpl and "trpl" in ev:
+        if spec.measure_trpl and getattr(spec, "trpl_dynamic", False) and "trpl_acq_s" in ev:
+            secs, chunks = self.dyn_model(spec)
+            n_chunks = max(1.0, float(ev.get("trpl_chunks", 1)))
+            secs.add(float(ev["trpl_acq_s"]) / n_acq, weight=n_acq)
+            chunks.add(n_chunks / n_acq, weight=n_acq)
+            if "trpl" in ev:  # overhead per chunk (one S command each)
+                oh = (float(ev["trpl"]) - float(ev["trpl_acq_s"])) / n_chunks
+                self.trpl_model(spec).add(oh, weight=n_chunks)
+                self.trpl_oh.add(oh, weight=n_chunks)
+        elif spec.measure_trpl and not getattr(spec, "trpl_dynamic", False) and "trpl" in ev:
             oh = float(ev["trpl"]) / n_acq - spec.tcspc_acq_s
             self.trpl_model(spec).add(oh, weight=n_acq)
             self.trpl_oh.add(oh, weight=n_acq)  # global value: prior of a detector without data yet
@@ -670,7 +713,7 @@ def fmt_clock(epoch_s: float) -> str:
 
 
 CSV_HEADER = ["idx", "wall_time", "elapsed_s", "point_s", "stage_s", "gate_s", "read_s", "wait_s", "acq_s",
-              "flip_s", "predicted_point_s", "left_est_s"]
+              "flip_s", "predicted_point_s", "left_est_s", "trpl_acq_s", "trpl_chunks"]
 
 
 @dataclass
@@ -734,6 +777,9 @@ class ScanTracker:
                f"{(wall if wall is not None else t - self.t_click):.3f}"]
         row += [f"{float(ev.get(key, 0.0)):.3f}" for key in ("stage", "gate", "read", "wait", "acq", "flip")]
         row += [f"{predicted:.3f}", f"{self._left_after:.3f}"]
+        # dynamic TRPL time: requested seconds and chunks at this point (blank in fixed mode)
+        row += ([f"{float(ev['trpl_acq_s']):.3f}", str(int(ev.get("trpl_chunks", 0)))]
+                if "trpl_acq_s" in ev else ["", ""])
         self.rows.append(row)
         return row
 
@@ -1055,7 +1101,13 @@ class ScanTimeWidget(QtWidgets.QFrame):
                     f"{model.frame_oh(spec):.2f} s readout/overhead) + {model.save.value:.2f} s save")
             acq += ")" if not spec.measure_trpl else ""
         if spec.measure_trpl:
-            acq += (" (" if not spec.measure_pl else "; ") + f"TRPL {pred['trpl_s']:.2f} s)"
+            acq += (" (" if not spec.measure_pl else "; ") + f"TRPL {pred['trpl_s']:.2f} s"
+            if getattr(spec, "trpl_dynamic", False):
+                secs, chunks = model.dyn_model(spec)
+                how = "average so far" if secs.n > 0 else "guess: midway between first chunk and max"
+                acq += (f", dynamic {spec.dyn_first_s:g} s + {spec.dyn_step_s:g} s steps up to {spec.dyn_max_s:g} s; "
+                        f"{secs.value:.0f} s / {chunks.value:.1f} chunks per spot ({how})")
+            acq += ")"
         lines.append(acq)
         sd, gd = pred["stage_detail"], pred["gate_detail"]
         vmax, accel = spec.stage_velocity or (DEFAULT_STAGE_VEL, DEFAULT_STAGE_ACC)

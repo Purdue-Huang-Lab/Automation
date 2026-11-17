@@ -209,6 +209,10 @@ class TrplLifetimeTab(QtWidgets.QWidget):
             s.blockSignals(False)
         self._sync_regions()
 
+    def shift_times(self, d: float) -> None:
+        """The panel's time axis moved by ``d`` ns (raw <-> time zero at 0): the windows follow the data."""
+        self._set_spins([s.value() + d for s in (self.spin_b0, self.spin_b1, self.spin_f0, self.spin_f1)])
+
     def _sync_regions(self) -> None:
         for r, a, b in ((self.region_base, self.spin_b0, self.spin_b1), (self.region_fit, self.spin_f0, self.spin_f1)):
             r.blockSignals(True)

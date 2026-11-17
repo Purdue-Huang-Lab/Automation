@@ -322,6 +322,63 @@ def align_first_peaks(counts: np.ndarray, time_ns: np.ndarray, edge_level: float
     return TimeZeroAlignment(out, shift, status, edge, corr, dt, target, second_delay, msg + ".")
 
 
+# with the alignment on, the views show t = raw time - this, so time zero is at 0 ns at every point
+T0_REF_BINS = 5  # default reference frame: this many (shown) bins after time zero
+
+
+def t0_display_offset(time_ns: np.ndarray, target_ns: Optional[float]) -> Optional[float]:
+    """Raw time (ns) of the bin holding time zero ``target_ns`` (from bin 0, as TimeZeroAlignment.target_ns).
+
+    Subtracted from the time axis it puts time zero at exactly 0 ns on the bin grid (the
+    first-peak edge lies within half a bin of 0).  None without a time zero.
+    """
+    t = np.asarray(time_ns, dtype=np.float64)
+    if t.size < 2 or target_ns is None or not np.isfinite(target_ns):
+        return None
+    dt = float(np.median(np.diff(t)))
+    if not dt > 0:
+        return None
+    return float(t[int(np.round(float(target_ns) / dt)) % t.size])
+
+
+T0_PEAK_SMOOTH_NS = 0.5  # boxcar over which the brightest pixel's maximum is taken (the time zero shown)
+
+
+def peak_display_offset(counts: np.ndarray, time_ns: np.ndarray, excluded=()) -> Optional[float]:
+    """Raw time (ns) of the signal peak: the maximum of the brightest pixel (each pixel minus its median,
+    smoothed over T0_PEAK_SMOOTH_NS).  With the time-zero alignment on, the views put t = 0 here (the
+    pixels themselves stay aligned on their first-peak edge).  None without signal."""
+    c = np.asarray(counts, dtype=np.float64)
+    t = np.asarray(time_ns, dtype=np.float64)
+    if c.ndim != 2 or c.shape[0] < 4 or t.size != c.shape[0]:
+        return None
+    dt = float(np.median(np.diff(t)))
+    if not dt > 0:
+        return None
+    k = max(1, int(round(T0_PEAK_SMOOTH_NS / dt))) | 1
+    y = c - np.median(c, axis=0)
+    if k > 1:
+        cs = np.cumsum(np.vstack([np.zeros((1, y.shape[1])), y]), axis=0)
+        y = (cs[k:] - cs[:-k]) / k  # row i = mean of rows i .. i+k-1 (centre i + k // 2)
+    ex = [int(p) for p in excluded if 0 <= int(p) < y.shape[1]]
+    if ex:
+        y[:, ex] = -np.inf
+    p = int(np.argmax(y.max(axis=0)))
+    i = int(np.argmax(y[:, p]))
+    if not y[i, p] > 0:
+        return None
+    return float(t[i + k // 2])
+
+
+def t0_ref_index(view_time_ns: np.ndarray, n_bins: int = T0_REF_BINS) -> int:
+    """Index of the default reference frame: ``n_bins`` bins after the first bin at or after t = 0."""
+    t = np.asarray(view_time_ns, dtype=np.float64)
+    if t.size == 0:
+        return 0
+    i0 = int(np.searchsorted(t, -1e-9, side="left"))
+    return int(min(i0 + int(n_bins), t.size - 1))
+
+
 # ======================================================================
 # 2D Gaussian (spatial) fits
 # ======================================================================

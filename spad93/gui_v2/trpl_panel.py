@@ -11,7 +11,10 @@ from typing import Callable, Dict, Optional, Tuple
 import numpy as np
 from PyQt5 import QtCore, QtWidgets
 
-from spad93.spad93_analysis import DarkReference, TimeZeroAlignment, align_first_peaks, locate_peak, rebin_time
+from spad93.spad93_analysis import (
+    T0_REF_BINS, DarkReference, TimeZeroAlignment, align_first_peaks, locate_peak, rebin_time,
+    peak_display_offset, t0_ref_index,
+)
 from spad93.spad93_geometry import CENTER_PIXEL, COLUMN_X_UM, PIXEL_COL, center_row_matrix, column_of
 from spad93.spad93_io import (
     TrplData,
@@ -46,6 +49,7 @@ from spad93.gui_v2.plots import HistogramPlot, SpectrumPlot, fwhm_text, trace_co
 from spad93.gui_v2.state import MODE_2D, MODE_SPECTRAL, SharedState
 from spad93.gui_v2.trpl_fitting import TrplFittingTab
 from spad93.gui_v2.trpl_lifetime import TrplLifetimeTab
+from spad93.gui_v2.trpl_processing import TrplProcessingTab
 from spad93.gui_v2.workers import CallWorker
 
 GEOMETRY_NOTE = (
@@ -74,6 +78,10 @@ class TrplPanel(QtWidgets.QWidget):
         self._calib_loader = calib_loader
         self._raw: Optional[TrplData] = None
         self.leak: Optional[TimeZeroAlignment] = None  # time-zero alignment applied to the view (None = off)
+        # aligned view: raw time shown as t = 0 (time zero; None = raw times).  Times in ns that the user set
+        # (range, reference, windows) are converted when the view switches between raw and aligned times.
+        self._t_off: Optional[float] = None
+        self._t_shift = 0.0  # ns added to such times by the last _rebuild_view
         self.view_time = np.zeros(0)
         self.view_counts = np.zeros((0, 93), dtype=np.int64)
         self._spec: Optional[np.ndarray] = None
@@ -240,7 +248,7 @@ class TrplPanel(QtWidgets.QWidget):
         self.spin_t0 = QtWidgets.QDoubleSpinBox()
         self.spin_t1 = QtWidgets.QDoubleSpinBox()
         for s in (self.spin_t0, self.spin_t1):
-            s.setRange(0.0, 1e9)
+            s.setRange(-1e9, 1e9)
             s.setDecimals(4)
         self.btn_apply = QtWidgets.QPushButton("Apply time range")
         self.btn_full = QtWidgets.QPushButton("Full range")
@@ -296,6 +304,8 @@ class TrplPanel(QtWidgets.QWidget):
             "2. Fine: time zero of each pixel = the rising edge of its first peak at half height, between bins\n"
             "   (the flat top of the peak is a poor marker).\n"
             "3. Each pixel is shifted by whole bins so its edge lands on the median edge of the largest group.\n"
+            "The time axis is then shifted so t = 0 ns is the signal peak (maximum of the brightest pixel), and\n"
+            f"the reference frame defaults to {T0_REF_BINS} bins after it (uncheck 'Use this frame as reference' to clear it).\n"
             "Applied to the view, fits and exports; Save As still writes the raw counts. Hover a pixel for its shift.")
         self.lbl_leak = QtWidgets.QLabel("")
         self.lbl_leak.setWordWrap(True)
@@ -332,6 +342,10 @@ class TrplPanel(QtWidgets.QWidget):
         # ---- lifetime tab
         self.lifetime = TrplLifetimeTab(self)
         self.tabs.addTab(self.lifetime, "Lifetime")
+
+        # ---- processing tab (double-pump linecuts)
+        self.processing = TrplProcessingTab(self)
+        self.tabs.addTab(self.processing, "Processing")
 
         # ---- signals
         self.btn_start.clicked.connect(self._on_start)
@@ -457,15 +471,14 @@ class TrplPanel(QtWidgets.QWidget):
         # keep_view keeps the applied time range (it follows the growing data while acquiring)
         self._raw = data
         self._rebuild_view()
+        if old_t is not None:
+            old_t += self._t_shift
         if not keep_view:
             self._req_range = None
             self._range_edit_pending = False
-            self.ref_time = None
         self._apply_requested_range()
         if not keep_view:
-            self.chk_ref.blockSignals(True)
-            self.chk_ref.setChecked(False)
-            self.chk_ref.blockSignals(False)
+            self._default_reference()
         self._sync_range_widgets()
         if old_t is not None:
             self.set_current(int(np.argmin(np.abs(self.view_time - old_t))), force=True)
@@ -480,26 +493,69 @@ class TrplPanel(QtWidgets.QWidget):
     def _rebuild_view(self) -> None:
         raw = self._raw
         self.leak = None
+        old_off = self._t_off
         if raw is None:
             self.view_time = np.zeros(0)
-            self.view_counts = np.zeros((0, 93), dtype=np.int64)
+            self.view_counts = np.zeros((0, self.view_counts.shape[1]), dtype=np.int64)
+            self._t_shift = 0.0
         else:
             counts = raw.counts
+            off = None
             if self.chk_leak.isChecked():
                 try:
                     self.leak = align_first_peaks(raw.counts, raw.time_ns)
                     counts = self.leak.counts
+                    off = peak_display_offset(self.leak.counts, raw.time_ns, self.state.excluded)
+                    if off is None:  # no signal in this histogram (e.g. the start of a live one): keep the axis
+                        off = old_off
                 except Exception as exc:
                     self.lbl_leak.setText(f"Time-zero alignment failed ({exc}); raw data shown.")
-            self.view_counts, self.view_time = rebin_time(counts, raw.time_ns, self._rebin)
+            self._t_off = off
+            t = raw.time_ns if off is None else raw.time_ns - off
+            if off is not None and self._rebin > 1:  # rebinned groups start at t = 0 (drop < rebin early bins)
+                s0 = int(np.argmin(np.abs(t))) % self._rebin
+                counts, t = counts[s0:], t[s0:]
+            self.view_counts, self.view_time = rebin_time(counts, t, self._rebin)
+            self._t_shift = self._shift_user_times(old_off, off)
         if self.leak is not None:
-            self.lbl_leak.setText(self.leak.message)
+            self.lbl_leak.setText(self.leak.message + (
+                f" Time axis: t = 0 at the signal peak (brightest pixel, raw {self._t_off:.2f} ns)." if self._t_off is not None else ""))
         elif not self.chk_leak.isChecked():
             self.lbl_leak.setText("")
         self._spec = None
         self.data_version += 1
         self.fitting.invalidate()
         self.lifetime.invalidate()
+        self.processing.invalidate()
+
+    def _shift_user_times(self, old_off: Optional[float], new_off: Optional[float]) -> float:
+        """The view switched between raw and time-zero (t = 0) times: move the times set in ns (range,
+        reference, pre-t0 window, lifetime windows) so they stay on the same data.  Returns the shift (ns)."""
+        if (old_off is None) == (new_off is None):
+            return 0.0  # same kind of axis (time zero stays at 0 from one histogram to the next)
+        d = -float(new_off) if old_off is None else float(old_off)
+        if self._req_range is not None:
+            self._req_range = (self._req_range[0] + d, self._req_range[1] + d)
+        if self._range_edit_pending:
+            for sp in (self.spin_t0, self.spin_t1):
+                sp.blockSignals(True)
+                sp.setValue(sp.value() + d)
+                sp.blockSignals(False)
+        if self.ref_time is not None:
+            self.ref_time += d
+        self.fitting.shift_times(d)
+        self.lifetime.shift_times(d)
+        return d
+
+    def _default_reference(self) -> None:
+        """Time-zero aligned view: reference frame T0_REF_BINS bins after t = 0; raw view: none."""
+        if self._t_off is not None and self.has_data:
+            self.ref_time = float(self.view_time[t0_ref_index(self.view_time)])
+        else:
+            self.ref_time = None
+        self.chk_ref.blockSignals(True)
+        self.chk_ref.setChecked(self.ref_time is not None)
+        self.chk_ref.blockSignals(False)
 
     def _apply_requested_range(self) -> None:
         """Bin range for the applied (start, end) times; it follows the data while acquiring."""
@@ -560,6 +616,7 @@ class TrplPanel(QtWidgets.QWidget):
             self._update_hist()
             self.fitting.refresh()
             self.lifetime.refresh()
+            self.processing.refresh()
         except Exception as exc:
             self.status.emit(f"Display error: {exc}")
 
@@ -738,11 +795,20 @@ class TrplPanel(QtWidgets.QWidget):
             self.lbl_leak.setText("Applied when data is loaded." if self.chk_leak.isChecked() else "")
             return
         self.set_data(self._raw, keep_view=True)
+        if self._t_off is not None and self.ref_time is None:  # switched on: the default reference
+            self._default_reference()
+            self.fitting.reference_changed()
+            self._update_hist()
         self.status.emit(self.leak.message if self.leak is not None else "Time-zero alignment off: raw alignment shown.")
 
     def processing_metadata(self) -> Dict[str, object]:
         """Header rows describing post-processing of the view (for exports made from it)."""
-        return {} if self.leak is None else {"time_zero_alignment": self.leak.summary()}
+        if self.leak is None:
+            return {}
+        out = {"time_zero_alignment": self.leak.summary()}
+        if self._t_off is not None:
+            out["time_axis"] = f"ns after the signal peak of the brightest pixel (t = 0 is raw {self._t_off:.4f} ns)"
+        return out
 
     def _on_ref_toggled(self, checked: bool) -> None:
         if not self.has_data:
@@ -949,6 +1015,8 @@ class TrplPanel(QtWidgets.QWidget):
                 self._req_range = None
                 self._range_edit_pending = False
             self._apply_requested_range()
+            if not keep:
+                self._default_reference()
             self._sync_range_widgets()
 
     def _on_done(self, snap: Optional[TrplSnapshot], err: str) -> None:

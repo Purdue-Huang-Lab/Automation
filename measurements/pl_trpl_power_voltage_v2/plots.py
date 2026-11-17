@@ -26,6 +26,19 @@ def _black_axis(axis: pg.AxisItem) -> None:
     axis.setTextPen(pg.mkPen("k"))
 
 
+class _NanSafeImageItem(pg.ImageItem):
+    """ImageItem whose NaN cells stay transparent at every downsampled size.
+
+    pyqtgraph 0.13.7 caches the NaN positions of the (auto-downsampled) image and reuses them after a zoom or
+    resize changes the downsampled shape: "IndexError: index N is out of bounds" in paint, and the image is not
+    drawn.  Recomputing them at each render is cheap (renders happen only when the image or view changes).
+    """
+
+    def render(self, *args, **kwargs):
+        self._imageNanLocations = None
+        return super().render(*args, **kwargs)
+
+
 class _ImageMapPlot(_PlotBase):
     """An image placed over a matplotlib-style extent (origin at the bottom), with a colorbar.
 
@@ -38,7 +51,7 @@ class _ImageMapPlot(_PlotBase):
     def __init__(self, cmap: str, parent=None):
         super().__init__(parent)
         self.plot.showGrid(x=False, y=False)
-        self.img = pg.ImageItem(autoDownsample=True)
+        self.img = _NanSafeImageItem(autoDownsample=True)
         self.plot.addItem(self.img)
         self.cmap = pg.colormap.get(cmap)
         self.cbar = pg.ColorBarItem(values=(0.0, 1.0), colorMap=self.cmap, interactive=False, width=14,

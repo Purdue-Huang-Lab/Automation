@@ -1,7 +1,8 @@
 """Counts tab: live count map with the 2D-space and spectral analysis pages.
 
-2D: the map is fitted with one 2D Gaussian, or with two round ones on a shared
-offset ("Double Gaussian" model, ported from spad23/gui_v2).
+2D: the map is fitted with one 2D Gaussian, or with two elliptical ones (sigma_x,
+sigma_y each) on a shared offset ("Double Gaussian" model, ported from spad23/gui_v2,
+which fits round ones).
 """
 
 import os
@@ -127,7 +128,8 @@ class CountsPanel(QtWidgets.QWidget):
         self.cmb_model.addItem("Single 2D Gaussian", MODEL_SINGLE)
         self.cmb_model.addItem("Double 2D Gaussian", MODEL_DOUBLE)
         self.cmb_model.setToolTip(
-            "Double: two round Gaussians (A, x0, y0, σ each) on one shared offset, fitted to the whole map.\n"
+            "Double: two elliptical Gaussians (A, x0, y0, σx, σy each; axes along x and y) on one shared\n"
+            "offset, fitted to the whole map.  σx ≈ σy means a round spot.\n"
             "The two spots are only resolved if they are about a pixel pitch or more apart;\n"
             "the subtitle says when the second Gaussian is not resolved.")
         model_row.addWidget(self.cmb_model)
@@ -270,7 +272,7 @@ class CountsPanel(QtWidgets.QWidget):
             p0 = None
             if self._prev_double is not None:
                 p0 = np.array(self._prev_double[0], dtype=np.float64)
-                p0[[0, 4, 8]] *= factor / self._prev_double[1]  # the display unit may have changed
+                p0[[0, 5, 10]] *= factor / self._prev_double[1]  # the display unit may have changed
             fit = fit_gaussian_2d_double(PIXEL_X_UM[mask], PIXEL_Y_UM[mask], vals[mask], p0=p0, keep_order_of=p0)
         self._prev_double = (fit.popt, factor) if fit is not None and fit.quality_ok else None
         self._last_double, self._last_unit = fit, unit
@@ -281,10 +283,11 @@ class CountsPanel(QtWidgets.QWidget):
             self.pixel_fit_plot.set_data(vals, None, ex, ylabel, "Radial profiles of the two Gaussians", message=msg)
             return
         self.fit_plot.set_data_double(vals, fit, ex, "Double 2D Gaussian fit", double_fit_text(fit))
-        _, _, _, s1 = fit.component(0)
-        _, _, _, s2 = fit.component(1)
+        _, _, _, sx1, sy1 = fit.component(0)
+        _, _, _, sx2, sy2 = fit.component(1)
         self.pixel_fit_plot.set_data(vals, fit, ex, ylabel, "Radial profiles of the two Gaussians",
-                                     f"σ1 = {abs(s1):.1f} µm, σ2 = {abs(s2):.1f} µm, offset {fit.offset:.3g}")
+                                     f"1: σx = {sx1:.1f}, σy = {sy1:.1f} µm; 2: σx = {sx2:.1f}, σy = {sy2:.1f} µm;"
+                                     f" offset {fit.offset:.3g}")
 
     def _update_linecuts(self, vals: np.ndarray, unit: str) -> None:
         ex = self.state.excluded
@@ -428,8 +431,9 @@ class CountsPanel(QtWidgets.QWidget):
         if not self.state.spectral and self.model == MODEL_DOUBLE and fit is not None:
             comps = {}
             for k in range(2):
-                A, x0, y0, s = fit.component(k)
-                comps[f"gaussian_{k + 1}"] = {"amplitude": A, "x0_um": x0, "y0_um": y0, "sigma_um": abs(s)}
+                A, x0, y0, sx, sy = fit.component(k)
+                comps[f"gaussian_{k + 1}"] = {"amplitude": A, "x0_um": x0, "y0_um": y0, "sigma_x_um": sx,
+                                              "sigma_y_um": sy, "sigma_eq_um": fit.sigma_eq(k)}
             meta["double_gaussian_fit"] = dict(comps, offset=fit.offset, unit=self._last_unit,
                                                separation_um=fit.separation, resolved=bool(fit.resolved),
                                                amplitude_significance=[fit.snr1, fit.snr2])

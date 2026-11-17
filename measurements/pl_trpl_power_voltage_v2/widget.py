@@ -15,6 +15,7 @@ mode (power-outer, voltage-outer, grid) and Andor option is the same.  Added:
 """
 
 import csv
+import dataclasses
 import os
 import shutil
 import re
@@ -154,6 +155,7 @@ from measurements.pl_trpl_power_voltage_v2.scan_time import (
     simulate,
 )
 from measurements.pl_trpl_power_voltage_v2.workers import GateRampThread, PowerVoltageSweepThread
+from measurements.pl_trpl_power_voltage_v2 import trpl_dynamic as tdyn
 from measurements.pl_trpl_power_voltage_v2 import detectors as spad_det
 from measurements.pl_trpl_power_voltage_v2.detectors import DetectWorker, is_count_snapshot, is_trpl_snapshot
 from measurements.pl_trpl_power_voltage_v2 import spectral as spad_spec
@@ -167,7 +169,7 @@ from measurements.pl_trpl_power_voltage_v2.spectral import (
 )
 # geometry-free analysis and plots (same in the spad23 and spad93 packages); the pixel maps, the 2D fit
 # and the clients come from the active detector's profile (self._det)
-from spad23.spad23_analysis import align_first_peaks, pre_pulse_window
+from spad23.spad23_analysis import T0_REF_BINS, align_first_peaks, peak_display_offset, pre_pulse_window, t0_ref_index
 from spad23.gui_v2.plots import HistogramPlot, RadialFitPlot, TracePlot, trace_color
 from spad23.gui_v2.workers import FitAllWorker
 
@@ -224,6 +226,8 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self._power_plan: List[hwp_planner.PlanRow] = []  # power list (HWP+ND): solved rows, list order
         self._power_list_bad: List[str] = []  # tokens of the power list that could not be read
         self._session_saved = False
+        self._sweep_dyn = None  # DynamicSettings of the running sweep (None = fixed TRPL time)
+        self._dyn_results: List[dict] = []  # dynamic TRPL: one dict per acquisition (trpl_done "dyn")
         self._file_counters: Dict[str, int] = {}
         self._save_dir = None
         self._calib_unit = "nW"
@@ -275,6 +279,19 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self._spad_fit_x_um, self._spad_fit_y_um = self._det.pixel_x_um.copy(), self._det.pixel_y_um.copy()
         self._spad_map_rates = np.zeros(self._det.num_pixels, dtype=np.float64)
         self._hist_t0_cache: dict = {}
+        # time-zero aligned view: t = raw - offset (time zero at 0 ns).  The Start / End / Reference / pre-t0
+        # times are in the coordinates of the view; they are converted when it switches between raw times and
+        # times after time zero (_hist_rel), so they stay on the same data.
+        self._hist_rel = False
+        self._hist_last_off: Optional[float] = None
+        self._hist_view_cache = None  # (snapshot, align, t_ns, counts)
+        # live TRPL updates (sweep or Take Histogram, every 0.4 s): only the newest is drawn, at most once per
+        # max(LIVE_HIST_MIN_S, LIVE_HIST_COST_X x the last redraw time), so a slow redraw (93 px x 13k bins with
+        # time-zero alignment ~1 s) can never queue up snapshots (that froze the GUI at 6.7 GB on 2026-11-11)
+        self._live_hist_timer = QtCore.QTimer(self)
+        self._live_hist_timer.setSingleShot(True)
+        self._live_hist_timer.timeout.connect(self._flush_live_hist)
+        self._live_hist_next = 0.0  # time.monotonic() before which no live redraw starts
         self._pre_t0_auto = True
         # dark reference (beam blocked): an alternative to the pre-t0 offset for the 2D fit
         self._dark_ref = None  # DarkReference of the active detector's analysis module
@@ -392,6 +409,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
 
         self._wire_signals()
         self._update_gate_sweep_controls()
+        self._wire_dyn_controls()
         self._wire_scan_estimate()
 
     def statusBar(self) -> QtWidgets.QStatusBar:
@@ -714,7 +732,66 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         line9.addWidget(self.tcspcBinSpin)
         line9.addWidget(self.tcspcCalibAlignBtn)
         line9.addWidget(self.stopCountsBtn)
-        grid.addLayout(line9, 8, 0, 1, 1)
+        self.tcspcAcqSpin.setToolTip("TRPL acquisition time: the Histogram tab's Take histogram, and every sweep point\n"
+                                     "when the sweep TRPL time is Fixed.")
+
+        # Sweep TRPL time: Fixed (Acq above) or Dynamic (chunks until the brightest pixel's peak is high enough)
+        self.trplTimeCombo = QtWidgets.QComboBox()
+        self.trplTimeCombo.addItems(["Fixed", "Dynamic"])
+        self.trplTimeCombo.setFixedWidth(90)
+        self.trplTimeCombo.setToolTip(
+            "Fixed: every sweep point takes 'Acq (s)'.\n"
+            "Dynamic: TRPL is taken in chunks (first chunk, then steps) until the brightest pixel's peak,\n"
+            "background subtracted, reaches the target; at the max time the point is flagged and the sweep\n"
+            "moves on. Each spot's chunks are summed bin-for-bin into its TRPL_*.csv, each chunk is also saved\n"
+            "in trpl_chunks/, and every spot's time / peak / flag goes to dynamic_trpl_log.csv.\n"
+            "Background: the dark reference (scaled to the time so far), else each pixel's pre-t0 level.\n"
+            "dI/dP: pump 2 on repeats pump 2 off's chunks (same time).")
+        self.dynTargetSpin = QtWidgets.QSpinBox()
+        self.dynTargetSpin.setRange(1, 100_000_000)
+        self.dynTargetSpin.setFixedWidth(80)
+        self.dynTargetSpin.setToolTip("Stop when max over pixels and bins of (counts - background) reaches this")
+        self.dynFirstSpin = QtWidgets.QDoubleSpinBox()
+        self.dynFirstSpin.setDecimals(1)
+        self.dynFirstSpin.setRange(0.1, 36000.0)
+        self.dynFirstSpin.setFixedWidth(80)
+        self.dynFirstPlChk = QtWidgets.QCheckBox("= PL time")
+        self.dynFirstPlChk.setToolTip("First chunk = exposure × accumulations (when the sweep measures PL)")
+        self.dynStepSpin = QtWidgets.QDoubleSpinBox()
+        self.dynStepSpin.setDecimals(1)
+        self.dynStepSpin.setRange(0.1, 36000.0)
+        self.dynStepSpin.setFixedWidth(80)
+        self.dynStepSpin.setToolTip("Length of every further chunk")
+        self.dynMaxSpin = QtWidgets.QDoubleSpinBox()
+        self.dynMaxSpin.setDecimals(1)
+        self.dynMaxSpin.setRange(0.1, 360000.0)
+        self.dynMaxSpin.setFixedWidth(90)
+        self.dynMaxSpin.setToolTip("Give up at this total (the last chunk is shortened to end exactly here);\n"
+                                   "the point is flagged 'below target'")
+        ds = self._det_settings
+        self.trplTimeCombo.setCurrentIndex(1 if str(ds.value("trpl_time_mode", "fixed", type=str)) == "dynamic" else 0)
+        self.dynTargetSpin.setValue(int(ds.value("trpl_dyn_target", 500, type=int)))
+        self.dynFirstSpin.setValue(float(ds.value("trpl_dyn_first_s", 60.0, type=float)))
+        self.dynFirstPlChk.setChecked(bool(ds.value("trpl_dyn_first_pl", True, type=bool)))
+        self.dynStepSpin.setValue(float(ds.value("trpl_dyn_step_s", 60.0, type=float)))
+        self.dynMaxSpin.setValue(float(ds.value("trpl_dyn_max_s", 600.0, type=float)))
+        self.dynCtrlWidget = QtWidgets.QWidget()
+        dyn_row = QtWidgets.QHBoxLayout(self.dynCtrlWidget)
+        dyn_row.setContentsMargins(0, 0, 0, 0)
+        for w in (QtWidgets.QLabel("Target peak (counts):"), self.dynTargetSpin, QtWidgets.QLabel("First (s):"),
+                  self.dynFirstSpin, self.dynFirstPlChk, QtWidgets.QLabel("Step (s):"), self.dynStepSpin,
+                  QtWidgets.QLabel("Max (s):"), self.dynMaxSpin):
+            dyn_row.addWidget(w)
+        line9b = QtWidgets.QHBoxLayout()
+        line9b.addWidget(QtWidgets.QLabel("Sweep TRPL time:"))
+        line9b.addWidget(self.trplTimeCombo)
+        line9b.addWidget(self.dynCtrlWidget)
+        line9b.addStretch()
+        tcspc_rows = QtWidgets.QVBoxLayout()
+        tcspc_rows.setSpacing(6)
+        tcspc_rows.addLayout(line9)
+        tcspc_rows.addLayout(line9b)
+        grid.addLayout(tcspc_rows, 8, 0, 1, 1)
 
         # Pump-2 flipper line (dI/dP mode)
         self.flipperDot = self._make_dot()
@@ -1100,17 +1177,17 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
 
         self.histStartNsSpin = QtWidgets.QDoubleSpinBox()
         self.histStartNsSpin.setDecimals(4)
-        self.histStartNsSpin.setRange(0.0, 1e9)
+        self.histStartNsSpin.setRange(-1e9, 1e9)
         self.histStartNsSpin.setValue(float(DEFAULT_HIST_START_NS))
         self.histStartNsSpin.setFixedWidth(110)
         self.histEndNsSpin = QtWidgets.QDoubleSpinBox()
         self.histEndNsSpin.setDecimals(4)
-        self.histEndNsSpin.setRange(0.0, 1e9)
+        self.histEndNsSpin.setRange(-1e9, 1e9)
         self.histEndNsSpin.setValue(float(DEFAULT_HIST_END_NS))
         self.histEndNsSpin.setFixedWidth(110)
         self.histRefNsSpin = QtWidgets.QDoubleSpinBox()
         self.histRefNsSpin.setDecimals(4)
-        self.histRefNsSpin.setRange(0.0, 1e9)
+        self.histRefNsSpin.setRange(-1e9, 1e9)
         self.histRefNsSpin.setValue(float(DEFAULT_HIST_REF_NS))
         self.histRefNsSpin.setFixedWidth(110)
 
@@ -1118,9 +1195,17 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         grid.addWidget(self.histStartNsSpin, 0, 1)
         grid.addWidget(QtWidgets.QLabel("End time (ns)"), 0, 2)
         grid.addWidget(self.histEndNsSpin, 0, 3)
+        self.chk_hist_ref_auto = QtWidgets.QCheckBox(f"t0 + {T0_REF_BINS} bins")
+        self.chk_hist_ref_auto.setChecked(True)
+        self.chk_hist_ref_auto.setToolTip(
+            f"With 'Align time zero' on, t = 0 ns is the signal peak (maximum of the brightest pixel, at every\n"
+            f"histogram of a scan) and the reference follows t0 + {T0_REF_BINS} bins.\n"
+            "Typing a reference (or clicking a time in the spectral view) switches this off.")
         grid.addWidget(QtWidgets.QLabel("Reference time (ns)"), 0, 4)
         grid.addWidget(self.histRefNsSpin, 0, 5)
-        grid.addWidget(QtWidgets.QLabel("All bins are saved; settings only affect visualization."), 1, 0, 1, 6)
+        grid.addWidget(self.chk_hist_ref_auto, 0, 6)
+        grid.addWidget(QtWidgets.QLabel("All bins are saved; settings only affect visualization. With time-zero "
+                                        "alignment on, t = 0 is the signal peak (brightest pixel)."), 1, 0, 1, 7)
 
         parent_layout.addWidget(box)
 
@@ -1447,7 +1532,9 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self.chk_t0_align.setToolTip(
             "View only (as in the SPAD23 / SPAD93 v2 GUIs): shift each pixel by whole bins so the rising edge of\n"
             "its first peak lines up (align_first_peaks). Applies to the histogram traces, the\n"
-            "2D fit frame and the lifetime maps. Saved data stays raw.")
+            "2D fit frame and the lifetime maps. Saved data stays raw.\n"
+            "The time axis is then shifted so t = 0 ns is the signal peak (maximum of the brightest pixel) of every\n"
+            "histogram; Start / End / Reference / pre-t0 times are converted when this is switched.")
         self.lbl_t0_align = QtWidgets.QLabel("")
         self.lbl_t0_align.setStyleSheet("color:#6b7280")
         self.lbl_t0_align.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
@@ -1611,7 +1698,8 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self.chk_hist_log.toggled.connect(lambda _v: self._update_histogram_tab())
         self.histStartNsSpin.valueChanged.connect(lambda _v: (self._update_histogram_tab(), self._update_lifetime_tab()))
         self.histEndNsSpin.valueChanged.connect(lambda _v: (self._update_histogram_tab(), self._update_lifetime_tab()))
-        self.histRefNsSpin.valueChanged.connect(lambda _v: self._update_histogram_tab())
+        self.histRefNsSpin.valueChanged.connect(lambda _v: self._on_hist_ref_edited())
+        self.chk_hist_ref_auto.toggled.connect(lambda _v: self._update_histogram_tab())
         self.chk_t0_align.toggled.connect(lambda _v: (self._update_histogram_tab(), self._update_lifetime_tab()))
         self.cmb_hist_bg.currentIndexChanged.connect(lambda _i: self._on_hist_bg_changed())
         self.btn_take_dark.clicked.connect(self.on_take_dark)
@@ -1944,8 +2032,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         if snapshot is None or snapshot.counts_matrix.shape[0] == 0:
             self.spectralHist.set_context(None)
             return
-        t_ns = snapshot.time_axis_ps.astype(np.float64) / 1000.0
-        counts = self._hist_view_counts(snapshot, t_ns)
+        t_ns, counts = self._hist_view(snapshot)
         start_idx, end_idx, ref_idx = self._hist_time_indices(snapshot)
         bg = self._hist_background(snapshot, t_ns, counts)  # also updates the background label
         dark, dark_text = self._dark_ref_scaled(snapshot)
@@ -1973,7 +2060,9 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         ))
 
     def _hist_time_indices(self, snapshot) -> Tuple[int, int, int]:
-        t_ns = snapshot.time_axis_ps.astype(np.float64) / 1000.0
+        t_ns = self._hist_view(snapshot)[0]
+        if self._hist_rel and self.chk_hist_ref_auto.isChecked() and t_ns.size:
+            self._set_spin_silently(self.histRefNsSpin, float(t_ns[t0_ref_index(t_ns)]))
         start_ns = float(self.histStartNsSpin.value())
         end_ns = float(self.histEndNsSpin.value())
         if end_ns < start_ns:
@@ -2004,8 +2093,25 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             self.statusBar().showMessage(f"Dark reference: {snapshot.elapsed_s:.1f} / "
                                          f"{snapshot.measurement_ms / 1000.0:.1f} s, {snapshot.n_events} events")
             return
+        self._show_live_hist(snapshot)
+
+    LIVE_HIST_MIN_S = 0.4
+    LIVE_HIST_COST_X = 3.0  # the GUI thread spends at most ~1/3 of its time on live histogram redraws
+
+    def _show_live_hist(self, snapshot) -> None:
+        """A live (partial) TRPL snapshot: keep the newest, redraw when the throttle allows."""
         self._spad_latest_hist_snapshot = snapshot
-        self._update_histogram_tab()
+        if not self._live_hist_timer.isActive():
+            delay = max(0.0, self._live_hist_next - time.monotonic())
+            self._live_hist_timer.start(int(delay * 1000.0))
+
+    def _flush_live_hist(self) -> None:
+        t0 = time.monotonic()
+        try:
+            self._update_histogram_tab()
+        finally:
+            cost = time.monotonic() - t0
+            self._live_hist_next = time.monotonic() + max(self.LIVE_HIST_MIN_S, self.LIVE_HIST_COST_X * cost)
 
     def _apply_crop_to_liveview(self) -> None:
         if self.liveView is None:
@@ -2549,6 +2655,144 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             self.tcspcConnBtn.setText("Connecting..." if st == spad_det.CONNECTING else "Busy...")
             self.tcspcConnBtn.setEnabled(False)
 
+    # -----------------
+    # Dynamic sweep TRPL time
+    # -----------------
+    def _dyn_on(self) -> bool:
+        return self.trplTimeCombo.currentIndex() == 1
+
+    def _pl_time_s(self) -> float:
+        return float(self.exposureSpin.value()) * int(self.accumSpin.value()) / 1000.0
+
+    def _dyn_first_from_pl(self) -> bool:
+        return self.dynFirstPlChk.isChecked() and self._measure_pl()
+
+    def _dyn_first_s(self) -> float:
+        return max(0.1, self._pl_time_s()) if self._dyn_first_from_pl() else float(self.dynFirstSpin.value())
+
+    def _sync_dyn_controls(self, busy: Optional[bool] = None) -> None:
+        if busy is None:
+            busy = self._is_busy()
+        self.dynCtrlWidget.setVisible(self._dyn_on())
+        self.trplTimeCombo.setEnabled(not busy)
+        for w in (self.dynTargetSpin, self.dynFirstPlChk, self.dynStepSpin, self.dynMaxSpin):
+            w.setEnabled(not busy)
+        from_pl = self._dyn_first_from_pl()
+        self.dynFirstSpin.setEnabled(not busy and not from_pl)
+        if from_pl:
+            self.dynFirstSpin.blockSignals(True)  # shows the PL time; the saved own value is kept
+            self.dynFirstSpin.setValue(self._dyn_first_s())
+            self.dynFirstSpin.blockSignals(False)
+            self.dynFirstSpin.setToolTip(f"= PL time ({self._pl_time_s():g} s = exposure × accumulations)")
+        else:
+            self.dynFirstSpin.setToolTip("Length of the first chunk")
+
+    def _save_dyn_settings(self, *_args) -> None:
+        ds = self._det_settings
+        ds.setValue("trpl_time_mode", "dynamic" if self._dyn_on() else "fixed")
+        ds.setValue("trpl_dyn_target", int(self.dynTargetSpin.value()))
+        if not self._dyn_first_from_pl():
+            ds.setValue("trpl_dyn_first_s", float(self.dynFirstSpin.value()))
+        ds.setValue("trpl_dyn_first_pl", bool(self.dynFirstPlChk.isChecked()))
+        ds.setValue("trpl_dyn_step_s", float(self.dynStepSpin.value()))
+        ds.setValue("trpl_dyn_max_s", float(self.dynMaxSpin.value()))
+
+    def _wire_dyn_controls(self) -> None:
+        self.trplTimeCombo.currentIndexChanged.connect(lambda _i: self._sync_dyn_controls())
+        self.dynFirstPlChk.toggled.connect(lambda _b: self._sync_dyn_controls())
+        for sig in (self.exposureSpin.valueChanged, self.accumSpin.valueChanged,
+                    self.measureCombo.currentIndexChanged):
+            sig.connect(lambda *_a: self._sync_dyn_controls())
+        for sig in (self.trplTimeCombo.currentIndexChanged, self.dynTargetSpin.valueChanged,
+                    self.dynFirstSpin.valueChanged, self.dynFirstPlChk.toggled, self.dynStepSpin.valueChanged,
+                    self.dynMaxSpin.valueChanged):
+            sig.connect(self._save_dyn_settings)
+        self._sync_dyn_controls()
+
+    def _dyn_usable_dark(self):
+        ref = self._dark_ref
+        return ref if ref is not None and ref.num_pixels == self._det.num_pixels else None
+
+    def _dyn_settings(self, with_background: bool = True) -> Optional["tdyn.DynamicSettings"]:
+        """The dynamic TRPL settings of the sweep (None = Fixed time, or TRPL not measured)."""
+        if not (self._dyn_on() and self._measure_trpl()):
+            return None
+        kw = {}
+        if with_background:
+            win = None if self._pre_t0_auto else (float(self.spin_pre_t0_start.value()),
+                                                  float(self.spin_pre_t0_end.value()))
+            if win is not None and self._hist_rel and self._hist_last_off is not None:
+                win = (win[0] + self._hist_last_off, win[1] + self._hist_last_off)  # raw times (worker)
+            kw = {"dark_ref": self._dyn_usable_dark(), "pre_t0_window": win,
+                  "excluded": tuple(sorted(int(p) for p in self._spad_excluded_fit_pixels))}
+        return tdyn.DynamicSettings(target_counts=float(self.dynTargetSpin.value()), first_s=self._dyn_first_s(),
+                                    step_s=float(self.dynStepSpin.value()), max_s=float(self.dynMaxSpin.value()),
+                                    **kw)
+
+    def _dyn_record(self, payload: dict) -> None:
+        """One dynamic spot came in (trpl_done): keep it for the summary, report it."""
+        dyn = payload.get("dyn")
+        if not isinstance(dyn, dict):
+            return
+        fp = payload.get("filepath")
+        self._dyn_results.append(dict(dyn, file=os.path.basename(fp) if fp else "", pump2=payload.get("pump2")))
+        if payload.get("pump2"):
+            return
+        spots = [r for r in self._dyn_results if not r.get("pump2")]
+        low = sum(not r.get("reached") for r in spots)
+        flag = "" if dyn.get("reached") else "  ** BELOW TARGET (max time) **"
+        self.statusBar().showMessage(
+            f"TRPL spot: {dyn.get('total_s', 0):g} s in {dyn.get('n_chunks', 0)} chunk(s), peak "
+            f"{dyn.get('peak', 0):.0f}/{dyn.get('target', 0):g}{flag}  |  {low} of {len(spots)} spot(s) below target")
+
+    def _write_dynamic_summary(self, status: str) -> None:
+        """Append the dynamic TRPL summary to session.md (also after an abort)."""
+        st = getattr(self, "_sweep_dyn", None)
+        if st is None or not self._save_dir:
+            return
+        spots = [r for r in self._dyn_results if not r.get("pump2")]
+        repeats = [r for r in self._dyn_results if r.get("pump2")]
+        if not self._session_saved:
+            self._write_session_metadata()
+        totals = [float(r.get("total_s", 0.0)) for r in spots]
+        low = [r for r in spots if not r.get("reached")]
+        lines = ["", "## TRPL dynamic", f"- Status: {status}",
+                 f"- Spots decided: {len(spots)}"
+                 + (f" (+ {len(repeats)} pump-2-on acquisitions that repeat pump 2 off's time)" if repeats else ""),
+                 f"- Reached the target ({st.target_counts:g} counts): {len(spots) - len(low)}; "
+                 f"below target (stopped at the max {st.max_s:g} s): {len(low)}"]
+        if totals:
+            lines.append(f"- TRPL time per spot (s): min {min(totals):g}, median {float(np.median(totals)):g}, "
+                         f"max {max(totals):g}; total {sum(totals) + sum(float(r.get('total_s', 0)) for r in repeats):g}")
+        lines.append(f"- Per-spot log: {tdyn.LOG_NAME}; every chunk: {tdyn.CHUNK_DIR}/")
+        if low:
+            lines.append("- Below target: " + ", ".join(r.get("file") or "?" for r in low[:40])
+                         + (" …" if len(low) > 40 else ""))
+        try:
+            with open(os.path.join(self._save_dir, "session.md"), "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as exc:
+            self.statusBar().showMessage(f"TRPL dynamic summary not written: {exc}")
+
+    def _write_problems_summary(self, problems: List[dict]) -> None:
+        """Failed TRPL attempts of the sweep (retried, or the point kept without TRPL) in session.md."""
+        if not problems or not self._save_dir:
+            return
+        if not self._session_saved:
+            self._write_session_metadata()
+        gave_up = [p for p in problems if p.get("outcome") != "retried"]
+        lines = ["", "## Problems",
+                 f"- {len(problems)} failed TRPL attempt(s), each followed by a retry except {len(gave_up)} where it "
+                 f"gave up (point kept without TRPL, or a dynamic spot ended with the chunks it had)",
+                 "- Details: scan_problems.txt; partial data of failed attempts: trpl_failed/"]
+        lines += [f"- {p['time']} {p['point']} {p['what']} attempt {p['attempt']}: {p['error']} -> {p['outcome']}"
+                  for p in problems[:30]]
+        try:
+            with open(os.path.join(self._save_dir, "session.md"), "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as exc:
+            self.statusBar().showMessage(f"Problems summary not written: {exc}")
+
     def _sync_controls(self) -> None:
         cam_ok = self.camDev.is_connected
         stage_a_ok = self.stage is not None
@@ -2607,6 +2851,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         self.tcspcCalibAlignBtn.setEnabled(spad_ok and not busy)
         self.tcspcAcqSpin.setEnabled(not self.spadDev.trpl_running and not busy)
         self.tcspcBinSpin.setEnabled(not self.spadDev.trpl_running and not busy)
+        self._sync_dyn_controls(busy)
         self.measureCombo.setEnabled(not busy)
         self.didpChk.setEnabled(not busy)
         self.flipperSettleSpin.setEnabled(not busy)
@@ -2979,11 +3224,14 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             "dark_reference_taken_at": None if self._dark_ref is None else self._dark_ref.taken_at,
             "tcspc_host": DEFAULT_TCSPC_HOST,
             "tcspc_port": int(DEFAULT_TCSPC_PORT),
-            "tcspc_acq_s": float(self.tcspcAcqSpin.value()),
+            "tcspc_acq_s": "dynamic" if self._dyn_settings(False) is not None else float(self.tcspcAcqSpin.value()),
             "tcspc_bin_ps": int(self.tcspcBinSpin.value()),
+            **self._dyn_metadata(),
             "hist_start_ns": float(self.histStartNsSpin.value()),
             "hist_end_ns": float(self.histEndNsSpin.value()),
             "hist_ref_ns": float(self.histRefNsSpin.value()),
+            "hist_times_after_t0": bool(self._hist_rel),  # start/end/ref relative to time zero (t = 0)
+            "hist_ref_auto": bool(self.chk_hist_ref_auto.isChecked()),
             "didp": bool(self.didpChk.isChecked()),
             "pump2_on_position": int(self._pump2_on_position()),
             "flipper_serial": self.flipperSerialEdit.text().strip(),
@@ -2991,6 +3239,16 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             "ramp_micro_read": bool(self.rampReadChk.isChecked()),
             "home_gates_after_scan": bool(self.homeAfterScanChk.isChecked()),
         }
+
+    def _dyn_metadata(self) -> dict:
+        st = self._dyn_settings(False)
+        if st is None:
+            return {"trpl_time_mode": "fixed"}
+        return {"trpl_time_mode": "dynamic", "trpl_dyn_target_counts": st.target_counts,
+                "trpl_dyn_first_s": st.first_s, "trpl_dyn_first_is_pl_time": self._dyn_first_from_pl(),
+                "trpl_dyn_step_s": st.step_s, "trpl_dyn_max_s": st.max_s,
+                "trpl_dyn_background": "dark reference" if self._dyn_usable_dark() is not None else "pre-t0",
+                "trpl_dyn_log": tdyn.LOG_NAME}
 
     def _reset_sweep_data(self) -> None:
         self._pv_images.clear()
@@ -4110,6 +4368,26 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             if ans != QtWidgets.QMessageBox.Yes:
                 return
 
+        dyn = self._dyn_settings() if measure_trpl else None
+        if dyn is not None:
+            err = dyn.validate()
+            if err:
+                QtWidgets.QMessageBox.warning(self, "Sweep", f"Dynamic TRPL time: {err}.")
+                return
+            if dyn.dark_ref is None:
+                win = ("automatic window" if dyn.pre_t0_window is None
+                       else "%g-%g ns" % tuple(sorted(dyn.pre_t0_window)))
+                ans = QtWidgets.QMessageBox.question(
+                    self, "Sweep",
+                    f"No {self._det.key} dark reference for the dynamic TRPL time.\n\n"
+                    f"The peak check subtracts each pixel's pre-t0 level instead ({win}).\n\n"
+                    "Start the sweep anyway?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+                if ans != QtWidgets.QMessageBox.Yes:
+                    return
+        self._sweep_dyn = dyn
+        self._dyn_results = []
+
         self._reset_sweep_data()
 
         mode = self._sweep_gate_mode()
@@ -4332,6 +4610,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             pump2_tags=PUMP2_TAGS,
             ramp_micro_read=self.rampReadChk.isChecked(),
             long_ramp_steps=LONG_RAMP_STEPS,
+            trpl_dynamic=dyn,
         )
         self._sweep_thread.frame_ready.connect(self.on_sweep_frame)
         self._sweep_thread.vi_ready.connect(self.on_sweep_vi)
@@ -4586,10 +4865,10 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         snap = payload.get("snapshot")
         if not is_trpl_snapshot(snap):
             return
-        self._spad_latest_hist_snapshot = snap
-        self._update_histogram_tab()
+        self._show_live_hist(snap)
 
     def on_sweep_trpl_done(self, payload: dict):
+        self._dyn_record(payload)
         if payload.get("pump2"):
             return
         snap = payload.get("snapshot")
@@ -4609,8 +4888,12 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
 
     def on_sweep_done(self, status: str):
         self._aborting = False
+        problems = list(getattr(self._sweep_thread, "trpl_problems", []) or [])
         self._sweep_thread = None
         self._finish_scan_timing(status)
+        self._write_dynamic_summary(status)
+        self._write_problems_summary(problems)
+        self._sweep_dyn = None
         self._set_busy(False)
         self._update_lifetime_tab()
         if self._spad_live_enabled and self.spadDev.state == spad_det.IDLE:
@@ -4674,6 +4957,9 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
                     self.sweepOrderPowerOuterRb, self.sweepOrderVoltageOuterRb, self.rampReadChk):
             chk.toggled.connect(later)
         self.angleListEdit.textChanged.connect(later)
+        for sig in (self.trplTimeCombo.currentIndexChanged, self.dynFirstSpin.valueChanged,
+                    self.dynFirstPlChk.toggled, self.dynStepSpin.valueChanged, self.dynMaxSpin.valueChanged):
+            sig.connect(later)
         self.powerListChk.toggled.connect(later)  # edits re-solve first (_apply_power_list kicks the estimate)
         later()
 
@@ -4728,6 +5014,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             flipper_settle_ms=float(self.flipperSettleSpin.value()),
             ramp_micro_read=self.rampReadChk.isChecked(),
             long_ramp_steps=LONG_RAMP_STEPS, detector=self._det.key,
+            **ScanSpec.dynamic_fields(self._dyn_settings(False)),
             **self._scan_start_state(),
         )
 
@@ -5177,11 +5464,30 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             out[:, j] = ncol
         return out
 
+    T0_LIVE_REFRESH_S = 10.0  # live view: full time-zero alignment at most this often (else the last shifts)
+
+    def _live_t0_alignment(self, counts: np.ndarray, t_ns: np.ndarray):
+        """While a histogram is still acquiring: the last alignment's per-pixel shifts applied to the new counts
+        (the shifts barely change within an acquisition); None = time for a full alignment."""
+        hit = self._hist_t0_cache.get("live")
+        if hit is None or hit["n_pix"] != counts.shape[1] or t_ns.size < 2:
+            return None
+        if abs(float(t_ns[1] - t_ns[0]) - hit["dt"]) > 1e-9:
+            return None
+        if time.monotonic() - hit["t"] > max(self.T0_LIVE_REFRESH_S, 10.0 * hit.get("cost", 0.0)):
+            return None
+        res = hit["res"]
+        out = np.array(counts, copy=True)
+        for p in np.flatnonzero(res.shift_bins):
+            out[:, p] = np.roll(counts[:, p], int(res.shift_bins[p]))
+        return dataclasses.replace(res, counts=out)
+
     def _t0_alignment(self, counts: np.ndarray, time_ns: np.ndarray, holder: dict, key: str):
         """``align_first_peaks`` of ``counts``, cached in ``holder[key]`` with the array it belongs to."""
         hit = holder.get(key)
         if hit is not None and hit[0] is counts:
             return hit[1]
+        self._t0_started = time.monotonic()
         try:
             res = align_first_peaks(counts, time_ns)
         except Exception as exc:
@@ -5189,26 +5495,116 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         holder[key] = (counts, res)
         return res
 
+    @staticmethod
+    def _set_spin_silently(spin, value: float) -> None:
+        spin.blockSignals(True)
+        spin.setValue(float(value))
+        spin.blockSignals(False)
+
+    def _on_hist_ref_edited(self) -> None:
+        """A reference typed (or clicked in the spectral view): it no longer follows t0 + N bins."""
+        self.chk_hist_ref_auto.blockSignals(True)
+        self.chk_hist_ref_auto.setChecked(False)
+        self.chk_hist_ref_auto.blockSignals(False)
+        self._update_histogram_tab()
+
+    def _sync_hist_frame(self, off: Optional[float]) -> None:
+        """The view switches between raw times and times after time zero: convert the times set in ns."""
+        rel = off is not None
+        if rel == self._hist_rel:
+            return
+        d = -float(off) if rel else float(self._hist_last_off or 0.0)
+        spins = [self.histStartNsSpin, self.histEndNsSpin, self.histRefNsSpin]
+        if not self._pre_t0_auto:
+            spins += [self.spin_pre_t0_start, self.spin_pre_t0_end]
+        for sp in spins:
+            self._set_spin_silently(sp, sp.value() + d)
+        self._hist_rel = rel
+        self._lifetime_dirty = True
+
+    def _peak_offset(self, t_raw: np.ndarray, res) -> Optional[float]:
+        """Raw time of the signal peak (brightest pixel) of an aligned histogram; None if none."""
+        if res is None or isinstance(res, Exception):
+            return None
+        return peak_display_offset(res.counts, t_raw, self._spad_excluded_fit_pixels)
+
+    def _view_offset(self, t_raw: np.ndarray, res, remember: bool = True, peak=False) -> Optional[float]:
+        """Raw time shown as t = 0 with the alignment on: the signal peak (None = raw times).  A histogram
+        without a peak (alignment failed, or the start of a live one) keeps the last offset (axis stays put).
+        ``peak``: the peak time if already known (False = find it)."""
+        if not self.chk_t0_align.isChecked():
+            off = None
+        else:
+            off = self._peak_offset(t_raw, res) if peak is False else peak
+            if off is None:
+                off = self._hist_last_off
+        if off is not None and (remember or self._hist_last_off is None):
+            self._hist_last_off = off  # (the Histogram tab's: converts the spins back to its raw times)
+        self._sync_hist_frame(off)
+        return off
+
+    def _hist_view(self, snapshot) -> Tuple[np.ndarray, np.ndarray]:
+        """(time ns, counts) shown for ``snapshot``: raw, or time-zero aligned with t = 0 at time zero."""
+        align = self.chk_t0_align.isChecked()
+        c = self._hist_view_cache
+        if c is not None and c[0] is snapshot and c[1] == align:
+            return c[2], c[3]
+        t_raw = snapshot.time_axis_ps.astype(np.float64) / 1000.0
+        counts, res = self._hist_aligned(snapshot, t_raw)
+        off = self._view_offset(t_raw, res)
+        t = t_raw if off is None else t_raw - off
+        if res is not None and not isinstance(res, Exception) and off is not None:
+            self.lbl_t0_align.setText(res.message + f" Time axis: t = 0 at the signal peak (brightest pixel, "
+                                      f"raw {off:.2f} ns).")
+        self._hist_view_cache = (snapshot, align, t, counts)
+        return t, counts
+
     def _hist_view_counts(self, snapshot, t_ns: np.ndarray) -> np.ndarray:
         """Counts shown in the Histogram tab: raw, or time-zero aligned (view only)."""
+        return self._hist_aligned(snapshot, t_ns)[0]
+
+    def _hist_aligned(self, snapshot, t_ns: np.ndarray):
+        """(counts, alignment result / exception / None when off) of ``snapshot`` (raw ``t_ns``)."""
         counts = snapshot.counts_matrix
         if not self.chk_t0_align.isChecked():
             self.lbl_t0_align.setText("")
-            return counts
-        res = self._t0_alignment(counts, t_ns, self._hist_t0_cache, "hist")
+            return counts, None
+        live = not getattr(snapshot, "done", True) and not getattr(snapshot, "cancelled", False)
+        res = self._live_t0_alignment(counts, t_ns) if live else None
+        if res is None:
+            res = self._t0_alignment(counts, t_ns, self._hist_t0_cache, "hist")
+            if live and not isinstance(res, Exception):
+                self._hist_t0_cache["live"] = {"res": res, "t": time.monotonic(), "n_pix": counts.shape[1],
+                                               "dt": float(t_ns[1] - t_ns[0]) if t_ns.size > 1 else 0.0,
+                                               "cost": time.monotonic() - getattr(self, "_t0_started", time.monotonic())}
         if isinstance(res, Exception):
             self.lbl_t0_align.setText(f"Time-zero alignment failed ({res}); raw data shown.")
-            return counts
+            return counts, res
         self.lbl_t0_align.setText(res.message)
-        return res.counts
+        return res.counts, res
+
+    def _record_view(self, rec: dict) -> Tuple[np.ndarray, np.ndarray]:
+        """(time ns, counts) of a stored TRPL record for the Lifetime tab: raw, or time-zero aligned with
+        t = 0 at the record's own signal peak (brightest pixel), so all records line up."""
+        t_raw = np.asarray(rec["time_ns"], dtype=np.float64)
+        counts = rec["counts"]
+        res, peak = None, None
+        if self.chk_t0_align.isChecked():
+            res = self._t0_alignment(counts, t_raw, rec, "_t0")
+            if not isinstance(res, Exception):
+                counts = res.counts
+            key = (id(res), tuple(sorted(self._spad_excluded_fit_pixels)))
+            hit = rec.get("_t0_peak")
+            if hit is None or hit[0] != key or hit[1] is not res:
+                hit = (key, res, self._peak_offset(t_raw, res))  # cached: redrawn for every record
+                rec["_t0_peak"] = hit
+            peak = hit[2]
+        off = self._view_offset(t_raw, res, remember=False, peak=peak)
+        return (t_raw if off is None else t_raw - off), counts
 
     def _record_view_counts(self, rec: dict) -> np.ndarray:
         """Counts of a stored TRPL record for the Lifetime tab: raw, or time-zero aligned."""
-        counts = rec["counts"]
-        if not self.chk_t0_align.isChecked():
-            return counts
-        res = self._t0_alignment(counts, np.asarray(rec["time_ns"], dtype=np.float64), rec, "_t0")
-        return counts if isinstance(res, Exception) else res.counts
+        return self._record_view(rec)[1]
 
     def _set_pre_t0_window(self, w0: float, w1: float) -> None:
         for sp, v in ((self.spin_pre_t0_start, w0), (self.spin_pre_t0_end, w1)):
@@ -5401,8 +5797,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             self._draw_sigma()
             return
 
-        t_ns = snapshot.time_axis_ps.astype(np.float64) / 1000.0
-        counts = self._hist_view_counts(snapshot, t_ns)
+        t_ns, counts = self._hist_view(snapshot)
         start_idx, end_idx, ref_idx = self._hist_time_indices(snapshot)
         start_ns = float(t_ns[start_idx])
         end_ns = float(t_ns[end_idx])
@@ -5468,8 +5863,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
         if not self._sigma_fit_allowed():
             return
         snapshot = self._spad_latest_hist_snapshot
-        t_ns = snapshot.time_axis_ps.astype(np.float64) / 1000.0
-        counts = self._hist_view_counts(snapshot, t_ns)
+        t_ns, counts = self._hist_view(snapshot)
         start_idx, end_idx, ref_idx = self._hist_time_indices(snapshot)
         if ref_idx >= end_idx:
             self.lbl_sigma.setText("The reference is at the end of the histogram range: nothing to fit.")
@@ -5648,7 +6042,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             rec = self._spad_trpl_data.get(key)
             if rec is None:
                 continue
-            t = np.asarray(rec["time_ns"], dtype=np.float64)
+            t = self._record_view(rec)[0]
             y = self._lifetime_trace(rec, pixel)
             mask = (t >= t_start) & (t <= t_end)
             if not np.any(mask):
@@ -5696,6 +6090,7 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             return
 
         pixel = int(self._spad_selected_pixel_live)
+        self._record_view(next(iter(self._spad_trpl_data.values())))  # Start / End in the current coordinates
         t_start = float(self.histStartNsSpin.value())
         t_end = float(self.histEndNsSpin.value())
         if t_end < t_start:
@@ -6176,11 +6571,21 @@ class PLTRPLPowerVoltageWidgetV2(QtWidgets.QWidget):
             f"- Detector: {meta.get('spad_detector', '')} ({meta.get('spad_num_pixels', '')} pixels, "
             f"{'detected from the server' if meta.get('spad_detector_detected') else 'selected manually'})",
             f"- Host: {meta.get('tcspc_host', '')}:{meta.get('tcspc_port', '')}",
-            f"- Acquisition (s): {meta.get('tcspc_acq_s', '')}",
+            (f"- Acquisition (s): dynamic (per file, see {tdyn.LOG_NAME})" if meta.get("trpl_time_mode") == "dynamic"
+             else f"- Acquisition (s): {meta.get('tcspc_acq_s', '')}"),
+        ] + ([
+            f"- TRPL time: dynamic; first chunk {meta['trpl_dyn_first_s']:g} s"
+            + (" (= PL time)" if meta.get("trpl_dyn_first_is_pl_time") else "")
+            + f", then {meta['trpl_dyn_step_s']:g} s chunks, max {meta['trpl_dyn_max_s']:g} s; stop when the brightest"
+            f" pixel's peak minus background reaches {meta['trpl_dyn_target_counts']:g} counts (background: "
+            f"{meta['trpl_dyn_background']}); TRPL_*.csv = sum of the chunks, chunks in {tdyn.CHUNK_DIR}/",
+        ] if meta.get("trpl_time_mode") == "dynamic" else []) + [
             f"- Bin size (ps): {meta.get('tcspc_bin_ps', '')}",
             f"- Dark reference: {self._sweep_dark_file or 'none'}"
             + (f" ({self._dark_ref.describe()})" if self._sweep_dark_file and self._dark_ref is not None else ""),
-            f"- Histogram start/end/ref (ns): {meta.get('hist_start_ns', '')}, {meta.get('hist_end_ns', '')}, {meta.get('hist_ref_ns', '')}",
+            f"- Histogram start/end/ref (ns{', t0 = 0' if meta.get('hist_times_after_t0') else ''}): "
+            f"{meta.get('hist_start_ns', '')}, {meta.get('hist_end_ns', '')}, {meta.get('hist_ref_ns', '')}",
+            f"- Reference: {('t0 + %d bins (auto)' % T0_REF_BINS) if meta.get('hist_ref_auto') else 'manual'}",
             f"- SPAD view: {'spectral (center line = wavelength axis)' if self._spectral else '2D space'}",
             f"- Wavelength calibration: {self._sweep_wlcal_file or 'none'}"
             + (f" ({self._wl_calib.describe()})" if self._sweep_wlcal_file and self._wl_calib is not None else ""),

@@ -27,10 +27,26 @@ from rot.rot_wrapper import MotionController
 from flipper.flipper_wrapper import MoveController as FlipperMoveController
 from measurements.pl_trpl_power_voltage_v2.scan_time import gate_ramp_microsteps
 from measurements.pl_trpl_power_voltage_v2.detectors import SPAD23, profile
+from measurements.pl_trpl_power_voltage_v2 import trpl_dynamic as tdyn
+from spad23.spad23_analysis import pre_pulse_window
 
 
 class _RampTrip(RuntimeError):
     """A sweep ramp reached the current compliance (the sweep ends with status "trip")."""
+
+
+# TRPL stream failures (e.g. the pSPAD server sent no DONE after a long acquisition) are retried on a new
+# connection; a point whose TRPL still fails is kept without TRPL and the sweep goes on.
+TRPL_RETRIES = 2              # extra attempts of one stream
+TRPL_RETRY_WAIT_S = 3.0       # pause before a retry (lets the server settle)
+TRPL_DONE_GRACE_S = 60.0      # silence allowed after the measurement end before "no DONE" (client default 15 s)
+MAX_TRPL_FAIL_POINTS = 3      # this many points in a row without TRPL: the sweep stops (server really down)
+FAILED_DIR = "trpl_failed"    # partial data of failed attempts (outside the TRPL_*.csv glob)
+PROBLEMS_NAME = "scan_problems.txt"
+
+
+class _TrplFailed(RuntimeError):
+    """A TRPL stream failed on every attempt."""
 
 
 class GateRampThread(QtCore.QThread):
@@ -149,6 +165,7 @@ class PowerVoltageSweepThread(QtCore.QThread):
         pump2_tags: Optional[Dict[bool, str]] = None,
         ramp_micro_read: bool = False,
         long_ramp_steps: int = 50,
+        trpl_dynamic: Optional["tdyn.DynamicSettings"] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -217,6 +234,12 @@ class PowerVoltageSweepThread(QtCore.QThread):
         # time per part since the last acquired point (stage, gate, read, wait, frame, save, trpl, flip, acq)
         self._tacc: Dict[str, float] = {}
         self._point_count = 0
+        # dynamic TRPL time (None = fixed tcspc_acq_s): chunks until the peak reaches the target
+        self.trpl_dynamic = trpl_dynamic if self.measure_trpl else None
+        self._dyn_log = tdyn.DynamicLog(self.save_dir) if self.trpl_dynamic is not None else None
+        self._dyn_schedule: Optional[List[int]] = None  # dI/dP: pump 2 off's chunks (ms), repeated at pump 2 on
+        self.trpl_problems: List[dict] = []  # failed TRPL attempts (session.md, scan_problems.txt)
+        self._trpl_fail_points = 0  # consecutive points whose TRPL failed on every attempt
 
     @contextlib.contextmanager
     def _timed(self, key: str):
@@ -686,6 +709,69 @@ class PowerVoltageSweepThread(QtCore.QThread):
             return None
         return path
 
+    def _note_trpl_problem(self, base_step: str, what: str, attempt: int, exc: Exception,
+                           saved: Optional[str], outcome: str) -> None:
+        rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "point": base_step, "what": what, "attempt": attempt,
+               "error": f"{type(exc).__name__}: {exc}", "partial_file": saved or "", "outcome": outcome}
+        self.trpl_problems.append(rec)
+        if self.save_dir:
+            try:
+                with open(os.path.join(self.save_dir, PROBLEMS_NAME), "a", encoding="utf-8") as f:
+                    f.write(" | ".join(f"{k}={v}" for k, v in rec.items()) + "\n")
+            except Exception:
+                pass
+
+    def _save_failed_partial(self, base_step: str, what: str, attempt: int, snap) -> Optional[str]:
+        """Keep what a failed stream had received (trpl_failed/, not a sweep point)."""
+        if not self.save_dir or snap is None or getattr(snap, "counts_matrix", None) is None:
+            return None
+        c = np.asarray(snap.counts_matrix)
+        if c.ndim != 2 or c.shape[0] == 0:
+            return None
+        folder = os.path.join(self.save_dir, FAILED_DIR)
+        tag = what.replace(" ", "_")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            k = 0
+            while True:
+                path = os.path.join(folder, f"TRPL_{base_step}_{tag}_attempt{attempt}" + (f"_{k}" if k else "") + ".csv")
+                if not os.path.exists(path):
+                    break
+                k += 1
+            tdyn.write_trpl_csv(path, c, float(snap.bin_width_ps))
+            return os.path.relpath(path, self.save_dir)
+        except Exception:
+            return None
+
+    def _trpl_stream(self, measurement_ms: int, bin_ps: int, on_update, base_step: str, what: str):
+        """One TRPL stream on its own connection, retried after a failure; returns the snapshot (a cancelled
+        one on abort), None when stopped during a failure, or raises ``_TrplFailed``."""
+        last_exc: Optional[Exception] = None
+        attempts = 1 + TRPL_RETRIES
+        for attempt in range(1, attempts + 1):
+            if self._stop:
+                return None
+            try:
+                with self.detector.tcspc_client(host=self.tcspc_host, port=self.tcspc_port,
+                                                stream_idle_timeout_s=TRPL_DONE_GRACE_S) as client:
+                    return client.acquire_trpl_stream(measurement_ms=measurement_ms, bin_width_ps=bin_ps,
+                                                      on_update=on_update, update_interval_s=0.4,
+                                                      should_stop=lambda: self._stop)
+            except Exception as exc:
+                if self._stop:
+                    return None
+                last_exc = exc
+                saved = self._save_failed_partial(base_step, what, attempt, getattr(exc, "snapshot", None))
+                retry = attempt < attempts
+                self._note_trpl_problem(base_step, what, attempt, exc, saved, "retried" if retry else "gave up")
+                self.status.emit(f"TRPL {what} failed (attempt {attempt}/{attempts}): {exc}"
+                                 + (f"; retrying in {TRPL_RETRY_WAIT_S:g} s" if retry else ""))
+                if retry:
+                    t_end = time.monotonic() + TRPL_RETRY_WAIT_S
+                    while time.monotonic() < t_end and not self._stop:
+                        time.sleep(0.05)
+        raise _TrplFailed(f"{what} failed {attempts} times; last error: {last_exc}")
+
     def _acquire_trpl(self, entry, base_step: str, step_idx: int, tags: dict, box: dict) -> None:
         """Quick count snapshot, then the TRPL stream; result (or error) in ``box``.
 
@@ -695,6 +781,12 @@ class PowerVoltageSweepThread(QtCore.QThread):
         t0 = time.monotonic()
         try:
             self._acquire_trpl_body(entry, base_step, step_idx, tags, box)
+        except Exception as exc:  # a bug, not the stream: still not worth losing the whole sweep
+            if self._stop:
+                box["aborted"] = True
+            else:
+                self._note_trpl_problem(base_step, "TRPL", 0, exc, None, "point kept without TRPL")
+                box["failed"] = f"TRPL at {base_step}: unexpected {type(exc).__name__}: {exc}"
         finally:
             box["dt"] = time.monotonic() - t0
 
@@ -709,29 +801,150 @@ class PowerVoltageSweepThread(QtCore.QThread):
         if self._stop:
             box["aborted"] = True
             return
+        if self.trpl_dynamic is not None:
+            self._acquire_trpl_dynamic(entry, base_step, step_idx, tags, box)
+            return
         measurement_ms = max(1, int(round(self.tcspc_acq_s * 1000.0)))
         bin_ps = max(1, int(self.tcspc_bin_ps))
         self.status.emit(f"TRPL acquire @ point (t={self.tcspc_acq_s:.3g}s, bin={bin_ps} ps)...")
         try:
-            with self.detector.tcspc_client(host=self.tcspc_host, port=self.tcspc_port) as tcspc_client:
-                snap = tcspc_client.acquire_trpl_stream(
-                    measurement_ms=measurement_ms,
-                    bin_width_ps=bin_ps,
-                    on_update=lambda s: self.trpl_update.emit(dict(tags, snapshot=s, entry=entry, step_idx=step_idx)),
-                    update_interval_s=0.4,
-                    should_stop=lambda: self._stop,
-                )
-        except Exception as exc:
-            if self._stop:
-                box["aborted"] = True
-            else:
-                box["error"] = f"error: TRPL acquire failed: {exc}"
+            snap = self._trpl_stream(
+                measurement_ms, bin_ps,
+                lambda s: self.trpl_update.emit(dict(tags, snapshot=s, entry=entry, step_idx=step_idx)),
+                base_step, "stream")
+        except _TrplFailed as exc:
+            box["failed"] = f"TRPL at {base_step}: {exc}"
             return
-        if self._stop or getattr(snap, "cancelled", False):
+        if snap is None or self._stop or getattr(snap, "cancelled", False):
             box["aborted"] = True
             return
         box["snapshot"] = snap
         box["filepath"] = self._save_trpl_csv(base_step, snap)
+
+    def _acquire_trpl_dynamic(self, entry, base_step: str, step_idx: int, tags: dict, box: dict) -> None:
+        """TRPL in chunks (one complete ``S,<ms>`` each, on one connection) until the brightest pixel's
+        background-subtracted peak reaches the target, or the max time.  The chunks are summed bin-for-bin
+        (zero-padded at the end: row 0 is t = 0 in every chunk) and each one is saved in trpl_chunks/.
+        dI/dP pump 2 on repeats pump 2 off's chunk list (equal time), without the count check."""
+        st = self.trpl_dynamic
+        bin_ps = max(1, int(self.tcspc_bin_ps))
+        plan = tdyn.ChunkPlan(st.first_s, st.step_s, st.max_s)
+        pump2 = tags.get("pump2")
+        fixed = list(self._dyn_schedule) if (pump2 is True and self._dyn_schedule) else None
+        res = tdyn.SpotResult(target=float(st.target_counts), max_s=plan.max_ms / 1000.0)
+        path = self._next_filename(f"TRPL_{base_step}", ext=".csv") if self.save_dir else None
+        stem = os.path.splitext(os.path.basename(path))[0] if path else f"TRPL_{base_step}"
+        chunk_dir = os.path.join(self.save_dir, tdyn.CHUNK_DIR) if self.save_dir else None
+        acc: Optional[np.ndarray] = None
+        n_events = 0
+        oow = 0
+        warns: List[str] = []
+        last = None
+        t_start = time.monotonic()
+
+        def emit_live(s, done_ms: int, chunk_ms: int, prev, prev_events: int):
+            # the running total: earlier chunks + this chunk so far (time = what the counts cover)
+            part_ms = int(min(chunk_ms, max(0.0, float(s.elapsed_s)) * 1000.0))
+            live = tdyn.combine_snapshot(s, tdyn.pad_add(prev, s.counts_matrix), max(1, done_ms + part_ms),
+                                         prev_events + int(s.n_events), oow, (), time.monotonic() - t_start,
+                                         done=False, cancelled=bool(getattr(s, "cancelled", False)))
+            self.trpl_update.emit(dict(tags, snapshot=live, entry=entry, step_idx=step_idx))
+
+        def finish_box():
+            box["dyn"] = res.as_dict()
+            box["trpl_acq_s"] = res.total_s
+            box["trpl_chunks"] = len(res.chunk_ms)
+
+        try:
+            while True:
+                if self._stop:
+                    res.reason = "aborted"
+                    break
+                if fixed is not None:
+                    if len(res.chunk_ms) >= len(fixed):
+                        res.reason = "fixed_schedule"
+                        break
+                    ms = int(fixed[len(res.chunk_ms)])
+                else:
+                    ms = plan.next_ms(res.chunk_ms)
+                    if ms is None:
+                        res.reason = "max_time"
+                        break
+                k = len(res.chunk_ms) + 1
+                done_ms = int(sum(res.chunk_ms))
+                goal = (f"{sum(fixed) / 1000.0:g} s (= pump 2 off)" if fixed is not None
+                        else f"max {plan.max_ms / 1000.0:g} s")
+                self.status.emit(f"TRPL chunk {k} ({ms / 1000.0:g} s) · {done_ms / 1000.0:g} s done, {goal} · "
+                                 f"peak {res.peak:.0f}/{st.target_counts:g}")
+                snap = self._trpl_stream(
+                    ms, bin_ps,
+                    lambda s, _d=done_ms, _m=ms, _p=acc, _n=n_events: emit_live(s, _d, _m, _p, _n),
+                    base_step, f"chunk {k}")
+                if snap is None or self._stop or getattr(snap, "cancelled", False):
+                    res.reason = "aborted"  # the partial chunk is dropped
+                    break
+                acc = tdyn.pad_add(acc, snap.counts_matrix)
+                res.chunk_ms.append(ms)
+                n_events += int(snap.n_events)
+                oow += int(getattr(snap, "out_of_window", 0))
+                warns.extend(snap.warnings)
+                last = snap
+                if chunk_dir:
+                    cpath = os.path.join(chunk_dir, f"{stem}_c{k:02d}.csv")
+                    try:
+                        os.makedirs(chunk_dir, exist_ok=True)
+                        tdyn.write_trpl_csv(cpath, snap.counts_matrix, bin_ps)
+                        res.chunk_files.append(os.path.basename(cpath))
+                    except Exception as exc:
+                        self.status.emit(f"TRPL chunk file not saved: {exc}")
+                pk = tdyn.peak_counts(acc, bin_ps, res.total_s, st, pre_pulse_window)
+                res.peak, res.pixel, res.t_ns = pk["peak"], pk["pixel"], pk["t_ns"]
+                res.background = pk["background"]
+                res.reached = res.peak >= float(st.target_counts)
+                if fixed is None and res.reached:
+                    res.reason = "target"
+                    break
+        except _TrplFailed as exc:
+            # keep the chunks already summed (the spot is flagged 'error'); none: the point has no TRPL
+            res.reason = "error"
+            res.reached = False
+            if last is None:
+                box["failed"] = f"TRPL at {base_step}: {exc}"
+                finish_box()
+                self._log_dynamic(None, res, entry, step_idx, tags)
+                return
+            self.status.emit(f"TRPL at {base_step}: {exc}; keeping the {len(res.chunk_ms)} chunk(s) taken")
+        finish_box()
+        if res.reason == "aborted" or last is None:
+            box["aborted"] = True
+            self._log_dynamic(None, res, entry, step_idx, tags)
+            return
+        total_ms = int(sum(res.chunk_ms))
+        box["snapshot"] = tdyn.combine_snapshot(last, acc, total_ms, n_events, oow, warns,
+                                                time.monotonic() - t_start)
+        if pump2 is False:
+            self._dyn_schedule = list(res.chunk_ms)
+        if path:
+            try:
+                tdyn.write_trpl_csv(path, acc, bin_ps)
+                box["filepath"] = path
+            except Exception as exc:
+                self.status.emit(f"TRPL file not saved: {exc}")
+                box["filepath"] = None
+        self._log_dynamic(box.get("filepath"), res, entry, step_idx, tags)
+        flag = "" if res.reached else f"  ** below target ({res.reason}) **"
+        self.status.emit(f"TRPL done: {len(res.chunk_ms)} chunk(s), {res.total_s:g} s, "
+                         f"peak {res.peak:.0f}/{st.target_counts:g} (pixel {res.pixel}){flag}")
+
+    def _log_dynamic(self, filepath, res, entry, step_idx: int, tags: dict) -> None:
+        if self._dyn_log is None:
+            return
+        try:
+            self._dyn_log.append(filepath, res, step_idx=step_idx, power_w=getattr(entry, "power_w", None),
+                                 v_front=tags.get("a_voltage"), v_back=tags.get("b_voltage"),
+                                 pump2=tags.get("pump2"))
+        except Exception as exc:
+            self.status.emit(f"{tdyn.LOG_NAME} not written: {exc}")
 
     def _acquire_at_step(self, entry, base: str, step_idx: int,
                          v_front: Optional[float], v_back: Optional[float]) -> bool:
@@ -772,6 +985,7 @@ class PowerVoltageSweepThread(QtCore.QThread):
         vsuffix = self._voltage_suffix(v_front, v_back)
         base_step = f"{base}{vsuffix}" if vsuffix else base
         vi = (v_read_f, i_read_f, v_read_b, i_read_b)
+        self._dyn_schedule = None
         if not self.didp:
             with self._timed("acq"):
                 return self._acquire_one(entry, base_step, step_idx, v_front, v_back, vi, pump2=None)
@@ -853,6 +1067,9 @@ class PowerVoltageSweepThread(QtCore.QThread):
             trpl_thread.join()
         if "dt" in trpl_box:
             self._tacc["trpl"] = self._tacc.get("trpl", 0.0) + float(trpl_box["dt"])
+        if "trpl_acq_s" in trpl_box:  # dynamic: the requested TRPL time and chunks (scan estimate)
+            self._tacc["trpl_acq_s"] = self._tacc.get("trpl_acq_s", 0.0) + float(trpl_box["trpl_acq_s"])
+            self._tacc["trpl_chunks"] = self._tacc.get("trpl_chunks", 0) + int(trpl_box["trpl_chunks"])
         if err:
             if err == "aborted":
                 self._set_done("aborted")
@@ -867,13 +1084,27 @@ class PowerVoltageSweepThread(QtCore.QThread):
             self.status.emit(trpl_box["error"])
             self._set_done(trpl_box["error"])
             return False
+        if self.measure_trpl:
+            if trpl_box.get("failed"):
+                self._trpl_fail_points += 1
+                if self._trpl_fail_points >= MAX_TRPL_FAIL_POINTS:
+                    msg = (f"error: TRPL failed at {self._trpl_fail_points} points in a row; last: "
+                           f"{trpl_box['failed']}")
+                    self.status.emit(msg)
+                    self._set_done(msg)
+                    return False
+                self.status.emit(f"{trpl_box['failed']} -- point kept without TRPL, the sweep goes on "
+                                 f"({PROBLEMS_NAME})")
+            else:
+                self._trpl_fail_points = 0
 
         if self.measure_pl:
             self._emit_point(entry, result, step_idx, voltage_key, v_read_f, i_read_f, v_read_b, i_read_b,
                              a_voltage=v_front, b_voltage=v_back, pump2=pump2)
         if self.measure_trpl:
             self.trpl_done.emit(dict(tags, snapshot=trpl_box.get("snapshot"), entry=entry, step_idx=step_idx,
-                                     filepath=trpl_box.get("filepath")))
+                                     filepath=trpl_box.get("filepath"), dyn=trpl_box.get("dyn"),
+                                     failed=trpl_box.get("failed")))
         return True
 
     def _run_power_outer(self, power_plan: List[dict]) -> bool:

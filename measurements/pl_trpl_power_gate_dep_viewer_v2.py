@@ -409,6 +409,105 @@ def _linecut_h(image: np.ndarray, row: int, width: int) -> Optional[np.ndarray]:
     return None if r2 <= r1 else a[r1:r2, :].sum(axis=0)
 
 
+# Points whose substrate signal is below this fraction of the largest |substrate|
+# are set to NaN in ΔR/R0, so near-zero denominators do not blow up the colour scale.
+RC_MIN_FRAC = 0.01
+
+
+def _rc_ratio(num: np.ndarray, den: np.ndarray, min_frac: float = RC_MIN_FRAC) -> np.ndarray:
+    """Element-wise num / den (num = R − R0, den = R0); NaN where |den| is tiny."""
+    num = np.asarray(num, dtype=float)
+    den = np.asarray(den, dtype=float)
+    out = np.full(np.broadcast(num, den).shape, np.nan, dtype=float)
+    a = np.abs(den)
+    if not np.isfinite(a).any():
+        return out
+    thr = max(float(min_frac) * float(np.nanmax(a)), 0.0)
+    ok = np.isfinite(den) & (a > thr)
+    np.divide(num, den, out=out, where=ok)
+    return out
+
+
+def _lc_from_terms(terms, row_raw: int, width: int,
+                   wl: Optional[np.ndarray] = None, flatten=None) -> Optional[np.ndarray]:
+    """Linecut of Σ sign · (Σrows num) / (Σrows den); den None → plain row sum.
+    ``flatten`` = (feature_ranges_nm, order): each ratio term is then divided by a
+    smooth fit of its feature-free part (see ``_flatten_rc``)."""
+    total = None
+    for sign, num, den in terms:
+        lc = _linecut_h(num, row_raw, width)
+        if lc is None:
+            return None
+        if den is not None:
+            lc_d = _linecut_h(den, row_raw, width)
+            if lc_d is None:
+                return None
+            lc = _rc_ratio(lc, lc_d)
+            if flatten is not None and wl is not None:
+                lc = _flatten_rc(wl, lc, *flatten)[0]
+        lc = float(sign) * np.asarray(lc, dtype=float)
+        total = lc if total is None else total + lc
+    return total
+
+
+def _parse_ranges_nm(text: str) -> List[Tuple[float, float]]:
+    """'690-710, 820-870' → [(690, 710), (820, 870)] in nm.
+    A range whose ends are both < 10 is taken as eV (e.g. '1.95-2.0')."""
+    out: List[Tuple[float, float]] = []
+    for tok in re.split(r"[,;\n]+", str(text)):
+        m = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*(?:-|–|to|:)\s*([0-9]*\.?[0-9]+)\s*", tok)
+        if not m:
+            continue
+        a, b = float(m.group(1)), float(m.group(2))
+        if a < 10 and b < 10:
+            if a <= 0 or b <= 0:
+                continue
+            a, b = EV_NM / a, EV_NM / b
+        out.append((min(a, b), max(a, b)))
+    return out
+
+
+def _flatten_rc(wl: np.ndarray, rc: np.ndarray,
+                ranges_nm: List[Tuple[float, float]], order: int
+                ) -> Tuple[np.ndarray, np.ndarray]:
+    """Remove a smooth multiplicative error from RC = R/R0 − 1.
+
+    R/R0 measured = (1 + RC_true)·g(λ) with g smooth (focus / spot mismatch).
+    g is a polynomial of ``order`` fitted to 1 + RC outside ``ranges_nm``
+    (the feature regions); returns (RC_flat = (1 + RC)/g − 1, g − 1).
+    Too few feature-free points → all NaN."""
+    x = np.asarray(wl, dtype=float).ravel()
+    y = 1.0 + np.asarray(rc, dtype=float).ravel()
+    nan = np.full(y.shape, np.nan)
+    if x.size != y.size:
+        return nan, nan.copy()
+    order = max(0, int(order))
+    keep = np.isfinite(x) & np.isfinite(y)
+    for lo, hi in ranges_nm:
+        keep &= ~((x >= lo) & (x <= hi))
+    if int(keep.sum()) < order + 2:
+        return nan, nan.copy()
+    xs = x[keep]
+    c = 0.5 * (xs.min() + xs.max())
+    s = 0.5 * (xs.max() - xs.min()) or 1.0
+    P = np.polynomial.polynomial
+    g = P.polyval((x - c) / s, P.polyfit((xs - c) / s, y[keep], order))
+    flat = nan.copy()
+    ok = np.isfinite(g) & (g > 0)
+    np.divide(y, g, out=flat, where=ok)
+    return flat - 1.0, g - 1.0
+
+
+def _flatten_rc_rows(wl: np.ndarray, rc_img: np.ndarray,
+                     ranges_nm: List[Tuple[float, float]], order: int) -> np.ndarray:
+    """``_flatten_rc`` applied to every row of a (rows, λ) ΔR/R0 image."""
+    out = np.full(rc_img.shape, np.nan)
+    for i in range(rc_img.shape[0]):
+        if np.isfinite(rc_img[i]).any():
+            out[i] = _flatten_rc(wl, rc_img[i], ranges_nm, order)[0]
+    return out
+
+
 def _resample(wl_src: Optional[np.ndarray], lc: np.ndarray, wl_dst: Optional[np.ndarray]) -> np.ndarray:
     if wl_src is None or wl_dst is None:
         return lc
@@ -1197,11 +1296,14 @@ class SingleFrameView(QtWidgets.QWidget):
     """pyqtgraph-based PL image viewer with movable linecut selector."""
 
     linecut_changed = QtCore.pyqtSignal(int)  # display row (0 = top)
+    feature_regions_edited = QtCore.pyqtSignal(object)  # [(lo_nm, hi_nm), ...]
 
     def __init__(self, title: str = "", *, default_linecut_width: int = 1, parent=None):
         super().__init__(parent)
         self._img_data: Optional[np.ndarray] = None
         self._wl:       Optional[np.ndarray] = None
+        self._lc_terms = None  # ΔR/R0: [(sign, num, den)] → linecut = ratio of row sums
+        self._flatten  = None  # (feature_ranges_nm, order) when flattening ΔR/R0
         self._h = self._w = 0
         self._build_ui(str(title), int(default_linecut_width))
 
@@ -1286,6 +1388,15 @@ class SingleFrameView(QtWidgets.QWidget):
             name="Smoothed")
         self._smoothCurve.setVisible(False)
         self._dipVLines: List[pg.InfiniteLine] = []
+        # ΔR/R0 flatten mode: unflattened ratio, smooth fit (g − 1), feature regions
+        self._rawRcCurve  = pg.PlotDataItem(pen=pg.mkPen("#9e9e9e", width=1.0))
+        self._flatFitCurve = pg.PlotDataItem(
+            pen=pg.mkPen("#2e7d32", width=1.5, style=QtCore.Qt.DashLine))
+        for it in (self._rawRcCurve, self._flatFitCurve):
+            it.setZValue(-5)
+            self._lcPlot.addItem(it)
+        self._flat_legend = False
+        self._featRegions: List[pg.LinearRegionItem] = []
 
         self._glw.ci.layout.setRowStretchFactor(0, 4)
         self._glw.ci.layout.setRowStretchFactor(1, 2)
@@ -1305,8 +1416,14 @@ class SingleFrameView(QtWidgets.QWidget):
     def linecut_width(self) -> int:
         return int(self.linecutWidthSpin.value())
 
-    def set_image(self, img: np.ndarray, wl: Optional[np.ndarray] = None) -> None:
+    def set_image(self, img: np.ndarray, wl: Optional[np.ndarray] = None,
+                  lc_terms=None, flatten=None) -> None:
+        """lc_terms: optional [(sign, num, den)] images; the linecut is then
+        Σ sign·(Σrows num)/(Σrows den) instead of the row sum of ``img``.
+        flatten: optional (feature_ranges_nm, order), see ``_flatten_rc``."""
         self._img_data = np.asarray(img, dtype=float)
+        self._lc_terms = lc_terms
+        self._flatten  = flatten if lc_terms else None
         self._h, self._w = self._img_data.shape
         self._wl = None if wl is None else np.asarray(wl, dtype=float).ravel()
 
@@ -1374,13 +1491,67 @@ class SingleFrameView(QtWidgets.QWidget):
             return
         row_d   = int(np.clip(round(self._hline.value()), 0, self._h - 1))
         row_raw = self._h - 1 - row_d  # convert display row (0=top) to raw row
-        lc = _linecut_h(self._img_data, row_raw, self.linecut_width())
+        width   = self.linecut_width()
+        if self._lc_terms:
+            lc = _lc_from_terms(self._lc_terms, row_raw, width,
+                                wl=self._wl, flatten=self._flatten)
+        else:
+            lc = _linecut_h(self._img_data, row_raw, width)
+        self._rawRcCurve.setData([], [])
+        self._flatFitCurve.setData([], [])
         if lc is None:
             self._lcCurve.setData([], [])
+            self._show_flat_legend(False)
             return
         x = self._wl if (self._wl is not None and self._wl.size == lc.size) \
             else np.arange(lc.size, dtype=float)
         self._lcCurve.setData(x, lc)
+        # Flatten mode, single term: also show the raw ratio and the smooth fit
+        show = bool(self._flatten) and len(self._lc_terms or []) == 1 \
+            and self._lc_terms[0][2] is not None
+        if show:
+            raw = _lc_from_terms(self._lc_terms, row_raw, width)
+            if raw is not None and raw.size == x.size:
+                fit = _flatten_rc(x, raw, *self._flatten)[1]
+                self._rawRcCurve.setData(x, raw)
+                self._flatFitCurve.setData(x, fit)
+        self._show_flat_legend(show)
+
+    def _show_flat_legend(self, on: bool) -> None:
+        leg = self._lcPlot.legend
+        if leg is None or on == self._flat_legend:
+            return
+        if on:
+            leg.addItem(self._rawRcCurve, "R/R₀ − 1 (raw)")
+            leg.addItem(self._flatFitCurve, "Smooth fit")
+        else:
+            leg.removeItem(self._rawRcCurve)
+            leg.removeItem(self._flatFitCurve)
+        self._flat_legend = on
+
+    def set_feature_regions(self, ranges_nm: List[Tuple[float, float]], visible: bool) -> None:
+        """Shaded, draggable feature regions on the linecut plot (flatten mode).
+        Dragging one emits ``feature_regions_edited`` with the new list."""
+        ranges_nm = list(ranges_nm) if visible else []
+        if len(ranges_nm) != len(self._featRegions):
+            for r in self._featRegions:
+                self._lcPlot.removeItem(r)
+            self._featRegions = []
+            for _ in ranges_nm:
+                r = pg.LinearRegionItem(brush=pg.mkBrush(255, 160, 0, 45),
+                                        pen=pg.mkPen((230, 120, 0, 160)))
+                r.setZValue(-10)
+                r.sigRegionChangeFinished.connect(self._on_feat_region_moved)
+                self._lcPlot.addItem(r)
+                self._featRegions.append(r)
+        for r, (lo, hi) in zip(self._featRegions, ranges_nm):
+            r.blockSignals(True)
+            r.setRegion((lo, hi))
+            r.blockSignals(False)
+
+    def _on_feat_region_moved(self, *_) -> None:
+        self.feature_regions_edited.emit(
+            [tuple(sorted(float(v) for v in r.getRegion())) for r in self._featRegions])
 
     def _refresh_vlinecut(self) -> None:
         if self._img_data is None or self._h == 0 or self._w == 0:
@@ -1814,6 +1985,7 @@ class PLViewerV2(QtWidgets.QMainWindow):
         self.liveView = SingleFrameView(title="PL Image", default_linecut_width=1)
         self.liveView.linecut_changed.connect(lambda _: self._update_maps())
         self.liveView.linecutWidthSpin.valueChanged.connect(lambda _: self._update_maps())
+        self.liveView.feature_regions_edited.connect(self._on_feat_regions_dragged)
         split.addWidget(self.liveView)
         self.mapView   = MapPlotWidget("Linecut map",   cmap_name="viridis",  line_label="I")
         self.derivView = MapPlotWidget("Derivative map", cmap_name="coolwarm", line_label="dI/dx")
@@ -1866,9 +2038,12 @@ class PLViewerV2(QtWidgets.QMainWindow):
         left.addWidget(self.srcStack)
 
         corr = QtWidgets.QGroupBox("Corrections")
-        cl = QtWidgets.QHBoxLayout(corr)
-        cl.setContentsMargins(8, 4, 8, 4)
+        cv = QtWidgets.QVBoxLayout(corr)
+        cv.setContentsMargins(8, 4, 8, 4)
+        cv.setSpacing(4)
+        cl = QtWidgets.QHBoxLayout()
         cl.setSpacing(8)
+        cv.addLayout(cl)
 
         self.baselineCheck = QtWidgets.QCheckBox("Baseline correction")
         cl.addWidget(self.baselineCheck)
@@ -1890,6 +2065,15 @@ class PLViewerV2(QtWidgets.QMainWindow):
         cl.addWidget(self.bgHiSpin)
         self.subCheck = QtWidgets.QCheckBox("Subtract substrate")
         cl.addWidget(self.subCheck)
+        self.rcCheck = QtWidgets.QCheckBox("÷ substrate (ΔR/R₀)")
+        self.rcCheck.setToolTip(
+            "Also divide by the substrate: (R − R0) / R0.\n"
+            "Linecuts and maps use the ratio of row sums over the linecut width;\n"
+            "the 2-D image shows the per-pixel ratio.\n"
+            f"Points where |R0| < {RC_MIN_FRAC:.0%} of its max are blanked (NaN).\n"
+            "Turn on baseline correction so R0 has no dark offset.")
+        self.rcCheck.setEnabled(False)
+        cl.addWidget(self.rcCheck)
         self.lockAxesCheck = QtWidgets.QCheckBox("Lock axes")
         self.lockAxesCheck.setToolTip(
             "Freeze all axis ranges and colour scales so switching\n"
@@ -1905,6 +2089,38 @@ class PLViewerV2(QtWidgets.QMainWindow):
         self.angleCalibStatusLbl.setStyleSheet("color: #888; font-size: 8pt;")
         cl.addWidget(self.angleCalibStatusLbl)
         cl.addStretch()
+
+        # Row 2: absolute ΔR/R0 — divide out a smooth fit of the feature-free part
+        cl2 = QtWidgets.QHBoxLayout()
+        cl2.setSpacing(8)
+        cv.addLayout(cl2)
+        self.flatCheck = QtWidgets.QCheckBox("Flatten ΔR/R₀")
+        self.flatCheck.setToolTip(
+            "Absolute RC: R/R0 = (1 + RC)·g(λ), with g a smooth error from focus /\n"
+            "spot mismatch. g is a polynomial fitted to R/R0 outside the feature\n"
+            "ranges; shown is (R/R0)/g − 1. Each spectrum (map column, image row)\n"
+            "gets its own fit. The linecut panel shows the raw ratio (grey), the\n"
+            "fit (green dashed) and the feature ranges (orange, draggable).")
+        self.flatCheck.setEnabled(False)
+        cl2.addWidget(self.flatCheck)
+        cl2.addWidget(QtWidgets.QLabel("Features:"))
+        self.featRangesEdit = QtWidgets.QLineEdit("820-870")
+        self.featRangesEdit.setPlaceholderText("e.g. 690-710, 820-870  (or eV: 1.45-1.5)")
+        self.featRangesEdit.setToolTip(
+            "Wavelength ranges (nm) that contain features; they are left out of the\n"
+            "smooth fit. Separate ranges with commas. A range with both ends < 10\n"
+            "is read as eV. Features at the edge of the spectrum rely on\n"
+            "extrapolating the fit, so keep the order low there.")
+        self.featRangesEdit.setMinimumWidth(200)
+        cl2.addWidget(self.featRangesEdit, 1)
+        cl2.addWidget(QtWidgets.QLabel("Order:"))
+        self.flatOrderSpin = QtWidgets.QSpinBox()
+        self.flatOrderSpin.setRange(0, 8)
+        self.flatOrderSpin.setValue(2)
+        self.flatOrderSpin.setFixedWidth(50)
+        self.flatOrderSpin.setToolTip("Polynomial order of the smooth fit g(λ)")
+        cl2.addWidget(self.flatOrderSpin)
+        cl2.addStretch()
         left.addWidget(corr)
         left.addStretch()
         outer.addLayout(left, 2)
@@ -2063,7 +2279,14 @@ class PLViewerV2(QtWidgets.QMainWindow):
         self.baselineCheck.toggled.connect(lambda _: self._clear_caches_and_refresh())
         self.bgLoSpin.valueChanged.connect(lambda _: self._clear_caches_and_refresh())
         self.bgHiSpin.valueChanged.connect(lambda _: self._clear_caches_and_refresh())
+        self.subCheck.toggled.connect(self.rcCheck.setEnabled)
+        self.subCheck.toggled.connect(lambda _: self._sync_flat_enabled())
+        self.rcCheck.toggled.connect(lambda _: self._sync_flat_enabled())
         self.subCheck.toggled.connect(lambda _: self._refresh_all())
+        self.rcCheck.toggled.connect(lambda _: self._refresh_all())
+        self.flatCheck.toggled.connect(lambda _: self._on_flatten_changed())
+        self.featRangesEdit.editingFinished.connect(self._on_flatten_changed)
+        self.flatOrderSpin.valueChanged.connect(lambda _: self._on_flatten_changed())
         self.modeCombo.currentTextChanged.connect(self._on_mode_changed)
         self.gateAxisCombo.currentTextChanged.connect(self._on_gate_axis_changed)
         self.powerSlider.valueChanged.connect(self._on_power_changed)
@@ -2185,6 +2408,26 @@ class PLViewerV2(QtWidgets.QMainWindow):
         return self._ch[self._current_ch_key()]
 
     # ── Browse callbacks ──────────────────────────────────────────────
+
+    # ── ΔR/R0 flatten ─────────────────────────────────────────────────
+
+    def _sync_flat_enabled(self) -> None:
+        self.flatCheck.setEnabled(self.subCheck.isChecked() and self.rcCheck.isChecked())
+
+    def _flatten_params(self):
+        """(feature_ranges_nm, order) when Flatten ΔR/R0 is active, else None."""
+        if not (self.flatCheck.isEnabled() and self.flatCheck.isChecked()):
+            return None
+        return _parse_ranges_nm(self.featRangesEdit.text()), int(self.flatOrderSpin.value())
+
+    def _on_flatten_changed(self) -> None:
+        fl = self._flatten_params()
+        self.liveView.set_feature_regions(fl[0] if fl else [], fl is not None)
+        self._refresh_all()
+
+    def _on_feat_regions_dragged(self, ranges) -> None:
+        self.featRangesEdit.setText(", ".join(f"{lo:.1f}-{hi:.1f}" for lo, hi in ranges))
+        self._refresh_all()
 
     def _on_load_angle_calib(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -2459,13 +2702,8 @@ class PLViewerV2(QtWidgets.QMainWindow):
         fr     = self._get_frame(ch)
         if fr is None:
             self.liveView.clear_linecut_fit_overlay(); return
-        img, wl = self._get_corrected(ch, fr)
-        h = img.shape[0]
-        row_d   = self.liveView.linecut_row()
-        row_d   = h // 2 if row_d is None else max(0, min(int(row_d), h - 1))
-        row_raw = h - 1 - row_d
-        width   = int(self.liveView.linecut_width())
-        lc = _linecut_h(img, row_raw, width)
+        lc, wl, _ = self._corrected_linecut(ch, fr, self.liveView.linecut_row(),
+                                            int(self.liveView.linecut_width()))
         if lc is None:
             self.liveView.clear_linecut_fit_overlay(); return
         wl  = np.asarray(wl, dtype=float).ravel()
@@ -2597,13 +2835,28 @@ class PLViewerV2(QtWidgets.QMainWindow):
         ch._img_cache[fr.path] = (img, wl_c)
         return img, wl_c
 
-    def _get_corrected(self, ch: _Channel, fr: PLFrame) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (corrected_image, wl) applying baseline and substrate corrections."""
+    def _corrected_linecut(self, ch: _Channel, fr: PLFrame, row_disp: Optional[int],
+                           width: int) -> Tuple[Optional[np.ndarray], np.ndarray, bool]:
+        """(linecut, wl, is_rc) at display row ``row_disp`` (None → middle row).
+        With ÷ substrate on, the linecut is (ΣR − ΣR0)/ΣR0 over the rows
+        (then flattened when Flatten ΔR/R0 is on)."""
+        num, den, wl = self._get_corrected_parts(ch, fr)
+        h = num.shape[0]
+        row_d   = h // 2 if row_disp is None else max(0, min(int(row_disp), h - 1))
+        row_raw = h - 1 - row_d
+        lc = _lc_from_terms([(1.0, num, den)], row_raw, width,
+                            wl=wl, flatten=self._flatten_params())
+        return lc, wl, den is not None
+
+    def _get_corrected_parts(self, ch: _Channel, fr: PLFrame
+                             ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+        """Return (corrected_image, substrate_or_None, wl).  The second item is the
+        (baseline-corrected) substrate image R0 only when ÷ substrate is active."""
         img, wl = self._get_cropped_raw(ch, fr)
         do_bl  = self.baselineCheck.isChecked()
         do_sub = self.subCheck.isChecked() and ch.has_substrate
         if not do_bl and not do_sub:
-            return img, wl
+            return img, None, wl
         sub_fr = _ch_substrate_for(ch, fr) if do_sub else None
         sub_img = sub_wl = None
         if sub_fr is not None:
@@ -2622,7 +2875,12 @@ class PLViewerV2(QtWidgets.QMainWindow):
             use_baseline=do_bl, lo=lo, hi=hi,
             use_sub=do_sub and sub_img is not None,
         )
-        return corrected, wl
+        den = None
+        if (do_sub and sub_img is not None and self.rcCheck.isChecked()
+                and np.shape(sub_img) == np.shape(img)):
+            den = _corrected_image(sub_img, sub_wl, None, None,
+                                   use_baseline=do_bl, lo=lo, hi=hi, use_sub=False)
+        return corrected, den, wl
 
     def _get_frame(self, ch: _Channel) -> Optional[PLFrame]:
         """Current frame to display, given the power/front/back sliders."""
@@ -2657,17 +2915,33 @@ class PLViewerV2(QtWidgets.QMainWindow):
             self.liveView.set_image_title("(missing frame)")
             return
 
-        img, wl = self._get_corrected(ch, fr)
+        fl = self._flatten_params()
+
+        def _rc_img(num_, den_, wl_):
+            if den_ is None:
+                return num_
+            r = _rc_ratio(num_, den_)
+            return r if fl is None else _flatten_rc_rows(wl_, r, *fl)
+
+        num, den, wl = self._get_corrected_parts(ch, fr)
+        img = _rc_img(num, den, wl)
+        terms = [(1.0, num, den)]
 
         if self._is_diff_mode():
             ch_rh = self._ch["RH"]
             fr_rh = self._get_frame(ch_rh)
             if fr_rh is not None:
-                img_rh, wl_rh = self._get_corrected(ch_rh, fr_rh)
+                num_rh, den_rh, wl_rh = self._get_corrected_parts(ch_rh, fr_rh)
+                img_rh = _rc_img(num_rh, den_rh, wl_rh)
                 if img.shape == img_rh.shape:
                     img = img - img_rh
+                    terms.append((-1.0, num_rh, den_rh))
 
-        self.liveView.set_image(img, wl)
+        # ΔR/R0: the linecut panel uses the ratio of row sums, like the maps
+        rc = any(t[2] is not None for t in terms)
+        self.liveView.set_image(img, wl, lc_terms=terms if rc else None,
+                                flatten=fl if rc else None)
+        self.liveView.set_feature_regions(fl[0] if fl else [], bool(fl) and rc)
 
         def _f(v): return "--" if v is None or not np.isfinite(float(v)) else f"{float(v):.4g}"
         suffix = " [LH−RH]" if self._is_diff_mode() else (f" [{ch_key}]" if ch_key else "")
@@ -2760,13 +3034,8 @@ class PLViewerV2(QtWidgets.QMainWindow):
             if fr is None:
                 cols.append(np.full(wl_ref.shape, np.nan, dtype=float))
                 continue
-            img, wl = self._get_corrected(ch, fr)
-            h = img.shape[0]
-            # linecut_row() is in display space (flipud); convert to raw row
-            row_d   = int(row_disp_raw) if row_disp_raw is not None else h // 2
-            row_d   = max(0, min(row_d, h - 1))
-            row_raw = h - 1 - row_d
-            lc = _linecut_h(img, row_raw, width)
+            # linecut_row() is in display space (flipud); converted to raw row inside
+            lc, wl, _ = self._corrected_linecut(ch, fr, row_disp_raw, width)
             if lc is None:
                 cols.append(np.full(wl_ref.shape, np.nan, dtype=float))
                 continue
@@ -3028,12 +3297,8 @@ class PLViewerV2(QtWidgets.QMainWindow):
         if fr is None:
             self.liveView.clear_dip_overlay()
             return
-        img, wl = self._get_corrected(ch, fr)
-        h       = img.shape[0]
-        row_d   = self.liveView.linecut_row()
-        row_d   = h // 2 if row_d is None else max(0, min(int(row_d), h - 1))
-        row_raw = h - 1 - row_d
-        lc = _linecut_h(img, row_raw, int(self.liveView.linecut_width()))
+        lc, wl, _ = self._corrected_linecut(ch, fr, self.liveView.linecut_row(),
+                                            int(self.liveView.linecut_width()))
         if lc is None:
             self.liveView.clear_dip_overlay()
             return
@@ -3103,14 +3368,11 @@ class PLViewerV2(QtWidgets.QMainWindow):
                 fr = _frame_at(ch, p_key, _ch_norm_gate(ch, float(vf)), _ch_norm_back(ch, float(vb)))
                 if fr is None:
                     continue
-                img, wl = self._get_corrected(ch, fr)
-                h = img.shape[0]
-                row_d   = h // 2 if row_disp is None else max(0, min(int(row_disp), h - 1))
-                row_raw = h - 1 - row_d
-                lc = _linecut_h(img, row_raw, width)
+                lc, wl, is_rc = self._corrected_linecut(ch, fr, row_disp, width)
                 if lc is None:
                     continue
-                lc = self._baseline_linecut(lc, wl)
+                if not is_rc:  # ΔR/R0 is already a ratio of baselined sums
+                    lc = self._baseline_linecut(lc, wl)
                 vol[i, j, :] = np.asarray(_resample(wl, lc, wl_ref), dtype=float)
         return fronts.copy(), backs.copy(), wl_ref, vol
 
@@ -3324,6 +3586,7 @@ class _CubeWindow(QtWidgets.QMainWindow):
 # ══════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════
 
+import csv
 import threading
 import time
 import warnings
@@ -3507,6 +3770,9 @@ def _read_session(folder: Path) -> dict:
                 out["hist_ns"] = (vals[0], vals[1])
             if len(vals) >= 3:
                 out["ref_ns"] = vals[2]
+            out["hist_after_t0"] = "t0 = 0" in low      # newer GUIs: times after time zero (else raw)
+        elif low == "reference":
+            out["ref_auto"] = not val.lower().startswith("manual")
         elif low.startswith("time-zero alignment"):
             out["align"] = val.lower().startswith("on")
         elif low.startswith("di/dp"):
@@ -3519,6 +3785,35 @@ def _read_session(folder: Path) -> dict:
         elif low.startswith("background subtracted before the 2d fit"):
             v = val.lower()
             out["background"] = "dark_ref" if "dark" in v else "pre_t0" if "pre-t0" in v else "none"
+    return out
+
+
+DYN_LOG_NAME = "dynamic_trpl_log.csv"   # the measuring GUI's dynamic TRPL time (not "trpl_*": TRPL_*.csv globs ignore case)
+
+
+def read_dynamic_log(folder: Path) -> Dict[str, dict]:
+    """``{TRPL file name: {total_s, reached, peak, target, n_chunks, reason}}`` from the folder's
+    dynamic_trpl_log.csv ({} = fixed TRPL time: every file has session.md's 'Acquisition (s)')."""
+    out: Dict[str, dict] = {}
+    path = Path(folder) / DYN_LOG_NAME
+    if not path.is_file():
+        return out
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                name = (row.get("file") or "").strip()
+                if not name:
+                    continue                     # aborted spot: no summed file
+                try:
+                    out[name] = {"total_s": float(row["total_s"]), "reached": row.get("reached", "") == "yes",
+                                 "peak": float(row.get("peak_counts") or "nan"),
+                                 "target": float(row.get("target_counts") or "nan"),
+                                 "n_chunks": int(row.get("n_chunks") or 0), "reason": row.get("reason", ""),
+                                 "pump2": row.get("pump2", "")}
+                except (KeyError, ValueError):
+                    continue
+    except OSError:
+        return {}
     return out
 
 
@@ -3920,6 +4215,68 @@ def common_time_zero(t0s, period_ns: float) -> float:
     return float(v[0] + np.median(d))
 
 
+# With the alignment on, the views show t = raw time - offset: t = 0 ns at each point's signal peak
+# (brightest pixel, found after the first-peak alignment), on the bin grid.
+T0_REF_BINS = 5      # default reference frame: this many (shown) bins after time zero
+
+
+def t0_display_offset(time_ns: np.ndarray, target_ns: Optional[float]) -> Optional[float]:
+    """Raw time (ns) of the bin holding time zero ``target_ns`` (from bin 0); None without one."""
+    t = np.asarray(time_ns, dtype=np.float64)
+    if t.size < 2 or target_ns is None or not np.isfinite(target_ns):
+        return None
+    dt = float(np.median(np.diff(t)))
+    if not dt > 0:
+        return None
+    return float(t[int(np.round(float(target_ns) / dt)) % t.size])
+
+
+T0_PEAK_SMOOTH_NS = 0.5  # boxcar over which the brightest pixel's maximum is taken (the time zero shown)
+
+
+def peak_display_offset(counts: np.ndarray, time_ns: np.ndarray, excluded=()) -> Optional[float]:
+    """Raw time (ns) of the signal peak: the maximum of the brightest pixel (each pixel minus its median,
+    smoothed over T0_PEAK_SMOOTH_NS).  With the time-zero alignment on, the views put t = 0 here (the
+    pixels themselves stay aligned on their first-peak edge).  None without signal."""
+    c = np.asarray(counts, dtype=np.float64)
+    t = np.asarray(time_ns, dtype=np.float64)
+    if c.ndim != 2 or c.shape[0] < 4 or t.size != c.shape[0]:
+        return None
+    dt = float(np.median(np.diff(t)))
+    if not dt > 0:
+        return None
+    k = max(1, int(round(T0_PEAK_SMOOTH_NS / dt))) | 1
+    y = c - np.median(c, axis=0)
+    if k > 1:
+        cs = np.cumsum(np.vstack([np.zeros((1, y.shape[1])), y]), axis=0)
+        y = (cs[k:] - cs[:-k]) / k  # row i = mean of rows i .. i+k-1 (centre i + k // 2)
+    ex = [int(p) for p in excluded if 0 <= int(p) < y.shape[1]]
+    if ex:
+        y[:, ex] = -np.inf
+    p = int(np.argmax(y.max(axis=0)))
+    i = int(np.argmax(y[:, p]))
+    if not y[i, p] > 0:
+        return None
+    return float(t[i + k // 2])
+
+
+def view_offset(time_ns: np.ndarray, zero_ns: Optional[float]) -> Optional[float]:
+    """Raw time of the bin holding ``zero_ns`` (a raw time, circular): subtracted, it puts t = 0 there."""
+    t = np.asarray(time_ns, dtype=np.float64)
+    if t.size < 2 or zero_ns is None or not np.isfinite(zero_ns):
+        return None
+    period = t.size * float(np.median(np.diff(t)))
+    return t0_display_offset(t, (float(zero_ns) - float(t[0])) % period)
+
+
+def t0_ref_index(view_time_ns: np.ndarray, n_bins: int = T0_REF_BINS) -> int:
+    """Index of the default reference frame: ``n_bins`` bins after the first bin at or after t = 0."""
+    t = np.asarray(view_time_ns, dtype=np.float64)
+    if t.size == 0:
+        return 0
+    return int(min(int(np.searchsorted(t, -1e-9, side="left")) + int(n_bins), t.size - 1))
+
+
 class TrplStore:
     """Thread-safe cache of TRPL files (least recently used out first) and their time-zero alignments."""
 
@@ -3928,11 +4285,15 @@ class TrplStore:
         self._max   = max_files
         self._files: "OrderedDict[str, TrplData]" = OrderedDict()
         self._align: Dict[str, Tuple[Optional[TimeZero], float, float, str]] = {}  # tz, t_first, period, error
+        self._delay: Dict[str, Optional[float]] = {}      # signal-peak delay after the time zero, per file
+        self._sweep_delay: Dict[float, Optional[float]] = {}  # common_t0 -> median delay
 
     def clear(self) -> None:
         with self._lock:
             self._files.clear()
             self._align.clear()
+            self._delay.clear()
+            self._sweep_delay.clear()
 
     def load(self, path) -> TrplData:
         key = str(path)
@@ -3965,9 +4326,28 @@ class TrplStore:
             info = (align_first_peaks(data.counts, t), float(t[0]), period, "")
         except ValueError as exc:
             info = (None, float(t[0]), period, str(exc))
+        delay = None    # signal peak (brightest pixel) after the file's own time zero (first-peak edge)
+        if info[0] is not None and np.isfinite(info[0].target_ns):
+            pk = peak_display_offset(roll_bins(data.counts, info[0].shift_bins), t)
+            if pk is not None:
+                delay = float((pk - (float(t[0]) + info[0].target_ns) + period / 2.0) % period - period / 2.0)
         with self._lock:
             self._align[key] = info
+            self._delay[key] = delay
         return info
+
+    def zero_of(self, data: TrplData, tz: Optional["TimeZero"], t0_ref: Optional[float]) -> Optional[float]:
+        """Raw time shown as t = 0 (alignment on): this point's own signal peak (brightest pixel), so every
+        point has its peak at 0 even where the first-peak alignment locked onto another feature; a point
+        without a clear peak uses the sweep's median delay after its time zero.  None if neither is known."""
+        if tz is None or not np.isfinite(tz.target_ns):
+            return None
+        self.alignment(data.path, data)
+        with self._lock:
+            d = self._delay.get(str(data.path))
+            if d is None and t0_ref is not None and np.isfinite(t0_ref):
+                d = self._sweep_delay.get(round(float(t0_ref), 9))
+        return None if d is None else float(data.time_ns[0]) + tz.target_ns + d
 
     def common_t0(self, paths) -> Optional[float]:
         infos = [self.alignment(p) for p in paths]
@@ -3976,7 +4356,13 @@ class TrplStore:
             return None
         period = float(np.median([per for tz, _, per, _ in infos if tz is not None]))
         t0 = common_time_zero(t0s, period)
-        return t0 if np.isfinite(t0) else None
+        if not np.isfinite(t0):
+            return None
+        with self._lock:
+            ds = [self._delay.get(str(p)) for p in paths]
+            ds = [d for d in ds if d is not None]
+            self._sweep_delay[round(float(t0), 9)] = float(np.median(ds)) if ds else None
+        return t0
 
 
 class ViewSettings:
@@ -3991,9 +4377,13 @@ class ViewSettings:
 
 
 def point_view(store: TrplStore, data: TrplData, vs: ViewSettings):
-    """(time_ns, counts [bins, pixels], TimeZero or None, note) of one point."""
+    """(time_ns, counts [bins, pixels], TimeZero or None, note) of one point.
+
+    With the alignment on, t = 0 ns is the signal peak (TrplStore.zero_of; the pixels stay aligned on
+    their first-peak edge)."""
     tz, note = None, ""
     counts = data.counts
+    t_raw = data.time_ns
     if vs.align:
         tz0, _, _, err = store.alignment(data.path, data)
         if tz0 is None:
@@ -4001,7 +4391,13 @@ def point_view(store: TrplStore, data: TrplData, vs: ViewSettings):
         else:
             tz = move_to_t0(tz0, data.time_ns, vs.t0_ref)
             counts = roll_bins(counts, tz.shift_bins)
-    c, t = rebin_time(counts, data.time_ns, vs.rebin)
+        off = view_offset(data.time_ns, store.zero_of(data, tz, vs.t0_ref))
+        if off is not None:
+            t_raw = data.time_ns - off
+            if vs.rebin > 1:            # rebinned groups start at t = 0 (drop < rebin early bins)
+                s0 = int(np.argmin(np.abs(t_raw))) % vs.rebin
+                counts, t_raw = counts[s0:], t_raw[s0:]
+    c, t = rebin_time(counts, t_raw, vs.rebin)
     return t, c, tz, note
 
 
@@ -4131,16 +4527,20 @@ def fit_gaussian_2d_next(x, y, z, prev: np.ndarray, tightness: float, pitch_x: f
 
 class FitSettings:
     """The TRPL settings a diffusion fit depends on (also used to tell whether a fit is still valid)."""
-    __slots__ = ("view", "t_range", "ref_ns", "dark", "pre_window", "fix_offset", "excluded", "dark_ref", "dark_id")
+    __slots__ = ("view", "t_range", "ref_ns", "dark", "pre_window", "fix_offset", "excluded", "dark_ref", "dark_id",
+                 "dark_per_s")
 
     def __init__(self, view: ViewSettings, t_range, ref_ns, dark, pre_window, fix_offset, excluded,
-                 dark_ref: Optional[np.ndarray] = None, dark_id: str = ""):
+                 dark_ref: Optional[np.ndarray] = None, dark_id: str = "", dark_per_s: bool = False):
         """``dark`` = subtract the pre-t0 offset; ``dark_ref`` = a dark reference per pixel (counts per
-        view bin), subtracted instead; ``dark_id`` names it (file, scale) for the cache key."""
+        view bin), subtracted instead; ``dark_id`` names it (file, scale) for the cache key.
+        ``dark_per_s``: ``dark_ref`` is per second of acquisition, scaled by each file's own time
+        (dynamic TRPL time: every spot has its own)."""
         self.view, self.t_range, self.ref_ns = view, t_range, float(ref_ns)
         self.dark, self.pre_window, self.fix_offset = bool(dark), pre_window, bool(fix_offset)
         self.excluded = tuple(sorted(excluded))
         self.dark_ref, self.dark_id = dark_ref, (dark_id if dark_ref is not None else "")
+        self.dark_per_s = bool(dark_per_s) and dark_ref is not None
 
     def key(self):
         return (self.view.key(), self.t_range, round(self.ref_ns, 6), self.dark, self.pre_window,
@@ -4172,10 +4572,12 @@ class PointDiffusion:
         self.ref_ns, self.failures, self.note = ref_ns, failures, note
 
 
-def fit_point(t: np.ndarray, counts: np.ndarray, s: FitSettings, cancelled=None) -> PointDiffusion:
+def fit_point(t: np.ndarray, counts: np.ndarray, s: FitSettings, cancelled=None,
+              acq_s: Optional[float] = None) -> PointDiffusion:
     """Fit All of one point: reference frame, then every later frame of the range (raises ValueError).
 
     The detector (pixel layout, fit pitches) follows the number of pixel columns of ``counts``.
+    ``acq_s``: this file's acquisition time (needed when the dark reference is per second).
     """
     geom = geometry_for(counts.shape[1])
     r0, r1 = range_bins(t, s.t_range)
@@ -4189,7 +4591,13 @@ def fit_point(t: np.ndarray, counts: np.ndarray, s: FitSettings, cancelled=None)
     if s.dark_ref is not None:
         if np.size(s.dark_ref) != counts.shape[1]:
             raise ValueError(f"the dark reference has {np.size(s.dark_ref)} pixels, the data {counts.shape[1]}")
-        frames = frames - np.asarray(s.dark_ref, dtype=np.float64)
+        dark = np.asarray(s.dark_ref, dtype=np.float64)
+        if s.dark_per_s:
+            if acq_s is None or not np.isfinite(acq_s) or acq_s <= 0:
+                raise ValueError("no acquisition time for this file (not in dynamic_trpl_log.csv): "
+                                 "the dark reference cannot be scaled")
+            dark = dark * float(acq_s)
+        frames = frames - dark
     elif s.dark:
         win = s.pre_window if s.pre_window is not None else pre_pulse_window(t, counts.sum(axis=1))
         sel = np.zeros(t.size, bool) if win is None else (t >= win[0]) & (t <= win[1])
@@ -4251,8 +4659,9 @@ def fit_line(pd_: PointDiffusion, window: Tuple[float, Optional[float]], use_fla
 
 
 def process_sweep(store: TrplStore, paths, vs: ViewSettings, fit: Optional[FitSettings] = None,
-                  progress=None, cancelled=None):
+                  progress=None, cancelled=None, acq_of=None):
     """Counts of every point on a common time axis, and/or (``fit``) its Fit All.
+    ``acq_of(path)``: a file's acquisition time (s), for a per-second dark reference.
 
     Returns dict(t, traces [points, bins, pixels] float32 NaN = missing, fits, notes, cancelled).
     The pixel count is that of the first point; points of another detector are left out (noted).
@@ -4270,7 +4679,8 @@ def process_sweep(store: TrplStore, paths, vs: ViewSettings, fit: Optional[FitSe
                 if note:
                     notes.append(f"{Path(path).name}: {note}")
                 if fit is not None:
-                    pdf = fit_point(t, c, fit, cancelled=stop)
+                    pdf = fit_point(t, c, fit, cancelled=stop,
+                                    acq_s=acq_of(path) if acq_of is not None else None)
             except Exception as exc:
                 notes.append(f"{Path(path).name}: {exc}")
         views.append(None if fit is not None else view)
@@ -4449,12 +4859,17 @@ class TrplPanel(QtWidgets.QWidget):
         self.folder: Optional[Path] = None
         self.t0_ref: Optional[float] = None      # sweep time zero (alignment on)
         self.t0_ready = True
+        # the time range / reference / pre-t0 window are in the shown coordinates: after time zero (aligned)
+        # or raw; they are converted when the view switches between the two (see _sync_time_frame)
+        self._times_after_t0 = False
+        self._last_off: Optional[float] = None   # raw time of t = 0 at the last aligned point
         self.geom = SPAD23_GEOM                 # detector of the loaded data (set per point)
         self.sel = {self.geom.center_pixel}
         self.excluded: set = set()
         self._dark: Optional[DarkReference] = None     # the folder's dark reference (beam blocked)
         self._dark_err = ""
         self._acq_s: Optional[float] = None             # TRPL acquisition time (session.md)
+        self._dyn: Dict[str, dict] = {}                 # dynamic TRPL time: per-file time / flag (log)
         self._bg_fallback = False                       # dark wanted but not usable yet: pre-t0 for now
         # current point
         self._path: Optional[str] = None
@@ -4467,6 +4882,7 @@ class TrplPanel(QtWidgets.QWidget):
         self._point_fit_key = None
         # sweep line
         self._points: List[Tuple[float, str, Optional[Path]]] = []
+        self._points_all: List[Tuple[float, str, Optional[Path]]] = []   # before 'Skip below-target spots'
         self._x_label = "X"
         self._marker: Optional[float] = None
         self._context = ""
@@ -4512,17 +4928,25 @@ class TrplPanel(QtWidgets.QWidget):
         self.alignCheck.setToolTip(
             "Put every pixel's time zero on the rising edge of its first peak (as in the SPAD v2 GUIs),\n"
             "then move each point as a whole to the sweep's time zero (circular median of all TRPL files),\n"
-            "so a time range or reference in ns means the same delay at every point. View and fits only.")
+            "so a time range or reference in ns means the same delay at every point. The time axis is then\n"
+            "shifted so t = 0 ns is each point's signal peak (brightest pixel); the time range,\n"
+            "reference and pre-t0 window are converted when\n"
+            "this is switched. View and fits only.")
         self.rebinSpin = QtWidgets.QSpinBox()
         self.rebinSpin.setRange(1, 1000)
         self.rebinSpin.setPrefix("×")
-        self.t0Spin, self.t1Spin = spin(0, 1e6, 3, " ns"), spin(0, 1e6, 3, " ns")
+        self.t0Spin, self.t1Spin = spin(-1e6, 1e6, 3, " ns"), spin(-1e6, 1e6, 3, " ns")
         self.fullRangeCheck = QtWidgets.QCheckBox("All bins")
         self.fullRangeCheck.setChecked(True)
-        self.refSpin = spin(0, 1e6, 3, " ns")
+        self.refSpin = spin(-1e6, 1e6, 3, " ns")
         self.refSpin.setToolTip("Reference frame of the fits (σ² is fitted from here on); t_ref of D.")
         self.refCursorBtn = QtWidgets.QPushButton("= cursor")
         self.refCursorBtn.setFixedWidth(70)
+        self.refAutoCheck = QtWidgets.QCheckBox(f"t0+{T0_REF_BINS}")
+        self.refAutoCheck.setChecked(True)
+        self.refAutoCheck.setToolTip(
+            f"With 'Align time zero' on: the reference follows the signal peak (t = 0) + {T0_REF_BINS} bins (shown bins, after\n"
+            "rebinning). Typing a reference or '= cursor' switches this off.")
         self.logCheck = QtWidgets.QCheckBox("Log y")
         g.addWidget(self.alignCheck, 0, 0)
         g.addWidget(QtWidgets.QLabel("Rebin"), 0, 1)
@@ -4534,7 +4958,11 @@ class TrplPanel(QtWidgets.QWidget):
         g.addWidget(self.fullRangeCheck, 0, 7)
         g.addWidget(QtWidgets.QLabel("Reference"), 0, 8)
         g.addWidget(self.refSpin, 0, 9)
-        g.addWidget(self.refCursorBtn, 0, 10)
+        rb = QtWidgets.QHBoxLayout()
+        rb.setSpacing(4)
+        rb.addWidget(self.refCursorBtn)
+        rb.addWidget(self.refAutoCheck)
+        g.addLayout(rb, 0, 10)
         g.addWidget(self.logCheck, 0, 11)
 
         self.bgCombo = QtWidgets.QComboBox()
@@ -4546,10 +4974,10 @@ class TrplPanel(QtWidgets.QWidget):
             "Pre-t0 offset: each pixel's mean count per bin over the pre-t0 window (dark counts plus any signal\n"
             "left over from earlier pulses).\n"
             "Dark reference: the folder's DARK_TRPL_*.csv (beam blocked), scaled to the acquisition time in\n"
-            "session.md and the bin width shown.")
+            "session.md (dynamic TRPL time: each file's own time from dynamic_trpl_log.csv) and the bin width shown.")
         self.autoWinCheck = QtWidgets.QCheckBox("auto window")
         self.autoWinCheck.setChecked(True)
-        self.w0Spin, self.w1Spin = spin(0, 1e6, 3, " ns"), spin(0, 1e6, 3, " ns")
+        self.w0Spin, self.w1Spin = spin(-1e6, 1e6, 3, " ns"), spin(-1e6, 1e6, 3, " ns")
         self.fixOffsetCheck = QtWidgets.QCheckBox("Fix Gaussian offset at 0")
         self.exclEdit = QtWidgets.QLineEdit()
         self.exclEdit.setPlaceholderText("e.g. 53, 7")
@@ -4593,6 +5021,8 @@ class TrplPanel(QtWidgets.QWidget):
         for w in (self.alignCheck, self.logCheck, self.autoWinCheck, self.fixOffsetCheck,
                   self.fullRangeCheck, self.flaggedCheck):
             w.toggled.connect(lambda _v, w=w: self._on_setting(w))
+        self.refSpin.valueChanged.connect(lambda _v: self._set_ref_auto(False))   # typed: no longer t0 + N
+        self.refAutoCheck.toggled.connect(self._on_ref_auto)
         for w in (self.rebinSpin, self.t0Spin, self.t1Spin, self.refSpin, self.w0Spin, self.w1Spin,
                   self.d0Spin, self.d1Spin):
             w.valueChanged.connect(lambda _v, w=w: self._on_setting(w))
@@ -4691,7 +5121,16 @@ class TrplPanel(QtWidgets.QWidget):
         self.cancelBtn.setEnabled(False)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setMaximumWidth(160)
-        for w in (self.normCheck, self.mapLogCheck, self.fitSweepBtn, self.cancelBtn, self.progress, self.exportBtn):
+        self.perSecCheck = QtWidgets.QCheckBox("÷ acq time")
+        self.perSecCheck.setToolTip("Dynamic TRPL time: show counts per second, so spots with different times\n"
+                                    "compare fairly (decay map and counts vs sweep; the fits do not change).")
+        self.skipLowCheck = QtWidgets.QCheckBox("Skip below-target spots")
+        self.skipLowCheck.setToolTip("Dynamic TRPL time: leave out the spots that hit the max time before their\n"
+                                     "peak reached the target (red rings in the plots).")
+        self.perSecCheck.setVisible(False)
+        self.skipLowCheck.setVisible(False)
+        for w in (self.normCheck, self.mapLogCheck, self.perSecCheck, self.skipLowCheck, self.fitSweepBtn,
+                  self.cancelBtn, self.progress, self.exportBtn):
             row.addWidget(w)
         self.sweepLbl = QtWidgets.QLabel("")
         self.sweepLbl.setStyleSheet("color:#4b5563")
@@ -4720,6 +5159,10 @@ class TrplPanel(QtWidgets.QWidget):
         self.s0Err = pg.ErrorBarItem(pen=pg.mkPen("#059669", width=1), beam=0.0)
         self.pD.addItem(self.dErr)
         self.pS0.addItem(self.s0Err)
+        ring = dict(size=11, brush=None, pen=pg.mkPen("#dc2626", width=1.6))
+        self.dLow, self.s0Low = pg.ScatterPlotItem(**ring), pg.ScatterPlotItem(**ring)
+        self.pD.addItem(self.dLow)
+        self.pS0.addItem(self.s0Low)
         tabs.addTab(glw, "D vs sweep")
         self.sigAll = pg.PlotWidget()
         _style(self.sigAll.getPlotItem(), "σ_eq² (µm²)", "t − t_ref (ns)")
@@ -4729,6 +5172,8 @@ class TrplPanel(QtWidgets.QWidget):
         _style(self.cntPlot.getPlotItem(), "Counts in the time range")
         self.cntCurve = self.cntPlot.plot(pen=pg.mkPen("#d62728", width=1.2), symbol="o", symbolSize=5,
                                           symbolBrush="#d62728", symbolPen=None)
+        self.cntLow = pg.ScatterPlotItem(size=11, brush=None, pen=pg.mkPen("#dc2626", width=1.6))
+        self.cntPlot.addItem(self.cntLow)
         tabs.addTab(self.cntPlot, "Counts vs sweep")
         self._markers = []
         for p in (self.pD, self.pS0, self.cntPlot.getPlotItem()):
@@ -4740,6 +5185,8 @@ class TrplPanel(QtWidgets.QWidget):
 
         self.normCheck.toggled.connect(lambda _v: self._redraw_map())
         self.mapLogCheck.toggled.connect(lambda _v: self._redraw_map())
+        self.perSecCheck.toggled.connect(lambda _v: self._redraw_map())
+        self.skipLowCheck.toggled.connect(lambda _v: self._apply_skip_low())
         self.fitSweepBtn.clicked.connect(self._on_fit_sweep)
         self.cancelBtn.clicked.connect(self.cancel)
         self.exportBtn.clicked.connect(self._on_export)
@@ -4763,14 +5210,47 @@ class TrplPanel(QtWidgets.QWidget):
         if key == "dark_ref":
             dark, dark_id = self._dark_scaled()
         return FitSettings(self.view_settings(), self.time_range(), self.refSpin.value(), key == "pre_t0",
-                           win, self.fixOffsetCheck.isChecked(), self.excluded, dark, dark_id)
+                           win, self.fixOffsetCheck.isChecked(), self.excluded, dark, dark_id,
+                           dark_per_s=bool(self._dyn))
+
+    # ── dynamic TRPL time (dynamic_trpl_log.csv) ──────────────────────
+    def _acq_of(self, path) -> Optional[float]:
+        """Acquisition time (s) of one TRPL file: its own (dynamic) or session.md's (fixed)."""
+        if path is None:
+            return None
+        rec = self._dyn.get(Path(path).name)
+        return rec["total_s"] if rec is not None else self._acq_s
+
+    def _below_target(self, path) -> bool:
+        rec = self._dyn.get(Path(path).name) if path is not None else None
+        return rec is not None and not rec["reached"]
+
+    def _dyn_text(self, path) -> str:
+        rec = self._dyn.get(Path(path).name) if path is not None else None
+        if rec is None:
+            return ""
+        txt = (f"dynamic: {rec['total_s']:g} s in {rec['n_chunks']} chunk(s), peak {rec['peak']:.0f}/"
+               f"{rec['target']:g}")
+        return txt + ("" if rec["reached"] else "  — BELOW TARGET (max time)")
+
+    def _apply_skip_low(self) -> None:
+        """'Skip below-target spots': those points get no TRPL file (left out of the map and the fits)."""
+        if self.skipLowCheck.isChecked() and self._dyn:
+            pts = [(x, lab, None if self._below_target(pth) else pth) for x, lab, pth in self._points_all]
+        else:
+            pts = list(self._points_all)
+        changed = [str(p[2]) for p in pts] != [str(p[2]) for p in self._points]
+        self._points = pts
+        if changed:
+            self._schedule_map()
+            self._redraw_fits()
 
     # ── dark reference (DARK_TRPL_*.csv of the folder) ─────────────────
     def _dark_reason(self) -> str:
         """Why the dark reference cannot be used (empty = it can)."""
         if self._dark is None:
             return self._dark_err or "no DARK_TRPL_*.csv in this folder"
-        if self._acq_s is None:
+        if self._acq_s is None and not self._dyn:
             return "session.md has no 'Acquisition (s)': the dark cannot be scaled"
         if self._dark.num_pixels != self.geom.num_pixels:
             return f"the dark reference has {self._dark.num_pixels} pixels, the data {self.geom.num_pixels}"
@@ -4781,6 +5261,8 @@ class TrplPanel(QtWidgets.QWidget):
         if self._dark_reason() or self._t.size < 2:
             return None, ""
         bin_ps = float(np.median(np.diff(self._t))) * 1000.0
+        if self._dyn:   # per second: fit_point scales it by each file's own time
+            return self._dark.per_bin(1.0, bin_ps), f"{Path(self._dark.path).name}|per_s|{bin_ps:.6g}"
         return self._dark.per_bin(self._acq_s, bin_ps), f"{Path(self._dark.path).name}|{self._acq_s:g}|{bin_ps:.6g}"
 
     def _on_bg_changed(self) -> None:
@@ -4810,7 +5292,7 @@ class TrplPanel(QtWidgets.QWidget):
 
     def apply_session(self, session: dict) -> None:
         """Alignment, time range and reference as they were in the measuring GUI."""
-        widgets = (self.alignCheck, self.t0Spin, self.t1Spin, self.refSpin, self.fullRangeCheck)
+        widgets = (self.alignCheck, self.t0Spin, self.t1Spin, self.refSpin, self.fullRangeCheck, self.refAutoCheck)
         for w in widgets:
             w.blockSignals(True)
         if "align" in session:
@@ -4821,8 +5303,52 @@ class TrplPanel(QtWidgets.QWidget):
             self.fullRangeCheck.setChecked(False)
         if "ref_ns" in session:
             self.refSpin.setValue(session["ref_ns"])
+        if "hist_ns" in session or "ref_ns" in session:
+            # older GUIs saved raw times: converted at the first aligned point (_sync_time_frame)
+            self._times_after_t0 = bool(session.get("hist_after_t0", False))
+        self.refAutoCheck.setChecked(bool(session.get("ref_auto", True)))
         for w in widgets:
             w.blockSignals(False)
+
+    def _set_ref_auto(self, on: bool) -> None:
+        self.refAutoCheck.blockSignals(True)
+        self.refAutoCheck.setChecked(bool(on))
+        self.refAutoCheck.blockSignals(False)
+
+    def _on_ref_auto(self, on: bool) -> None:
+        if on and self._apply_auto_ref():
+            self._on_setting(self.refSpin)
+
+    def _apply_auto_ref(self) -> bool:
+        """Reference = time zero + T0_REF_BINS shown bins (alignment on, 't0+N' checked); True if it changed."""
+        if not (self.refAutoCheck.isChecked() and self.alignCheck.isChecked() and self._times_after_t0
+                and self._t.size):
+            return False
+        v = round(float(self._t[t0_ref_index(self._t)]), 6)
+        if abs(float(self.refSpin.value()) - v) < 1e-9:
+            return False
+        self.refSpin.blockSignals(True)
+        self.refSpin.setValue(v)
+        self.refSpin.blockSignals(False)
+        return True
+
+    def _sync_time_frame(self, off: Optional[float]) -> None:
+        """The view switches between raw times (off None) and times after time zero: move the time range,
+        reference and manual pre-t0 window by the offset so they stay on the same data."""
+        after = off is not None
+        if after:
+            self._last_off = off
+        if after == self._times_after_t0:
+            return
+        d = -float(off) if after else float(self._last_off or 0.0)
+        spins = [self.t0Spin, self.t1Spin, self.refSpin]
+        if not self.autoWinCheck.isChecked():
+            spins += [self.w0Spin, self.w1Spin]
+        for sp in spins:
+            sp.blockSignals(True)
+            sp.setValue(sp.value() + d)
+            sp.blockSignals(False)
+        self._times_after_t0 = after
 
     def _on_setting(self, w) -> None:
         if w in (self.alignCheck, self.rebinSpin):
@@ -4879,6 +5405,21 @@ class TrplPanel(QtWidgets.QWidget):
         self.apply_session(session)
         # dark reference: the newest DARK_TRPL_*.csv the measuring GUI copied into the folder
         self._acq_s = session.get("acq_s")
+        self._dyn = read_dynamic_log(folder)
+        for w in (self.perSecCheck, self.skipLowCheck):
+            w.setVisible(bool(self._dyn))
+        self.skipLowCheck.blockSignals(True)
+        self.skipLowCheck.setChecked(False)
+        self.skipLowCheck.blockSignals(False)
+        self.perSecCheck.blockSignals(True)
+        times = {round(r["total_s"], 6) for r in self._dyn.values()}
+        self.perSecCheck.setChecked(len(times) > 1)       # times differ: counts per second by default
+        self.perSecCheck.blockSignals(False)
+        if self._dyn:
+            spots = [r for r in self._dyn.values() if r["pump2"] != "on"]
+            low = sum(not r["reached"] for r in spots)
+            self.status.emit(f"Dynamic TRPL time: {len(spots)} spot(s), {low} below target "
+                             f"(red rings in the Sweep tab); the dark reference is scaled per file.")
         self._dark, self._dark_err = None, ""
         darks = sorted(Path(folder).glob("DARK_TRPL_*.csv"), key=lambda p: p.stat().st_mtime)
         if darks:
@@ -4908,6 +5449,9 @@ class TrplPanel(QtWidgets.QWidget):
         self._reload_point()
 
     def set_points(self, points, x_label: str, marker: Optional[float], context: str) -> None:
+        self._points_all = list(points)
+        if self.skipLowCheck.isChecked() and self._dyn:
+            points = [(x, lab, None if self._below_target(pth) else pth) for x, lab, pth in points]
         changed = [(p[0], str(p[2])) for p in points] != [(p[0], str(p[2])) for p in self._points]
         self._points, self._x_label, self._marker, self._context = list(points), x_label, marker, context
         if changed:
@@ -4930,9 +5474,15 @@ class TrplPanel(QtWidgets.QWidget):
                 data = self.store.load(self._path)
                 self._set_geometry(data.geom)
                 self._t, self._c, self._tz, note = point_view(self.store, data, vs)
-                self.pointLbl.setStyleSheet("")
+                off = view_offset(data.time_ns, self.store.zero_of(data, self._tz, vs.t0_ref)) if vs.align else None
+                # aligned: converted once the sweep's time zero is known (a point's own differs by a few ns)
+                if not vs.align or (off is not None and self.t0_ready):
+                    self._sync_time_frame(off)
+                self._apply_auto_ref()
+                dyn = self._dyn_text(self._path)
+                self.pointLbl.setStyleSheet("color:#b91c1c" if self._below_target(self._path) else "")
                 self.pointLbl.setText(f"{self._label}  —  {Path(self._path).name}  [{data.geom.label}]"
-                                      + (f"  ({note})" if note else ""))
+                                      + (f"  ({note})" if note else "") + (f"  —  {dyn}" if dyn else ""))
             except Exception as exc:
                 self._t, self._c = np.zeros(0), np.zeros((0, self.geom.num_pixels))
                 self.pointLbl.setStyleSheet("color:#b91c1c")
@@ -4947,12 +5497,15 @@ class TrplPanel(QtWidgets.QWidget):
             self.timeSlider.setValue(int(np.argmin(np.abs(self._t - old_t))))
         self.timeSlider.blockSignals(False)
         if self.alignCheck.isChecked():
-            self.infoLbl.setText(self._tz.message if self._tz is not None else
+            self.infoLbl.setText((self._tz.message + "  Time axis: t = 0 at the signal peak.") if self._tz is not None else
                                  ("Waiting for the alignment of all TRPL files …" if not self.t0_ready else ""))
         else:
             self.infoLbl.setText(f"{n} bins of {np.median(np.diff(self._t)):.3g} ns" if n > 1 else "")
         self._update_dark_item()
         dark, _ = self._dark_scaled()
+        if dark is not None and self._dyn:
+            acq = self._acq_of(self._path)
+            dark = dark * acq if acq is not None else None
         if dark is not None and n > 3:
             win = pre_pulse_window(self._t, self._c.sum(axis=1))
             sel = (self._t >= win[0]) & (self._t <= win[1]) if win is not None else np.zeros(n, bool)
@@ -5024,7 +5577,8 @@ class TrplPanel(QtWidgets.QWidget):
         s = self.fit_settings()
         t, c, key = self._t, self._c, (self._path, s.key())
         self.pointFitLbl.setText("Fitting …")
-        self._point_job = self._run(lambda prog, cancelled: fit_point(t, c, s, cancelled),
+        acq = self._acq_of(self._path)
+        self._point_job = self._run(lambda prog, cancelled: fit_point(t, c, s, cancelled, acq_s=acq),
                                     lambda res, err: self._on_point_fit_done(res, err, key))
 
     def _on_point_fit_done(self, res, err: str, key) -> None:
@@ -5125,6 +5679,11 @@ class TrplPanel(QtWidgets.QWidget):
         if d is None:
             return
         x, t, z = d
+        per_s = self.perSecCheck.isChecked() and bool(self._dyn)
+        if per_s:
+            acq = np.array([np.nan if self._acq_of(p[2]) is None else self._acq_of(p[2]) for p in self._points], float)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                z = z / acq[:, None]
         have = np.isfinite(z).any(axis=1)
         counts = np.where(have, np.nansum(z, axis=1), np.nan)
         zz = z.copy()
@@ -5138,9 +5697,18 @@ class TrplPanel(QtWidgets.QWidget):
         self.decayMap.setTitle(f"Decay vs sweep — px {px}" + (f" — {self._context}" if self._context else ""))
         self.decayMap.set_map(x, t, zz.T, x_label=self._x_label, y_label="Time (ns)")
         self.cntCurve.setData(x[have], counts[have])
+        low = np.array([self._below_target(p[2]) for p in self._points], bool) & have
+        self.cntLow.setData(x[low], counts[low])
         self.cntPlot.setLabel("bottom", self._x_label)
-        self.cntPlot.setTitle(f"Counts of px {px} in {t[0]:.2f}–{t[-1]:.2f} ns")
-        self.sweepLbl.setText(f"{int(have.sum())}/{len(self._points)} points with TRPL, {t.size} bins")
+        self.cntPlot.setLabel("left", "Counts / s in the time range" if per_s else "Counts in the time range")
+        self.cntPlot.setTitle(f"Counts{' / s' if per_s else ''} of px {px} in {t[0]:.2f}–{t[-1]:.2f} ns")
+        text = f"{int(have.sum())}/{len(self._points)} points with TRPL, {t.size} bins"
+        if self._dyn:
+            n_low = sum(self._below_target(p[2]) for p in self._points_all)
+            text += (f"; dynamic time, {n_low} below target"
+                     + (" (skipped)" if self.skipLowCheck.isChecked() and n_low else "")
+                     + ("; counts / s" if per_s else ""))
+        self.sweepLbl.setText(text)
         self._draw_markers()
 
     def _draw_markers(self) -> None:
@@ -5165,7 +5733,9 @@ class TrplPanel(QtWidgets.QWidget):
         self.fitLbl.setText(f"Fitting {sum(p is not None for p in paths)} points: {s.describe()} …")
         self.fitSweepBtn.setEnabled(False)
         self.cancelBtn.setEnabled(True)
-        self._fit_job = self._run(lambda prog, cancelled: process_sweep(self.store, paths, s.view, s, prog, cancelled),
+        acq_of = self._acq_of
+        self._fit_job = self._run(lambda prog, cancelled: process_sweep(self.store, paths, s.view, s, prog, cancelled,
+                                                                        acq_of=acq_of),
                                   lambda res, err: self._on_fits_done(res, err, key, s),
                                   progress=self._on_fit_progress)
 
@@ -5199,6 +5769,8 @@ class TrplPanel(QtWidgets.QWidget):
         for c, e in ((self.dCurve, self.dErr), (self.s0Curve, self.s0Err)):
             c.setData([], [])
             e.setData(x=np.zeros(0), y=np.zeros(0), top=np.zeros(0), bottom=np.zeros(0))
+        self.dLow.setData([], [])
+        self.s0Low.setData([], [])
         self.pS0.setLabel("bottom", self._x_label)
         self._draw_markers()
         fits = self._valid_fits()
@@ -5215,6 +5787,8 @@ class TrplPanel(QtWidgets.QWidget):
             curve.setData(x[ok], y[ok])
             eo = ok & np.isfinite(ye)
             err.setData(x=x[eo], y=y[eo], top=ye[eo], bottom=ye[eo])
+            low = ok & np.array([self._below_target(p[2]) for p in self._points], bool)
+            (self.dLow if key == "D" else self.s0Low).setData(x[low], y[low])
         lo, hi = self._line_window()
         self.pD.setTitle(f"σ² = σ₀² + 2D(t − t_ref) over {lo:g}–{'end' if hi is None else f'{hi:g}'} ns")
         cmap = _pg_cmap("viridis")
@@ -5234,6 +5808,9 @@ class TrplPanel(QtWidgets.QWidget):
             text += "  <b>Settings changed since this fit</b>: click 'Fit sweep' to refit."
         if self._fit_notes:
             text += "  " + "; ".join(self._fit_notes[:2])
+        n_low = sum(self._below_target(p[2]) for p in self._points)
+        if n_low:
+            text += f"  <span style='color:#dc2626'>{n_low} point(s) below the count target (red rings).</span>"
         self.fitLbl.setText(text)
 
     def _on_export(self) -> None:
@@ -5262,10 +5839,17 @@ class TrplPanel(QtWidgets.QWidget):
 
         table = np.column_stack([x, col("D"), col("D_err"), col("s0"), col("s0_err"), col("n"),
                                  [np.nan if f is None else f.failures for f in fits], counts])
+        cols = "x,D_cm2_s,D_err_cm2_s,sigma0_2_um2,sigma0_2_err_um2,n_bins,fit_failures,counts_in_range"
+        if self._dyn:   # dynamic TRPL time: each point's own time and whether it reached the target
+            acq = [np.nan if self._acq_of(p[2]) is None else self._acq_of(p[2]) for p in self._points]
+            low = [np.nan if p[2] is None else float(self._below_target(p[2])) for p in self._points]
+            table = np.column_stack([table, acq, low])
+            cols += ",acq_s,below_target"
+            head.append("dynamic TRPL time (dynamic_trpl_log.csv): counts_in_range "
+                        + ("per second" if self.perSecCheck.isChecked() else "raw"))
         try:
             np.savetxt(path, table, delimiter=",", fmt="%.10g", comments="# ",
-                       header="\n".join(head) + "\nx,D_cm2_s,D_err_cm2_s,sigma0_2_um2,sigma0_2_err_um2,n_bins,"
-                                                "fit_failures,counts_in_range")
+                       header="\n".join(head) + "\n" + cols)
             rows = [(k, x[k], t, t - f.ref_ns, s2, fl) for k, f in enumerate(fits) if f is not None
                     for t, s2, fl in zip(f.t_ns, f.sigma2, f.flagged)]
             path2 = os.path.splitext(path)[0] + "_sigma2_t.csv"

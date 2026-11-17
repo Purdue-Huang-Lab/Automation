@@ -141,16 +141,17 @@ class RadialFitPlot(_PlotBase):
 class DoubleRadialPlot(_PlotBase):
     """The double 2D Gaussian as two 1D radial profiles (a single radial plot needs one center).
 
-    For Gaussian k every enabled pixel is plotted at its distance from center k
-    (mirrored to +-r, as in the single-Gaussian radial plot) with the value minus the
-    other Gaussian and the offset, so it lies on A_k exp(-r^2 / 2 sigma_k^2).  Points
+    For Gaussian k every enabled pixel is plotted at its effective distance from center k,
+    r = sigma_eq sqrt((dx / sigma_x)^2 + (dy / sigma_y)^2) with sigma_eq = sqrt(sigma_x sigma_y)
+    (mirrored to +-r, as in the single-Gaussian radial plot), with the value minus the
+    other Gaussian and the offset, so it lies on A_k exp(-r^2 / 2 sigma_eq^2).  Points
     are filled where Gaussian k is the larger of the two at that pixel and hollow where
     the other one dominates (their value is mostly what the subtraction left).
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.plot.setLabel("bottom", "Distance from the Gaussian's center (µm)")
+        self.plot.setLabel("bottom", "Effective distance from the Gaussian's center (µm)")
         self.legend = self.plot.addLegend(offset=(-10, 10))
         self.items = []
         for k, color in enumerate(COMPONENT_COLORS):
@@ -182,20 +183,22 @@ class DoubleRadialPlot(_PlotBase):
         x, y, z = PIXEL_X_UM[ok], PIXEL_Y_UM[ok], v[ok]
         comps = []
         for k in range(2):
-            A, x0, y0, sig = fit.component(k)
-            r = np.hypot(x - x0, y - y0)
-            comps.append((A, abs(sig), r, A * np.exp(-(r**2) / (2.0 * max(abs(sig), 1e-6) ** 2))))
+            A, x0, y0, sx, sy = fit.component(k)
+            sx, sy = max(sx, 1e-6), max(sy, 1e-6)
+            sig = float(np.sqrt(sx * sy))
+            r = sig * np.hypot((x - x0) / sx, (y - y0) / sy)
+            comps.append((A, sig, r, A * np.exp(-(r**2) / (2.0 * sig**2)), sx, sy))
         rmax = max(float(np.max(c[2])) for c in comps) if z.size else 1.0
         r_line = np.linspace(-rmax, rmax, 401)
         self.legend.clear()
         for k, (line, own, other) in enumerate(self.items):
-            A, sig, r, model_k = comps[k]
+            A, sig, r, model_k, sx, sy = comps[k]
             rest = z - comps[1 - k][3] - fit.offset  # this Gaussian's share of the data
             mine = model_k >= comps[1 - k][3]
             line.setData(r_line, A * np.exp(-(r_line**2) / (2.0 * max(sig, 1e-6) ** 2)))
             own.setData(np.concatenate([-r[mine], r[mine]]), np.concatenate([rest[mine], rest[mine]]))
             other.setData(np.concatenate([-r[~mine], r[~mine]]), np.concatenate([rest[~mine], rest[~mine]]))
-            self.legend.addItem(line, f"Gaussian {k + 1}: σ = {sig:.1f} µm")
+            self.legend.addItem(line, f"Gaussian {k + 1}: σx = {sx:.1f}, σy = {sy:.1f} µm")
         self.plot.setLabel("left", ylabel)
         self.set_title(title, subtitle)
         self.show_message("")
@@ -622,8 +625,8 @@ def double_fit_text(fit: DoubleFitResult, centers_fixed: bool = False) -> str:
     """
     parts = []
     for k in range(2):
-        _, x0, y0, s = fit.component(k)
-        parts.append(f"{k + 1}: ({x0:.1f}, {y0:.1f}) µm, σ={abs(s):.1f}")
+        _, x0, y0, sx, sy = fit.component(k)
+        parts.append(f"{k + 1}: ({x0:.1f}, {y0:.1f}) µm, σx={sx:.1f}, σy={sy:.1f}")
     w1, w2 = fit.weights
     ratio = w2 / w1 if w1 > 0 else float("nan")
     text = "; ".join(parts) + f"; d={fit.separation:.1f} µm, I2/I1={ratio:.2f}"

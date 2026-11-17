@@ -6,6 +6,8 @@ moment-based start values, bounded widths and a quality estimate.
 
 The time-zero alignment, the double 2D Gaussian and the fixed/tied fit
 parameters (``_curve_fit_fixed``) are ported back from ``spad23/spad23_analysis.py``.
+Unlike SPAD23, the double Gaussian here is elliptical: each spot has its own
+sigma_x and sigma_y (11 parameters).
 """
 
 from __future__ import annotations
@@ -315,6 +317,63 @@ def align_first_peaks(counts: np.ndarray, time_ns: np.ndarray, edge_level: float
     return TimeZeroAlignment(out, shift, status, edge, corr, dt, target, second_delay, msg + ".")
 
 
+# with the alignment on, the views show t = raw time - this, so time zero is at 0 ns at every point
+T0_REF_BINS = 5  # default reference frame: this many (shown) bins after time zero
+
+
+def t0_display_offset(time_ns: np.ndarray, target_ns: Optional[float]) -> Optional[float]:
+    """Raw time (ns) of the bin holding time zero ``target_ns`` (from bin 0, as TimeZeroAlignment.target_ns).
+
+    Subtracted from the time axis it puts time zero at exactly 0 ns on the bin grid (the
+    first-peak edge lies within half a bin of 0).  None without a time zero.
+    """
+    t = np.asarray(time_ns, dtype=np.float64)
+    if t.size < 2 or target_ns is None or not np.isfinite(target_ns):
+        return None
+    dt = float(np.median(np.diff(t)))
+    if not dt > 0:
+        return None
+    return float(t[int(np.round(float(target_ns) / dt)) % t.size])
+
+
+T0_PEAK_SMOOTH_NS = 0.5  # boxcar over which the brightest pixel's maximum is taken (the time zero shown)
+
+
+def peak_display_offset(counts: np.ndarray, time_ns: np.ndarray, excluded=()) -> Optional[float]:
+    """Raw time (ns) of the signal peak: the maximum of the brightest pixel (each pixel minus its median,
+    smoothed over T0_PEAK_SMOOTH_NS).  With the time-zero alignment on, the views put t = 0 here (the
+    pixels themselves stay aligned on their first-peak edge).  None without signal."""
+    c = np.asarray(counts, dtype=np.float64)
+    t = np.asarray(time_ns, dtype=np.float64)
+    if c.ndim != 2 or c.shape[0] < 4 or t.size != c.shape[0]:
+        return None
+    dt = float(np.median(np.diff(t)))
+    if not dt > 0:
+        return None
+    k = max(1, int(round(T0_PEAK_SMOOTH_NS / dt))) | 1
+    y = c - np.median(c, axis=0)
+    if k > 1:
+        cs = np.cumsum(np.vstack([np.zeros((1, y.shape[1])), y]), axis=0)
+        y = (cs[k:] - cs[:-k]) / k  # row i = mean of rows i .. i+k-1 (centre i + k // 2)
+    ex = [int(p) for p in excluded if 0 <= int(p) < y.shape[1]]
+    if ex:
+        y[:, ex] = -np.inf
+    p = int(np.argmax(y.max(axis=0)))
+    i = int(np.argmax(y[:, p]))
+    if not y[i, p] > 0:
+        return None
+    return float(t[i + k // 2])
+
+
+def t0_ref_index(view_time_ns: np.ndarray, n_bins: int = T0_REF_BINS) -> int:
+    """Index of the default reference frame: ``n_bins`` bins after the first bin at or after t = 0."""
+    t = np.asarray(view_time_ns, dtype=np.float64)
+    if t.size == 0:
+        return 0
+    i0 = int(np.searchsorted(t, -1e-9, side="left"))
+    return int(min(i0 + int(n_bins), t.size - 1))
+
+
 # ======================================================================
 # 2D Gaussian (spatial) fits
 # ======================================================================
@@ -618,44 +677,51 @@ def fit_radial_gaussian_1d(
 
 
 # ======================================================================
-# Double 2D Gaussian: two round spots on one shared offset
+# Double 2D Gaussian: two elliptical (axis-aligned) spots on one shared offset
 # ======================================================================
-MIN_FIT_PIXELS_DOUBLE = 10  # 9 parameters
+_NP_DOUBLE = 11  # [A1, x1, y1, sx1, sy1, A2, x2, y2, sx2, sy2, offset]
+MIN_FIT_PIXELS_DOUBLE = _NP_DOUBLE + 1
 MIN_DOUBLE_FRACTION = 0.05  # weaker / brighter integrated intensity for "resolved"
-_DOUBLE_SCALED = [0, 4, 8]  # amplitudes and offset: fitted as z / max|z|
-_DOUBLE_SWAP = [4, 5, 6, 7, 0, 1, 2, 3, 8]
+_DOUBLE_SCALED = [0, 5, 10]  # amplitudes and offset: fitted as z / max|z|
+_DOUBLE_SWAP = [5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 10]
 
 
-def gauss2d_double(coords, A1, x1, y1, s1, A2, x2, y2, s2, offset):
+def gauss2d_double(coords, A1, x1, y1, sx1, sy1, A2, x2, y2, sx2, sy2, offset):
     xg, yg = coords
     return (
-        A1 * np.exp(-((xg - x1) ** 2 + (yg - y1) ** 2) / (2.0 * s1**2))
-        + A2 * np.exp(-((xg - x2) ** 2 + (yg - y2) ** 2) / (2.0 * s2**2))
+        A1 * np.exp(-((xg - x1) ** 2 / (2.0 * sx1**2) + (yg - y1) ** 2 / (2.0 * sy1**2)))
+        + A2 * np.exp(-((xg - x2) ** 2 / (2.0 * sx2**2) + (yg - y2) ** 2 / (2.0 * sy2**2)))
         + offset
     )
 
 
 @dataclass
 class DoubleFitResult:
-    popt: np.ndarray  # [A1, x1, y1, s1, A2, x2, y2, s2, offset]
+    popt: np.ndarray  # [A1, x1, y1, sx1, sy1, A2, x2, y2, sx2, sy2, offset]
     z_fit: np.ndarray
     rss: float
     snr1: float = float("inf")
     snr2: float = float("inf")
     at_bound: bool = False
 
-    def component(self, i: int) -> Tuple[float, float, float, float]:
-        """``(A, x0, y0, sigma)`` of component ``i`` (0 or 1)."""
-        k = 4 * int(i)
-        return tuple(float(v) for v in self.popt[k : k + 4])  # type: ignore[return-value]
+    def component(self, i: int) -> Tuple[float, float, float, float, float]:
+        """``(A, x0, y0, sigma_x, sigma_y)`` of component ``i`` (0 or 1); widths are >= 0."""
+        k = 5 * int(i)
+        A, x0, y0, sx, sy = (float(v) for v in self.popt[k : k + 5])
+        return A, x0, y0, abs(sx), abs(sy)
+
+    def sigma_eq(self, i: int) -> float:
+        """Equivalent round width sqrt(sigma_x * sigma_y) of component ``i``."""
+        _, _, _, sx, sy = self.component(i)
+        return float(np.sqrt(sx * sy))
 
     @property
     def offset(self) -> float:
-        return float(self.popt[8])
+        return float(self.popt[10])
 
     @property
     def separation(self) -> float:
-        return float(np.hypot(self.popt[1] - self.popt[5], self.popt[2] - self.popt[6]))
+        return float(np.hypot(self.popt[1] - self.popt[6], self.popt[2] - self.popt[7]))
 
     @property
     def quality_ok(self) -> bool:
@@ -663,16 +729,17 @@ class DoubleFitResult:
 
     @property
     def weights(self) -> Tuple[float, float]:
-        """Integrated intensity of each component (2 pi A sigma^2)."""
-        return (float(2 * np.pi * self.popt[0] * self.popt[3] ** 2), float(2 * np.pi * self.popt[4] * self.popt[7] ** 2))
+        """Integrated intensity of each component (2 pi A sigma_x sigma_y)."""
+        p = self.popt
+        return (float(2 * np.pi * p[0] * abs(p[3] * p[4])), float(2 * np.pi * p[5] * abs(p[8] * p[9])))
 
     @property
     def resolved(self) -> bool:
         """Both amplitudes significant, the weaker spot >= MIN_DOUBLE_FRACTION of the brighter
-        one's light, and the centers at least (sigma1 + sigma2) / 2 apart."""
+        one's light, and the centers at least (sigma_eq1 + sigma_eq2) / 2 apart."""
         w1, w2 = self.weights
         return (self.quality_ok and min(w1, w2) >= MIN_DOUBLE_FRACTION * max(w1, w2)
-                and self.separation >= 0.5 * (abs(self.popt[3]) + abs(self.popt[7])))
+                and self.separation >= 0.5 * (self.sigma_eq(0) + self.sigma_eq(1)))
 
 
 def _bounds_double(x: np.ndarray, y: np.ndarray, pitch_x: float, pitch_y: float):
@@ -680,8 +747,8 @@ def _bounds_double(x: np.ndarray, y: np.ndarray, pitch_x: float, pitch_y: float)
     s_lo, s_hi = 0.25 * min(pitch_x, pitch_y), 2.0 * span
     x_lo, x_hi = float(np.min(x) - pitch_x), float(np.max(x) + pitch_x)
     y_lo, y_hi = float(np.min(y) - pitch_y), float(np.max(y) + pitch_y)
-    lower = [0.0, x_lo, y_lo, s_lo, 0.0, x_lo, y_lo, s_lo, -np.inf]
-    upper = [np.inf, x_hi, y_hi, s_hi, np.inf, x_hi, y_hi, s_hi, np.inf]
+    lower = [0.0, x_lo, y_lo, s_lo, s_lo, 0.0, x_lo, y_lo, s_lo, s_lo, -np.inf]
+    upper = [np.inf, x_hi, y_hi, s_hi, s_hi, np.inf, x_hi, y_hi, s_hi, s_hi, np.inf]
     return lower, upper
 
 
@@ -698,13 +765,15 @@ def _double_seeds(x, y, z, pitch_x, pitch_y, single: Optional[FitResult],
     """Start points: the two brightest local maxima, and the single-Gaussian fit split in two."""
     bg = float(np.percentile(z, 10)) if fix_offset is None else float(fix_offset)
     pitch = max(pitch_x, pitch_y)
+    s0 = 0.6 * pitch
     seeds: List[List[float]] = []
     peaks = _local_maxima(x, y, z, 1.15 * pitch)
     if peaks.size >= 2:
         i, j = int(peaks[0]), int(peaks[1])
-        seeds.append([z[i] - bg, x[i], y[i], 0.6 * pitch, z[j] - bg, x[j], y[j], 0.6 * pitch, bg])
+        seeds.append([z[i] - bg, x[i], y[i], s0, s0, z[j] - bg, x[j], y[j], s0, s0, bg])
     if single is not None:
         A, x0, y0, sx, sy, off = (float(v) for v in single.popt)
+        sx, sy = max(abs(sx), 0.5 * pitch), max(abs(sy), 0.5 * pitch)
         s = max(single.sigma_eq, 0.5 * pitch)
         w = np.clip(z - off, 0.0, None)
         if w.sum() > 0:
@@ -714,19 +783,19 @@ def _double_seeds(x, y, z, pitch_x, pitch_y, single: Optional[FitResult],
         else:
             v = np.array([1.0, 0.0])
         d = max(0.8 * s, 0.5 * pitch)
-        seeds.append([0.7 * A, x0 + d * v[0], y0 + d * v[1], 0.7 * s,
-                      0.7 * A, x0 - d * v[0], y0 - d * v[1], 0.7 * s, off])
+        seeds.append([0.7 * A, x0 + d * v[0], y0 + d * v[1], 0.7 * sx, 0.7 * sy,
+                      0.7 * A, x0 - d * v[0], y0 - d * v[1], 0.7 * sx, 0.7 * sy, off])
         # a weak second spot: the pixel the single fit misses most
         k = int(np.argmax(z - single.z_fit))
         if np.hypot(x[k] - x0, y[k] - y0) > 0.5 * pitch:
-            seeds.append([A, x0, y0, s, max(float(z[k] - single.z_fit[k]), 1e-9), x[k], y[k], 0.6 * pitch, off])
+            seeds.append([A, x0, y0, sx, sy, max(float(z[k] - single.z_fit[k]), 1e-9), x[k], y[k], s0, s0, off])
     return seeds
 
 
 def _order_like(popt: np.ndarray, pcov: np.ndarray, ref: np.ndarray):
     """Swap the components so their centers best match those of ``ref``."""
-    keep = np.hypot(popt[1] - ref[1], popt[2] - ref[2]) + np.hypot(popt[5] - ref[5], popt[6] - ref[6])
-    swap = np.hypot(popt[1] - ref[5], popt[2] - ref[6]) + np.hypot(popt[5] - ref[1], popt[6] - ref[2])
+    keep = np.hypot(popt[1] - ref[1], popt[2] - ref[2]) + np.hypot(popt[6] - ref[6], popt[7] - ref[7])
+    swap = np.hypot(popt[1] - ref[6], popt[2] - ref[7]) + np.hypot(popt[6] - ref[1], popt[7] - ref[2])
     if swap < keep:
         return popt[_DOUBLE_SWAP], pcov[np.ix_(_DOUBLE_SWAP, _DOUBLE_SWAP)]
     return popt, pcov
@@ -736,19 +805,20 @@ def _double_fixed(fix_offset: Optional[float], centers: Optional[Sequence[float]
     """Fixed parameters of a double fit: the offset and/or the centers (x1, y1, x2, y2)."""
     fixed: Dict[int, float] = {}
     if fix_offset is not None:
-        fixed[8] = float(fix_offset)
+        fixed[10] = float(fix_offset)
     if centers is not None:
-        fixed.update(zip((1, 2, 5, 6), (float(v) for v in centers)))
+        fixed.update(zip((1, 2, 6, 7), (float(v) for v in centers)))
     return fixed
 
 
 def _double_tied(amp_ratio: Optional[float], share_sigma: bool) -> Dict[int, Tuple[int, float]]:
-    """Ties of a double fit: A2 = amp_ratio * A1 and/or sigma2 = sigma1."""
+    """Ties of a double fit: A2 = amp_ratio * A1 and/or (sigma_x2, sigma_y2) = (sigma_x1, sigma_y1)."""
     tied: Dict[int, Tuple[int, float]] = {}
     if amp_ratio is not None:
-        tied[4] = (0, float(amp_ratio))
+        tied[5] = (0, float(amp_ratio))
     if share_sigma:
-        tied[7] = (3, 1.0)
+        tied[8] = (3, 1.0)
+        tied[9] = (4, 1.0)
     return tied
 
 
@@ -759,7 +829,7 @@ def _fit_double_once(x, y, z, guess, lower, upper, maxfev, fixed: Optional[Dict[
     Returns (popt, pcov, rss) in data units, or None.
     """
     zs = max(float(np.max(np.abs(z))), 1e-300)
-    scale = np.ones(9)
+    scale = np.ones(_NP_DOUBLE)
     scale[_DOUBLE_SCALED] = zs
     g = np.asarray(guess, dtype=np.float64).copy()
     for i, v in (fixed or {}).items():
@@ -779,14 +849,14 @@ def _fit_double_once(x, y, z, guess, lower, upper, maxfev, fixed: Optional[Dict[
     return popt, pcov, rss
 
 
-def _make_double(x, y, z, popt, pcov, rss, lower, upper, n_free: int = 9) -> DoubleFitResult:
+def _make_double(x, y, z, popt, pcov, rss, lower, upper, n_free: int = _NP_DOUBLE) -> DoubleFitResult:
     dof = int(z.size) - n_free
     return DoubleFitResult(
         popt=popt,
         z_fit=np.asarray(gauss2d_double((x, y), *popt), dtype=np.float64),
         rss=rss,
         snr1=_significance(popt[0], pcov, dof),
-        snr2=_significance(popt[4], pcov[4:, 4:], dof),
+        snr2=_significance(popt[5], pcov[5:, 5:], dof),
         at_bound=_hit_bound(popt, lower, upper),
     )
 
@@ -805,21 +875,26 @@ def fit_gaussian_2d_double(
     amp_ratio: Optional[float] = None,
     share_sigma: bool = False,
 ) -> Optional[DoubleFitResult]:
-    """Fit two round 2D Gaussians plus one offset; the lowest-RSS fit of several start points wins.
+    """Fit two elliptical (axis-aligned) 2D Gaussians plus one offset; the lowest-RSS fit of
+    several start points wins.
 
-    ``centers`` = (x1, y1, x2, y2) holds both centers fixed (only A, sigma and the offset are
-    fitted); ``fix_offset`` holds the offset; ``amp_ratio`` ties A2 = amp_ratio * A1 and
-    ``share_sigma`` ties sigma2 = sigma1.
+    ``centers`` = (x1, y1, x2, y2) holds both centers fixed (only A, the widths and the offset
+    are fitted); ``fix_offset`` holds the offset; ``amp_ratio`` ties A2 = amp_ratio * A1 and
+    ``share_sigma`` ties (sigma_x2, sigma_y2) = (sigma_x1, sigma_y1).
 
     ``maxfev`` is per start point and kept small: a well-posed fit converges in a
     few hundred evaluations, while noise-only frames would otherwise run to the
     limit on every start point (seconds per frame in the live view).
-    Components are ordered brighter first (A * sigma^2), or, with ``keep_order_of``
+    Components are ordered brighter first (A * sigma_x * sigma_y), or, with ``keep_order_of``
     (a previous popt), so that their centers match it (stable labels in live view).
     """
     if not _HAS_SCIPY or z.size < MIN_FIT_PIXELS_DOUBLE or np.allclose(z, z[0]):
         return None
     x, y, z = (np.asarray(v, dtype=np.float64) for v in (x, y, z))
+    if p0 is not None and len(p0) != _NP_DOUBLE:
+        p0 = None
+    if keep_order_of is not None and len(keep_order_of) != _NP_DOUBLE:
+        keep_order_of = None
     single = fit_gaussian_2d(x, y, z, pitch_x, pitch_y, maxfev=maxfev, fix_offset=fix_offset)
     lower, upper = _bounds_double(x, y, pitch_x, pitch_y)
     seeds = ([list(p0)] if p0 is not None else []) + _double_seeds(x, y, z, pitch_x, pitch_y, single, fix_offset)
@@ -835,7 +910,7 @@ def fit_gaussian_2d_double(
             near = int(np.argmin((x - c[k]) ** 2 + (y - c[k + 1]) ** 2))
             amp.append(max(float(z[near]) - bg, 1e-9))
         s0 = 0.6 * max(pitch_x, pitch_y)
-        seeds.insert(0, [amp[0], c[0], c[1], s0, amp[1], c[2], c[3], s0, bg])
+        seeds.insert(0, [amp[0], c[0], c[1], s0, s0, amp[1], c[2], c[3], s0, s0, bg])
     best = None
     for guess in seeds:
         out = _fit_double_once(x, y, z, guess, lower, upper, maxfev, fixed, tied)
@@ -848,9 +923,9 @@ def fit_gaussian_2d_double(
         pass  # the order is given by the centers / the ratio would be inverted by a swap
     elif keep_order_of is not None:
         popt, pcov = _order_like(popt, pcov, np.asarray(keep_order_of, dtype=np.float64))
-    elif popt[4] * popt[7] ** 2 > popt[0] * popt[3] ** 2:
+    elif popt[5] * abs(popt[8] * popt[9]) > popt[0] * abs(popt[3] * popt[4]):
         popt, pcov = popt[_DOUBLE_SWAP], pcov[np.ix_(_DOUBLE_SWAP, _DOUBLE_SWAP)]
-    return _make_double(x, y, z, popt, pcov, rss, lower, upper, 9 - len(fixed) - len(tied))
+    return _make_double(x, y, z, popt, pcov, rss, lower, upper, _NP_DOUBLE - len(fixed) - len(tied))
 
 
 def fit_gaussian_2d_double_constrained_next(
@@ -869,36 +944,139 @@ def fit_gaussian_2d_double_constrained_next(
     """Next TRPL frame from the previous double fit with small steps (component order is kept).
 
     ``centers`` = (x1, y1, x2, y2) holds both centers fixed; ``amp_ratio`` / ``share_sigma``
-    tie A2 and sigma2 to A1 and sigma1.
+    tie A2 and (sigma_x2, sigma_y2) to A1 and (sigma_x1, sigma_y1).
     """
     if not _HAS_SCIPY or z.size < MIN_FIT_PIXELS_DOUBLE or np.allclose(z, z[0]):
         return None
     x, y, z = (np.asarray(v, dtype=np.float64) for v in (x, y, z))
     p = np.asarray(prev_popt, dtype=np.float64)
-    a_ref = max(abs(p[0]), abs(p[4]))
+    if p.size != _NP_DOUBLE:
+        return None
+    a_ref = max(abs(p[0]), abs(p[5]))
     lower, upper = [], []
-    for k in (0, 4):
-        A, x0, y0, s = p[k], p[k + 1], p[k + 2], max(abs(p[k + 3]), 1e-3)
+    for k in (0, 5):
+        A, x0, y0 = p[k], p[k + 1], p[k + 2]
+        sx, sy = max(abs(p[k + 3]), 1e-3), max(abs(p[k + 4]), 1e-3)
         dA = max(a_ref * 0.18 * tightness, 1e-3)
         dx = max(pitch_x * 0.18 * tightness, 0.8)
         dy = max(pitch_y * 0.18 * tightness, 0.8)
-        ds = max(s * 0.18 * tightness, 0.5)
-        lower += [max(0.0, A - dA), x0 - dx, y0 - dy, max(1e-3, s - ds)]
-        upper += [A + dA, x0 + dx, y0 + dy, s + ds]
-    off = p[8]
+        dsx = max(sx * 0.18 * tightness, 0.5)
+        dsy = max(sy * 0.18 * tightness, 0.5)
+        lower += [max(0.0, A - dA), x0 - dx, y0 - dy, max(1e-3, sx - dsx), max(1e-3, sy - dsy)]
+        upper += [A + dA, x0 + dx, y0 + dy, sx + dsx, sy + dsy]
+    off = p[10]
     doff = max(abs(off) * 0.25 * tightness, 0.05 * a_ref * tightness, 0.5)
     lower.append(off - doff)
     upper.append(off + doff)
     fixed = _double_fixed(fix_offset, centers)
     tied = _double_tied(amp_ratio, share_sigma)
     lower, upper = _unbound(lower, upper, fixed, tied)
+    p = p.copy()
+    p[[3, 4, 8, 9]] = np.abs(p[[3, 4, 8, 9]])
     out = _fit_double_once(x, y, z, p, lower, upper, 20000, fixed, tied)
     if out is None:
         return None
-    # at_bound is judged against the physical limits; with 9 parameters some step limit is
+    # at_bound is judged against the physical limits; with 11 parameters some step limit is
     # nearly always touched, which says nothing about the quality of the fit
     glo, ghi = _unbound(*_bounds_double(x, y, pitch_x, pitch_y), fixed, tied)
-    return _make_double(x, y, z, out[0], out[1], out[2], glo, ghi, 9 - len(fixed) - len(tied))
+    return _make_double(x, y, z, out[0], out[1], out[2], glo, ghi, _NP_DOUBLE - len(fixed) - len(tied))
+
+
+# ======================================================================
+# Linecut along an arbitrary line (double pump: through the two Gaussian centers)
+# ======================================================================
+@dataclass
+class LineCut:
+    s_um: np.ndarray  # position along the line (bin centers), 0 at p1, increasing towards p2
+    pixels: List[np.ndarray]  # pixel ids averaged into each bin
+    band: np.ndarray  # all pixel ids inside the band
+    length_um: float  # |p2 - p1|
+
+    def values(self, frame: np.ndarray) -> np.ndarray:
+        """Mean of ``frame`` over the pixels of each bin."""
+        v = np.asarray(frame, dtype=np.float64)
+        return np.array([float(np.mean(v[ids])) for ids in self.pixels], dtype=np.float64)
+
+
+def line_cut(
+    x: np.ndarray,
+    y: np.ndarray,
+    p1: Sequence[float],
+    p2: Sequence[float],
+    width_um: float,
+    bin_um: float = 0.0,
+    mask: Optional[np.ndarray] = None,
+) -> Optional[LineCut]:
+    """Pixels within ``width_um`` / 2 of the infinite line through ``p1`` and ``p2``.
+
+    Each pixel is placed at its projection ``s`` on the line (0 at p1, |p2 - p1| at p2).
+    With ``bin_um`` > 0 pixels are grouped in bins of that size along the line (bins
+    without pixels are dropped; the bin position is the mean ``s`` of its pixels);
+    otherwise pixels at the same ``s`` (within 0.5 um) are averaged.
+    Returns None when p1 == p2 or no enabled pixel is inside the band.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    d = np.array([float(p2[0]) - float(p1[0]), float(p2[1]) - float(p1[1])])
+    length = float(np.hypot(*d))
+    if not length > 0:
+        return None
+    u = d / length
+    s = (x - float(p1[0])) * u[0] + (y - float(p1[1])) * u[1]
+    perp = -(x - float(p1[0])) * u[1] + (y - float(p1[1])) * u[0]
+    inside = np.abs(perp) <= 0.5 * float(width_um) + 1e-6
+    if mask is not None:
+        inside &= np.asarray(mask, dtype=bool)
+    band = np.flatnonzero(inside)
+    if band.size == 0:
+        return None
+    order = band[np.argsort(s[band], kind="stable")]
+    groups: List[List[int]] = []
+    if bin_um and bin_um > 0:
+        keys = np.floor(s[order] / float(bin_um) + 0.5).astype(np.int64)
+        for k in np.unique(keys):
+            groups.append(list(order[keys == k]))
+    else:
+        for i in order:
+            if groups and abs(s[i] - s[groups[-1][0]]) <= 0.5:
+                groups[-1].append(int(i))
+            else:
+                groups.append([int(i)])
+    pixels = [np.asarray(g, dtype=np.int64) for g in groups]
+    s_um = np.array([float(np.mean(s[g])) for g in pixels], dtype=np.float64)
+    return LineCut(s_um=s_um, pixels=pixels, band=band, length_um=length)
+
+
+def parse_times(text: str) -> List[float]:
+    """Floats from comma, semicolon, space or newline separated text (bad tokens skipped)."""
+    out: List[float] = []
+    for tok in text.replace("\n", ",").replace("\t", ",").replace(";", ",").replace(" ", ",").split(","):
+        tok = tok.strip()
+        if tok:
+            try:
+                out.append(float(tok))
+            except ValueError:
+                pass
+    return out
+
+
+def time_window_frame(counts: np.ndarray, time_ns: np.ndarray, t_ns: float, window_ns: float = 0.0):
+    """Mean frame of the bins within +-window/2 of ``t_ns`` (the nearest bin if none / window 0).
+
+    Returns ``(frame, i0, i1)`` with the bin index range used (inclusive), or None if
+    ``t_ns`` is outside the time axis by more than one bin.
+    """
+    t = np.asarray(time_ns, dtype=np.float64)
+    if t.size == 0:
+        return None
+    dt = float(np.median(np.diff(t))) if t.size > 1 else 0.0
+    if t_ns < t[0] - dt or t_ns > t[-1] + dt:
+        return None
+    sel = np.flatnonzero(np.abs(t - t_ns) <= 0.5 * float(window_ns) + 1e-12) if window_ns > 0 else np.zeros(0, int)
+    if sel.size == 0:
+        sel = np.array([int(np.argmin(np.abs(t - t_ns)))])
+    i0, i1 = int(sel[0]), int(sel[-1])
+    return np.asarray(counts[i0 : i1 + 1], dtype=np.float64).mean(axis=0), i0, i1
 
 
 # ======================================================================
@@ -1488,7 +1666,8 @@ def fit_all_2d_double_sequential(
     Otherwise the centers move too; the components keep their labels (a frame that needs
     a free refit is matched to the previous frame's centers).
     With ``fix_ratio`` A2/A1 is held at ``ratio``, or, if ``ratio`` is None, at the value of
-    the reference fit; ``share_sigma`` fits one sigma for both Gaussians (reference included).
+    the reference fit; ``share_sigma`` fits one sigma_x and one sigma_y shared by both
+    Gaussians (reference included).
     """
     method = "2d_double_sequential"
     xm, ym = x[mask], y[mask]
@@ -1497,13 +1676,13 @@ def fit_all_2d_double_sequential(
                                      amp_ratio=given, share_sigma=share_sigma)
     if ref_fit is None:
         raise ValueError("Could not fit two Gaussians to the reference frame.")
-    centers = tuple(float(ref_fit.popt[i]) for i in (1, 2, 5, 6)) if fix_centers else None
+    centers = tuple(float(ref_fit.popt[i]) for i in (1, 2, 6, 7)) if fix_centers else None
     amp_ratio = None
     if fix_ratio:
         if given is not None:
             amp_ratio = given
-        elif ref_fit.popt[0] > 0 and ref_fit.popt[4] > 0:
-            amp_ratio = float(ref_fit.popt[4] / ref_fit.popt[0])
+        elif ref_fit.popt[0] > 0 and ref_fit.popt[5] > 0:
+            amp_ratio = float(ref_fit.popt[5] / ref_fit.popt[0])
         else:
             raise ValueError("The reference fit has a zero amplitude: A2/A1 cannot be taken from it.")
     extra = dict(centers=centers, amp_ratio=amp_ratio, shared_sigma=bool(share_sigma))
