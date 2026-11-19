@@ -43,6 +43,15 @@ Tabs
   5. PL fit (scan) — the same linecut fit for the loaded scan's PL spectra along tab 4's
      sweep line (tab 2's CCD row / width / crop / baseline).
 
+Lengths: the SPAD fits work in µm on the detector.  With "Physical units" on (tab 1) every
+displayed / exported SPAD length is converted to the sample with the factor typed next to it
+("1 µm on sample = M µm on detector"): lengths ÷ M, σ², σ₀² and D ÷ M².  The λ-calibration
+(nm per µm on the detector) and the "Fixed" reference width (σx, σy) stay in detector µm.
+
+Time-zero alignment ("Align t0" + method box, tab 2): first-peak edge per point (the SPAD GUIs' method),
+max of each trace per point, or the per-pixel shifts of one reference point (Set t0 ref; edge or max there)
+used at every point — the robust choice at low power, since pixel delays belong to the detector.
+
 The PL and TRPL processing (crop, linecut, time-zero alignment, background, the
 sequential 2D Gaussian fit) is copied from pl_trpl_power_gate_dep_viewer_v2.py;
 the n-D map (cache builder, coordinates, map quantities) from the gate grids
@@ -2066,6 +2075,31 @@ MIN_SNR           = 3.0          # amplitude / its standard error below this = "
 UM2_NS_TO_CM2_S   = 10.0         # 1 µm²/ns = 10 cm²/s
 TRPL_CACHE_FILES  = 48
 
+
+class LengthUnits:
+    """Display units of SPAD lengths.  The fits always work in µm on the detector; with "Physical
+    units" on (tab 1) displayed / exported lengths are divided by the magnification ``mag``
+    (1 µm on the sample = mag µm on the detector): lengths ÷ mag, σ² and D ÷ mag²."""
+
+    def __init__(self):
+        self.mag, self.on = 100.0, False
+
+    @property
+    def f(self) -> float:
+        """Displayed µm per detector µm."""
+        return 1.0 / self.mag if self.on and self.mag > 0 else 1.0
+
+    def u(self, power: int = 1) -> str:
+        return ("µm" if power == 1 else "µm²") + (" on sample" if self.on else "")
+
+    def val(self, v, power: int = 1, spec: str = ".2f") -> str:
+        """Detector length (power 1) or area (power 2) ``v`` in display units, formatted."""
+        x = float(v) * self.f ** power
+        return format(x, ".3g" if self.on and spec.endswith("f") else spec)
+
+
+LEN = LengthUnits()        # set by NDMapTab (Physical units + magnification)
+
 # ── pump 2 (filter flipper) ───────────────────────────────────────────
 P2_OFF, P2_ON, P2_NONE = "off", "on", "none"
 P2_ORDER  = (P2_OFF, P2_ON, P2_NONE)
@@ -2477,6 +2511,25 @@ def _circ_dist(a, b, period: float):
     return (np.asarray(a) - b + period / 2.0) % period - period / 2.0
 
 
+def _shifts_to_common(pos: np.ndarray, reliable: np.ndarray, dt: float, period: float) -> Tuple[np.ndarray, float]:
+    """Whole-bin shifts putting every finite ``pos`` (ns from bin 0) on the median of the largest cluster
+    (within T0_CLUSTER_NS) of the ``reliable`` ones (of all finite ones if none is reliable).
+    Returns (shift_bins, target_ns); target NaN and no shift when no position is finite."""
+    shift = np.zeros(pos.size, dtype=np.int64)
+    have = np.flatnonzero(np.isfinite(pos))
+    if have.size == 0:
+        return shift, float("nan")
+    rel = have[np.asarray(reliable, bool)[have]]
+    ref = pos[rel] if rel.size else pos[have]
+    counts_near = [int(np.sum(np.abs(_circ_dist(ref, v, period)) <= T0_CLUSTER_NS)) for v in ref]
+    v0 = float(ref[int(np.argmax(counts_near))])
+    group = ref[np.abs(_circ_dist(ref, v0, period)) <= T0_CLUSTER_NS]
+    target = float((v0 + np.median(_circ_dist(group, v0, period))) % period)
+    for p in have:
+        shift[p] = int(np.round(_circ_dist(target, pos[p], period) / dt))
+    return shift, target
+
+
 def align_first_peaks(counts: np.ndarray, time_ns: np.ndarray, edge_level: float = T0_EDGE_LEVEL) -> TimeZero:
     c = np.asarray(counts)
     t = np.asarray(time_ns, dtype=np.float64)
@@ -2546,18 +2599,10 @@ def align_first_peaks(counts: np.ndarray, time_ns: np.ndarray, edge_level: float
         coarse = status == T0_COARSE
         pos[coarse] = (pos[coarse] + offset) % period
 
-    have = np.flatnonzero(np.isfinite(pos))
-    shift = np.zeros(n_pix, dtype=np.int64)
-    if have.size == 0:
+    shift, target = _shifts_to_common(pos, status == T0_EDGE, dt, period)
+    if not np.isfinite(target):
         return TimeZero(shift, status, dt, float("nan"), second_delay,
                         "Time-zero alignment: no pixel has a usable first peak; nothing shifted.")
-    ref = pos[have[status[have] == T0_EDGE]] if np.any(status[have] == T0_EDGE) else pos[have]
-    counts_near = [int(np.sum(np.abs(_circ_dist(ref, v, period)) <= T0_CLUSTER_NS)) for v in ref]
-    v0 = float(ref[int(np.argmax(counts_near))])
-    group = ref[np.abs(_circ_dist(ref, v0, period)) <= T0_CLUSTER_NS]
-    target = float((v0 + np.median(_circ_dist(group, v0, period))) % period)
-    for p in have:
-        shift[p] = int(np.round(_circ_dist(target, pos[p], period) / dt))
 
     s_ns = shift * dt
     msg = (f"Time zero: first-peak edge of every pixel put at {target:.2f} ns"
@@ -2571,6 +2616,58 @@ def align_first_peaks(counts: np.ndarray, time_ns: np.ndarray, edge_level: float
     if n_none:
         msg += f"; {n_none} px without usable signal left alone"
     return TimeZero(shift, status, dt, target, second_delay, msg + ".")
+
+
+T0_MAX_MIN_SNR = 5.0    # max method: a pixel's maximum must stand this many noise σ above its median
+
+
+def align_signal_max(counts: np.ndarray, time_ns: np.ndarray) -> TimeZero:
+    """Every pixel shifted by whole bins so the maximum of its trace (minus its median, boxcar over
+    T0_SMOOTH_NS so single-bin noise spikes do not win) lands on the median maximum of the largest group.
+    Pixels whose maximum is not T0_MAX_MIN_SNR noise σ above the median are left alone."""
+    c = np.asarray(counts)
+    t = np.asarray(time_ns, dtype=np.float64)
+    n, n_pix = c.shape
+    if n < 8:
+        raise ValueError("Too few time bins.")
+    dt = float(np.median(np.diff(t)))
+    period = n * dt
+    k = max(1, int(round(T0_SMOOTH_NS / dt))) | 1
+    bg = np.median(c, axis=0).astype(np.float64)
+    y = _circular_boxcar(c.astype(np.float64) - bg, k)
+    imax = np.argmax(y, axis=0)
+    h = y[imax, np.arange(n_pix)]
+    ok = h >= T0_MAX_MIN_SNR * np.sqrt(np.maximum(bg, 1.0) / k)
+    pos = np.where(ok, imax * dt, np.nan)
+    status = np.where(ok, T0_EDGE, T0_NONE).astype(np.int64)
+    shift, target = _shifts_to_common(pos, ok, dt, period)
+    if not np.isfinite(target):
+        return TimeZero(shift, status, dt, float("nan"), float("nan"),
+                        "Time zero (max): no pixel has a clear maximum; nothing shifted.")
+    msg = f"Time zero (max): maximum of every pixel put at {target:.2f} ns; {int((shift != 0).sum())} px shifted"
+    if shift.any():
+        msg += f" (up to {np.abs(shift * dt).max():.1f} ns)"
+    n_none = int(np.sum(~ok))
+    if n_none:
+        msg += f"; {n_none} px without a clear maximum left alone"
+    return TimeZero(shift, status, dt, target, float("nan"), msg + ".")
+
+
+# How the pixels of a point are aligned (ViewSettings.method = (kind, reference TRPL path or None)):
+ALIGN_EDGE, ALIGN_MAX, ALIGN_REF_EDGE, ALIGN_REF_MAX = "edge", "max", "ref_edge", "ref_max"
+ALIGN_DEFAULT = (ALIGN_EDGE, None)
+ALIGN_KINDS = (     # kind, combo text, tooltip
+    (ALIGN_EDGE, "first-peak edge", "Each point aligned on its own pixels' first-peak rising edge (half height)."),
+    (ALIGN_MAX, "max of each trace", "Each point aligned on its own pixels' maxima (0.3 ns boxcar)."),
+    (ALIGN_REF_EDGE, "reference point (edge)",
+     "The per-pixel shifts of the reference point (first-peak edge method) used at every point."),
+    (ALIGN_REF_MAX, "reference point (max)",
+     "The per-pixel shifts of the reference point (max of each trace) used at every point."),
+)
+
+
+def _own_kind(kind: str) -> str:
+    return ALIGN_MAX if kind in (ALIGN_MAX, ALIGN_REF_MAX) else ALIGN_EDGE
 
 
 def move_to_t0(tz: TimeZero, t_ns: np.ndarray, t0_ref: Optional[float]) -> TimeZero:
@@ -2665,9 +2762,10 @@ class TrplStore:
         self._lock  = threading.Lock()
         self._max   = max_files
         self._files: "OrderedDict[str, TrplData]" = OrderedDict()
-        self._align: Dict[str, Tuple[Optional[TimeZero], float, float, str]] = {}  # tz, t_first, period, error
-        self._delay: Dict[str, Optional[float]] = {}      # signal-peak delay after the time zero, per file
-        self._sweep_delay: Dict[float, Optional[float]] = {}  # common_t0 -> median delay
+        # all keyed by (path, method): method = (kind, reference path or None), see ALIGN_KINDS
+        self._align: Dict[tuple, Tuple[Optional[TimeZero], float, float, str]] = {}  # tz, t_first, period, error
+        self._delay: Dict[tuple, Optional[float]] = {}    # signal-peak delay after the time zero, per file
+        self._sweep_delay: Dict[tuple, Optional[float]] = {}  # (common_t0, method) -> median delay
 
     def clear(self) -> None:
         with self._lock:
@@ -2690,24 +2788,61 @@ class TrplStore:
                 self._files.popitem(last=False)
         return d
 
-    def has_alignment(self, path) -> bool:
+    def has_alignment(self, path, method=ALIGN_DEFAULT) -> bool:
         with self._lock:
-            return str(path) in self._align
+            return (str(path), tuple(method)) in self._align
 
-    def alignment(self, path, data: Optional[TrplData] = None):
-        key = str(path)
+    def _reference_tz(self, data: TrplData, method) -> TimeZero:
+        """The reference point's per-pixel shifts (its own edge / max alignment) for ``data``."""
+        kind, ref = method
+        if not ref:
+            raise ValueError("no reference point set")
+        rtz, _, _, rerr = self.alignment(ref, None, (_own_kind(kind), None))
+        if rtz is None:
+            raise ValueError(f"reference point {Path(ref).name}: {rerr}")
+        n, n_pix = data.counts.shape
+        dt = float(np.median(np.diff(data.time_ns)))
+        if rtz.shift_bins.size != n_pix:
+            raise ValueError(f"reference point has {rtz.shift_bins.size} pixels, this one {n_pix}")
+        if abs(rtz.bin_ns - dt) > 1e-6 * max(dt, 1e-12):
+            raise ValueError(f"reference bin width {rtz.bin_ns:g} ns ≠ {dt:g} ns")
+        # The histograms can differ in length (the measuring GUI sizes them to the measured period): carry the
+        # reference's per-pixel edge / max *raw times* over, not its bin shifts, and shift on this file's circle.
+        d_ref = self.load(ref)
+        t_ref0, per_ref = float(d_ref.time_ns[0]), d_ref.counts.shape[0] * dt
+        t0, per = float(data.time_ns[0]), n * dt
+        pos = t_ref0 + (rtz.target_ns - rtz.shift_bins * dt) % per_ref         # raw time of each pixel's feature
+        target = (t_ref0 + rtz.target_ns - t0) % per
+        s = np.round(_circ_dist(target, (pos - t0) % per, per) / dt).astype(np.int64)
+        s[rtz.status == T0_NONE] = 0
+        msg = (f"Time zero: per-pixel shifts of the reference point {Path(ref).name} "
+               f"({'max' if _own_kind(kind) == ALIGN_MAX else 'first-peak edge'}); {int((s != 0).sum())} px shifted")
+        if s.any():
+            msg += f" (up to {np.abs(s * dt).max():.1f} ns)"
+        return TimeZero(s, rtz.status.copy(), rtz.bin_ns, target, rtz.second_delay_ns, msg + ".")
+
+    def alignment(self, path, data: Optional[TrplData] = None, method=ALIGN_DEFAULT):
+        method = tuple(method)
+        key = (str(path), method)
         with self._lock:
             info = self._align.get(key)
         if info is not None:
             return info
-        data = data if data is not None else self.load(key)
+        data = data if data is not None else self.load(str(path))
         t = data.time_ns
         period = t.size * float(np.median(np.diff(t)))
         try:
-            info = (align_first_peaks(data.counts, t), float(t[0]), period, "")
+            kind = method[0]
+            if kind == ALIGN_EDGE:
+                tz = align_first_peaks(data.counts, t)
+            elif kind == ALIGN_MAX:
+                tz = align_signal_max(data.counts, t)
+            else:
+                tz = self._reference_tz(data, method)
+            info = (tz, float(t[0]), period, "")
         except ValueError as exc:
             info = (None, float(t[0]), period, str(exc))
-        delay = None    # signal peak (brightest pixel) after the file's own time zero (first-peak edge)
+        delay = None    # signal peak (brightest pixel) after the file's own time zero (target_ns)
         if info[0] is not None and np.isfinite(info[0].target_ns):
             pk = peak_display_offset(roll_bins(data.counts, info[0].shift_bins), t)
             if pk is not None:
@@ -2717,21 +2852,24 @@ class TrplStore:
             self._delay[key] = delay
         return info
 
-    def zero_of(self, data: TrplData, tz: Optional["TimeZero"], t0_ref: Optional[float]) -> Optional[float]:
+    def zero_of(self, data: TrplData, tz: Optional["TimeZero"], t0_ref: Optional[float],
+                method=ALIGN_DEFAULT) -> Optional[float]:
         """Raw time shown as t = 0 (alignment on): this point's own signal peak (brightest pixel), so every
         point has its peak at 0 even where the first-peak alignment locked onto another feature; a point
         without a clear peak uses the sweep's median delay after its time zero.  None if neither is known."""
         if tz is None or not np.isfinite(tz.target_ns):
             return None
-        self.alignment(data.path, data)
+        method = tuple(method)
+        self.alignment(data.path, data, method)
         with self._lock:
-            d = self._delay.get(str(data.path))
+            d = self._delay.get((str(data.path), method))
             if d is None and t0_ref is not None and np.isfinite(t0_ref):
-                d = self._sweep_delay.get(round(float(t0_ref), 9))
+                d = self._sweep_delay.get((round(float(t0_ref), 9), method))
         return None if d is None else float(data.time_ns[0]) + tz.target_ns + d
 
-    def common_t0(self, paths) -> Optional[float]:
-        infos = [self.alignment(p) for p in paths]
+    def common_t0(self, paths, method=ALIGN_DEFAULT) -> Optional[float]:
+        method = tuple(method)
+        infos = [self.alignment(p, None, method) for p in paths]
         t0s = [t_first + tz.target_ns for tz, t_first, _, _ in infos if tz is not None]
         if not t0s:
             return None
@@ -2740,22 +2878,31 @@ class TrplStore:
         if not np.isfinite(t0):
             return None
         with self._lock:
-            ds = [self._delay.get(str(p)) for p in paths]
+            ds = [self._delay.get((str(p), method)) for p in paths]
             ds = [d for d in ds if d is not None]
-            self._sweep_delay[round(float(t0), 9)] = float(np.median(ds)) if ds else None
+            self._sweep_delay[(round(float(t0), 9), method)] = float(np.median(ds)) if ds else None
         return t0
 
 
 class ViewSettings:
     """How a TRPL file becomes the counts that are shown and fitted."""
-    __slots__ = ("align", "t0_ref", "rebin", "smooth")
+    __slots__ = ("align", "t0_ref", "rebin", "smooth", "method")
 
-    def __init__(self, align: bool, t0_ref: Optional[float], rebin: int, smooth=None):
+    def __init__(self, align: bool, t0_ref: Optional[float], rebin: int, smooth=None, method=ALIGN_DEFAULT):
         self.align, self.t0_ref, self.rebin = bool(align), t0_ref, max(1, int(rebin))
         self.smooth = None if smooth is None else tuple(smooth)    # (method, p1, p2, t_ref): see smooth_traces
+        self.method = tuple(method)                                # time-zero alignment: (kind, reference path)
 
     def key(self):
-        return (self.align, self.t0_ref if self.align else None, self.rebin, self.smooth)
+        return (self.align, self.t0_ref if self.align else None, self.method if self.align else None,
+                self.rebin, self.smooth)
+
+    def describe_align(self) -> str:
+        if not self.align:
+            return "not aligned"
+        kind, ref = self.method
+        text = next((txt for k, txt, _ in ALIGN_KINDS if k == kind), kind)
+        return f"aligned ({text}" + (f": {Path(ref).name})" if ref and kind in (ALIGN_REF_EDGE, ALIGN_REF_MAX) else ")")
 
 
 def point_view(store: TrplStore, data: TrplData, vs: ViewSettings):
@@ -2767,13 +2914,13 @@ def point_view(store: TrplStore, data: TrplData, vs: ViewSettings):
     counts = data.counts
     t_raw = data.time_ns
     if vs.align:
-        tz0, _, _, err = store.alignment(data.path, data)
+        tz0, _, _, err = store.alignment(data.path, data, vs.method)
         if tz0 is None:
             note = f"time-zero alignment failed ({err}); raw data"
         else:
             tz = move_to_t0(tz0, data.time_ns, vs.t0_ref)
             counts = roll_bins(counts, tz.shift_bins)
-        off = view_offset(data.time_ns, store.zero_of(data, tz, vs.t0_ref))
+        off = view_offset(data.time_ns, store.zero_of(data, tz, vs.t0_ref, vs.method))
         if off is not None:
             t_raw = data.time_ns - off
             if vs.rebin > 1:            # rebinned groups start at t = 0 (drop < rebin early bins)
@@ -2940,7 +3087,7 @@ class FitSettings:
         if self.dark_ref is not None:
             bg = f"dark reference subtracted ({self.dark_id.split('|')[0]})"
         return (f"sequential 2D Gaussian, reference {self.ref_ns:.3f} ns, range {rng}, rebin ×{self.view.rebin}, "
-                f"{'aligned' if self.view.align else 'not aligned'}, {bg}, Gaussian offset "
+                f"{self.view.describe_align()}, {bg}, Gaussian offset "
                 f"{'fixed at 0' if self.fix_offset else 'fitted'}, {len(self.excluded)} px excluded")
 
 
@@ -3183,6 +3330,13 @@ class PixelMapPlot(pg.PlotWidget):
         pi.getViewBox().invertY(g.invert_y)
         pi.setXRange(*g.x_range, padding=0)
         pi.setYRange(*g.y_range, padding=0)
+
+    def apply_length_units(self) -> None:
+        """Axis numbers in LEN's units (the dots stay at their detector µm)."""
+        pi = self.getPlotItem()
+        for ax, name in (("bottom", "x"), ("left", "y")):
+            pi.getAxis(ax).setScale(LEN.f)
+            pi.setLabel(ax, f"{name} ({LEN.u()})")
 
     def set_values(self, v: np.ndarray, excluded) -> None:
         v = np.asarray(v, dtype=float).copy()
@@ -3628,7 +3782,7 @@ def fit_point_x(t: np.ndarray, counts: np.ndarray, s, cancelled=None) -> PointDi
         fits.append(fit)
         spans.append((i0, i1))
     if ref_sigma is not None:
-        notes.insert(0, f"reference width held at σx = {ref_sigma[0]:.3g}, σy = {ref_sigma[1]:.3g} µm")
+        notes.insert(0, f"reference width held at σx = {ref_sigma[0]:.3g}, σy = {ref_sigma[1]:.3g} µm on detector")
     return PointDiffusion(np.array(times), np.array([f.sigma_eq ** 2 for f in fits]),
                           np.array([bool(f.at_bound) or not f.quality_ok for f in fits]), float(t[ref]), failures,
                           "; ".join(notes), np.array([f.popt for f in fits], dtype=np.float64),
@@ -3879,8 +4033,14 @@ class XMapPlot(QtWidgets.QWidget):
         self.msg = pg.TextItem("", color="#6b7280", anchor=(0.5, 0.5))
         self.plot.addItem(self.msg, ignoreBounds=True)
         self._x = None
+        self._x_scale = 1.0
         self._has_img = False
         self.plot.scene().sigMouseClicked.connect(self._on_click)
+
+    def set_x_scale(self, s: float) -> None:
+        """Show (and export) x × ``s`` while the data stay in their own units (e.g. detector µm)."""
+        self._x_scale = float(s)
+        self.plot.getAxis("bottom").setScale(self._x_scale)
 
     def show_message(self, text: str, title: str = "") -> None:
         self.img.clear()
@@ -3935,7 +4095,7 @@ class XMapPlot(QtWidgets.QWidget):
     def export_csv(self, fn) -> None:
         """The map's data (not the display resampling): x = the sweep values, y = energy / time / ..."""
         x, y, z, _t = self._export
-        export_matrix_csv(fn, x, y, z)
+        export_matrix_csv(fn, x * self._x_scale, y, z)
 
     def _on_export(self) -> None:
         if self._export is not None:
@@ -4650,6 +4810,7 @@ _ND_CAL_DIR = HERE / "gate grids viewer" / "calibration"
 
 class NDMapTab(QtWidgets.QWidget):
     calib_changed = QtCore.pyqtSignal()
+    length_changed = QtCore.pyqtSignal()          # LEN changed (Physical units / magnification)
     point_clicked = QtCore.pyqtSignal(int)        # base index of a scan point
     status = QtCore.pyqtSignal(str)
 
@@ -4674,6 +4835,7 @@ class NDMapTab(QtWidgets.QWidget):
         self._restore_settings()
         self._wire()
         self._update_phys_info()
+        LEN.mag, LEN.on = float(self.magSpin.value()), self.physChk.isChecked()
         self._apply_axes()
         self._refresh_map()
 
@@ -4729,14 +4891,20 @@ class NDMapTab(QtWidgets.QWidget):
         self.calChk.setChecked(True)
         self.calChk.setToolTip("Off: raw gate voltages (V_front, V_back) on the map, and the sweep axis is "
                                "the front gate voltage")
-        self.physChk = QtWidgets.QCheckBox("Physical units (n, D/ε₀)")
+        self.physChk = QtWidgets.QCheckBox("Physical units (n, D/ε₀, µm on sample)")
         self.physChk.setToolTip("Axes in n [10¹² cm⁻²] and D/ε₀ [V/nm] from d_F and ε_hBN "
-                                "(turns on calibrated axes)")
+                                "(turns on calibrated axes),\nand SPAD lengths on the sample: lengths ÷ M, "
+                                "σ², σ₀² and D ÷ M² (M = the factor on the right)")
+        self.magSpin = _dspin(1e-3, 1e6, 100.0, 3, 1.0, " µm on detector", width=170)
+        self.magSpin.setToolTip("Magnification M of the SPAD imaging: 1 µm on the sample = M µm on the detector.\n"
+                                "Used only with 'Physical units' on.")
         self.tolSpin = _dspin(0.1, 45.0, 5.0, 1, 0.5, " °", width=80)
         self.tolSpin.setToolTip("A linecut within this angle of the u_D (u_n) axis is a constant-n "
                                 "(constant-D) scan; its sweep axis is then D (n)")
         r4.addWidget(self.calChk)
         r4.addWidget(self.physChk)
+        r4.addWidget(QtWidgets.QLabel("  1 µm on sample ="))
+        r4.addWidget(self.magSpin)
         r4.addSpacing(12)
         r4.addWidget(QtWidgets.QLabel("Linecut tolerance"))
         r4.addWidget(self.tolSpin)
@@ -4874,6 +5042,7 @@ class NDMapTab(QtWidgets.QWidget):
             w.valueChanged.connect(lambda _v: self._on_coords_changed())
         self.calChk.toggled.connect(self._on_display_toggled)
         self.physChk.toggled.connect(self._on_display_toggled)
+        self.magSpin.valueChanged.connect(lambda _v: (self._update_length_units(), self.save_settings()))
         for w in (self.spatCenter, self.spatWidth):
             w.valueChanged.connect(lambda _v: self._on_band_changed())
         for w in (self.bgLo, self.bgHi):
@@ -4889,7 +5058,8 @@ class NDMapTab(QtWidgets.QWidget):
 
     # ── settings ──────────────────────────────────────────────────────
     _SAVED = (("r", "rSpin"), ("un0", "nOrig"), ("uD0", "dOrig"), ("dF", "dF"), ("eps", "eps"),
-              ("tol", "tolSpin"), ("bg_lo", "bgLo"), ("bg_hi", "bgHi"), ("e_lo", "eLo"), ("e_hi", "eHi"))
+              ("tol", "tolSpin"), ("bg_lo", "bgLo"), ("bg_hi", "bgHi"), ("e_lo", "eLo"), ("e_hi", "eHi"),
+              ("mag", "magSpin"))
 
     def _restore_settings(self) -> None:
         st = _settings()
@@ -4985,6 +5155,11 @@ class NDMapTab(QtWidgets.QWidget):
                 self.physChk.setChecked(False)
                 self.physChk.blockSignals(False)
         self._on_coords_changed()
+        self._update_length_units()
+
+    def _update_length_units(self) -> None:
+        LEN.mag, LEN.on = float(self.magSpin.value()), self.physChk.isChecked()
+        self.length_changed.emit()
 
     def _on_coords_changed(self) -> None:
         self._update_phys_info()
@@ -5601,9 +5776,11 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.ndTab.calib_changed.connect(self._on_calib_changed)
+        self.ndTab.length_changed.connect(self._on_length_units_changed)
         self.ndTab.point_clicked.connect(self._on_nd_point_clicked)
         self.ndTab.status.connect(lambda t: self.statusBar().showMessage(t, 15000))
         _big_fonts(self)
+        self._apply_length_units()
         self._on_tab_changed(0)
 
     def _make_bar(self) -> QtWidgets.QGroupBox:
@@ -5683,10 +5860,32 @@ class DualGateViewer(QtWidgets.QMainWindow):
             w.setToolTip(tip)
         self.alignCheck = QtWidgets.QCheckBox("Align t0")
         self.alignCheck.setChecked(True)
-        self.alignCheck.setToolTip("Time-zero alignment on each pixel's first peak; every point is then moved to "
-                                   "the scan's common time zero; t = 0 ns is then the signal peak (brightest\n"
+        self.alignCheck.setToolTip("Per-pixel time-zero alignment (method in the box next to it); every point is then "
+                                   "moved to the scan's common time zero; t = 0 ns is then the signal peak (brightest\n"
                                    "pixel) of each point.\n"
                                    "Begin / End / Ref are converted when this is switched.")
+        self.alignModeCombo = QtWidgets.QComboBox()
+        for k, (kind, text, tip) in enumerate(ALIGN_KINDS):
+            self.alignModeCombo.addItem(text, kind)
+            self.alignModeCombo.setItemData(k, tip, QtCore.Qt.ToolTipRole)
+        self.alignModeCombo.setToolTip(
+            "How each pixel's time zero is found:\n"
+            "• first-peak edge: every point aligns its own pixels on the rising edge (half height) of the first "
+            "peak\n  (cross-correlation for weak pixels). Noisy at low power.\n"
+            "• max of each trace: every point aligns its own pixels on their maxima (0.3 ns boxcar); pixels\n"
+            f"  without a maximum {T0_MAX_MIN_SNR:g}σ above their median stay put.\n"
+            "• reference point (edge / max): the per-pixel shifts found at the reference point (Set ref = a\n"
+            "  bright point) are used at every point of the scan — pixel delays are a property of the detector,\n"
+            "  so weak points get the same, clean alignment.")
+        i = self.alignModeCombo.findData(str(_settings().value("trpl/align_mode", ALIGN_EDGE)))
+        self.alignModeCombo.setCurrentIndex(max(i, 0))
+        self._align_ref: Optional[str] = None        # TRPL path of the reference point (reference modes)
+        self.alignRefBtn = QtWidgets.QPushButton("Set t0 ref")
+        self.alignRefBtn.setToolTip("Use the current point (gate, power) as the time-zero reference point")
+        self.alignGoRefBtn = QtWidgets.QPushButton("Go to ref")
+        self.alignGoRefBtn.setToolTip("Show the time-zero reference point")
+        self.alignRefLbl = QtWidgets.QLabel("")
+        self.alignRefLbl.setStyleSheet("color:#555")
         self.rebinSpin = QtWidgets.QSpinBox()
         self.rebinSpin.setRange(1, 200)
         self.rebinSpin.setValue(1)
@@ -5712,6 +5911,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
         r3.addWidget(QtWidgets.QLabel("ns"))
         r3.addSpacing(8)
         r3.addWidget(self.alignCheck)
+        r3.addWidget(self.alignModeCombo)
         r3.addWidget(self.fixOffsetCheck)
         r3.addWidget(QtWidgets.QLabel("Excluded"))
         r3.addWidget(self.exclEdit)
@@ -5738,6 +5938,11 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self.smInfo.setStyleSheet("color:#555")
         self._smooth_vals = {"sg": [11.0, 2.0], "ma": [5.0, 0.0], "gauss": [1.0, 0.0], "adapt": [0.5, 0.05]}
         self._smooth_method = None
+        for w in (self.alignRefBtn, self.alignGoRefBtn, self.alignRefLbl):
+            r4.addWidget(w)
+        self._alignRefGap = QtWidgets.QWidget()
+        self._alignRefGap.setFixedWidth(16)
+        r4.addWidget(self._alignRefGap)
         r4.addWidget(QtWidgets.QLabel("Rebin"))
         r4.addWidget(self.rebinSpin)
         r4.addWidget(self.binLbl)
@@ -5768,6 +5973,10 @@ class DualGateViewer(QtWidgets.QMainWindow):
         for w in (self.beginEdit, self.endEdit, self.refEdit):
             w.editingFinished.connect(self._on_times_edited)
         self.alignCheck.toggled.connect(self._on_align_toggled)
+        self.alignModeCombo.currentIndexChanged.connect(lambda _i: self._on_align_mode_changed())
+        self.alignRefBtn.clicked.connect(self._on_set_align_ref)
+        self.alignGoRefBtn.clicked.connect(self._on_go_align_ref)
+        self._update_align_ref_widgets()
         self.rebinSpin.valueChanged.connect(lambda _v: self._on_fit_setting_changed(reload_view=True))
         self.smoothCombo.currentIndexChanged.connect(lambda _i: self._on_smooth_method())
         for s in (self.sm1Spin, self.sm2Spin):
@@ -5928,14 +6137,17 @@ class DualGateViewer(QtWidgets.QMainWindow):
                                       "from that frame's fitted centre (linear between pixels).")
         self.lineProfNorm = QtWidgets.QCheckBox("Normalize each time")
         self.lineProfNorm.setToolTip("Fitted: exp(−d²/2σ²); measured: (counts − offset) / A, so the fitted peak = 1")
-        self.lineProfRSpin = _dspin(0.0, 100000.0, 0.0, 1, 10.0, " µm", width=90)
+        self.lineProfRSpin = _dspin(0.0, 100000.0, 0.0, 1, 10.0, " µm", width=150)
         self.lineProfRSpin.setSpecialValueText("auto")
-        self.lineProfRSpin.setToolTip("Fix the profile map's x axis to −max … +max (µm). 0 = auto.")
+        self.lineProfRSpin.setToolTip("Fix the profile map's x axis to −max … +max (µm, on the sample with "
+                                      "Physical units). 0 = auto.")
+        self._lineProfR_det = 0.0        # the same in detector µm (what is saved and used)
         st = _settings()
         try:
             self.lineProfCombo.setCurrentIndex(int(st.value("spectral/prof_mode", 1)))
             self.lineProfNorm.setChecked(str(st.value("spectral/prof_norm", "true")).lower() == "true")
-            self.lineProfRSpin.setValue(float(st.value("spectral/prof_r_max", 0.0)))
+            self._lineProfR_det = float(st.value("spectral/prof_r_max", 0.0))
+            self.lineProfRSpin.setValue(self._lineProfR_det)
         except (TypeError, ValueError):
             pass
         lrow.addWidget(QtWidgets.QLabel("Profile"))
@@ -6090,8 +6302,8 @@ class DualGateViewer(QtWidgets.QMainWindow):
             "• Common: every point's reference frame is fitted freely first, then all points are fitted with the\n"
             "  median σx, σy of the sweep line held (for spots that start at the same size).\n"
             "• Fixed: the σx, σy typed here.")
-        self.refSxSpin = _dspin(0.5, 1000.0, 40.0, 2, 1.0, " µm", width=92)
-        self.refSySpin = _dspin(0.5, 1000.0, 40.0, 2, 1.0, " µm", width=92)
+        self.refSxSpin = _dspin(0.5, 1000.0, 40.0, 2, 1.0, " µm", width=112)     # detector µm (as the fits)
+        self.refSySpin = _dspin(0.5, 1000.0, 40.0, 2, 1.0, " µm", width=112)
         self.s0FixCheck = QtWidgets.QCheckBox("D line through σ²(t_ref)")
         self.s0FixCheck.setToolTip("Hold the line's intercept at the reference frame's σ_eq² (the common / fixed width,\n"
                                    "or this point's own reference fit) and fit only the slope.")
@@ -6143,11 +6355,14 @@ class DualGateViewer(QtWidgets.QMainWindow):
         row2.addWidget(QtWidgets.QLabel("Profile map (right of σ_eq²(t)):"))
         row2.addWidget(self.profCombo)
         row2.addWidget(self.profNormCheck)
-        self.profRSpin = _dspin(0.0, 100000.0, 0.0, 1, 10.0, " µm", width=100)
+        self.profRSpin = _dspin(0.0, 100000.0, 0.0, 1, 10.0, " µm", width=150)
         self.profRSpin.setSpecialValueText("auto")
-        self.profRSpin.setToolTip("Fix the map's x axis to −max … +max (µm). 0 = auto (fit the data).")
+        self.profRSpin.setToolTip("Fix the map's x axis to −max … +max (µm, on the sample with Physical units). "
+                                  "0 = auto (fit the data).")
+        self._profR_det = 0.0            # the same in detector µm (what is saved and used)
         try:
-            self.profRSpin.setValue(float(_settings().value("profile/r_max", 0.0)))
+            self._profR_det = float(_settings().value("profile/r_max", 0.0))
+            self.profRSpin.setValue(self._profR_det)
         except (TypeError, ValueError):
             pass
         row2.addWidget(QtWidgets.QLabel("x max ±"))
@@ -6374,6 +6589,8 @@ class DualGateViewer(QtWidgets.QMainWindow):
         if not same_folder or keep is None:
             self.store.clear()
             self._sweep_t0, self._t0_ready = None, False
+        if not same_folder:
+            self._align_ref = None          # reference modes: the first point shown becomes the reference
         self._fits.clear()
         self._sigma_snap = None
         self._traces.clear()
@@ -6398,6 +6615,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self.depCombo.setCurrentText(self.MODE_GATE if model.n_points > 1 or model.n_powers < 2 else self.MODE_POWER)
         self.depCombo.blockSignals(False)
         self._sync_bars()
+        self._update_align_ref_widgets()
         self._start_alignment()
         self._on_point_changed()
         self._mark_dep_dirty()
@@ -6633,6 +6851,38 @@ class DualGateViewer(QtWidgets.QMainWindow):
         self._update_labels()
         self._mark_dep_dirty()
 
+    def _apply_length_units(self) -> None:
+        """Axis numbers / labels and the x-range boxes in LEN's units (the plotted data stay in detector µm)."""
+        f, u, u2 = LEN.f, LEN.u(), LEN.u(2)
+        self.pixMap.apply_length_units()
+        for pw, ax, s, label in ((self.radialPlot, "bottom", f, f"Distance from the fitted centre ({u})"),
+                                 (self.sigPlot, "left", f * f, f"σ_eq² ({u2})"),
+                                 (self.pickSigPlot, "left", f * f, f"σ_eq² ({u2})"),
+                                 (self.lineSigPlot, "left", f * f, f"σ² ({u2})")):
+            pi = pw.getPlotItem()
+            pi.getAxis(ax).setScale(s)
+            pi.setLabel(ax, label)
+        for mp in (self.profMap, self.lineProfMap):
+            mp.set_x_scale(f)
+        for spin, det in ((self.profRSpin, self._profR_det), (self.lineProfRSpin, self._lineProfR_det)):
+            spin.blockSignals(True)
+            spin.setDecimals(3 if LEN.on else 1)
+            spin.setSingleStep(0.1 if LEN.on else 10.0)
+            spin.setSuffix(" " + u)
+            spin.setValue(det * f)
+            spin.blockSignals(False)
+        for spin in (self.refSxSpin, self.refSySpin):
+            spin.setSuffix(" µm det." if LEN.on else " µm")
+
+    def _on_length_units_changed(self) -> None:
+        self._apply_length_units()
+        self._update_ref_info()
+        if self.model is None:
+            return
+        self._draw_frame_fit()
+        self._draw_sigma_plot()          # also the profile maps and the spectral line fit
+        self._draw_sigma_map()           # tab 4 (only marked dirty when another tab is shown)
+
     def _on_nd_point_clicked(self, b: int) -> None:
         if self.model is not None and 0 <= b < self.model.n_points:
             self.voltBar.setValue(int(np.flatnonzero(self._order == b)[0]))
@@ -6680,7 +6930,85 @@ class DualGateViewer(QtWidgets.QMainWindow):
 
     def _view_settings(self) -> ViewSettings:
         return ViewSettings(self.alignCheck.isChecked(), self._sweep_t0 if self.alignCheck.isChecked() else None,
-                            self.rebinSpin.value(), self._smooth_spec())
+                            self.rebinSpin.value(), self._smooth_spec(), self._align_method())
+
+    # ── time-zero method / reference point ────────────────────────────
+    def _ref_mode(self) -> bool:
+        return self.alignModeCombo.currentData() in (ALIGN_REF_EDGE, ALIGN_REF_MAX)
+
+    def _align_method(self) -> tuple:
+        kind = self.alignModeCombo.currentData() or ALIGN_EDGE
+        if kind not in (ALIGN_REF_EDGE, ALIGN_REF_MAX):
+            return (kind, None)
+        if self._align_ref is None and self.model is not None:   # no reference yet: the current point
+            p = self.model.trpl_path(self._pi, self._b)
+            if p is not None:
+                self._align_ref = str(p)
+                self._update_align_ref_widgets()
+        return (kind, self._align_ref)
+
+    def _align_ref_point(self) -> Optional[Tuple[int, int]]:
+        """(power index, base point) of the reference point in the loaded scan, or None."""
+        m = self.model
+        if m is None or self._align_ref is None:
+            return None
+        for pi in range(m.n_powers):
+            for b in range(m.n_points):
+                p = m.trpl_path(pi, b)
+                if p is not None and str(p) == self._align_ref:
+                    return pi, b
+        return None
+
+    def _update_align_ref_widgets(self) -> None:
+        on = self._ref_mode()
+        for w in (self.alignRefBtn, self.alignGoRefBtn, self.alignRefLbl, self._alignRefGap):
+            w.setVisible(on)
+        if not on:
+            return
+        if self._align_ref is None:
+            self.alignRefLbl.setText("t0 ref: none")
+            self.alignRefLbl.setToolTip("")
+            return
+        pt = self._align_ref_point()
+        if pt is None:
+            text = f"t0 ref: {Path(self._align_ref).name}"
+        else:
+            pi, b = pt
+            px = self._px[pi] if pi < self._px.size else np.nan
+            text = f"t0 ref: {self._point_text(b).split('   ')[0]}, {self._plabel.split(' (')[0]} {_fmt(px)}"
+        self.alignRefLbl.setText(text)
+        self.alignRefLbl.setToolTip(self._align_ref)
+        self.alignGoRefBtn.setEnabled(pt is not None)
+
+    def _on_align_mode_changed(self) -> None:
+        _settings().setValue("trpl/align_mode", self.alignModeCombo.currentData())
+        self._update_align_ref_widgets()
+        if self.alignCheck.isChecked():
+            self._on_align_toggled(True)
+
+    def _on_set_align_ref(self) -> None:
+        if self.model is None:
+            return
+        p = self.model.trpl_path(self._pi, self._b)
+        if p is None:
+            self.statusBar().showMessage("No TRPL file at this point: it cannot be the time-zero reference.", 10000)
+            return
+        self._align_ref = str(p)
+        self._update_align_ref_widgets()
+        if self.alignCheck.isChecked() and self._ref_mode():
+            self._on_align_toggled(True)
+
+    def _on_go_align_ref(self) -> None:
+        pt = self._align_ref_point()
+        if pt is None:
+            return
+        pi, b = pt
+        for bar, order, idx in ((self.powerBar, self._porder, pi), (self.voltBar, self._order, b)):
+            bar.blockSignals(True)
+            bar.setValue(int(np.flatnonzero(order == idx)[0]))
+            bar.blockSignals(False)
+        self._pi, self._b = pi, b
+        self._on_point_changed()
 
     # ── trace smoothing ───────────────────────────────────────────────
     _SMOOTH_SPINS = {   # method: ((label, decimals, lo, hi, step, suffix), second spin or None)
@@ -6848,12 +7176,14 @@ class DualGateViewer(QtWidgets.QMainWindow):
                     s.blockSignals(True)
                     s.setValue(v)
                     s.blockSignals(False)
-                self.refInfo.setText(f"median of {c['n_used']}/{c['n']} reference fits: σx = {c['sx']:.3g}, "
-                                     f"σy = {c['sy']:.3g} µm (IQR {c['iqr_x']:.2g}, {c['iqr_y']:.2g})")
+                self.refInfo.setText(f"median of {c['n_used']}/{c['n']} reference fits: σx = {LEN.val(c['sx'], 1, '.3g')}, "
+                                     f"σy = {LEN.val(c['sy'], 1, '.3g')} {LEN.u()} "
+                                     f"(IQR {LEN.val(c['iqr_x'], 1, '.2g')}, {LEN.val(c['iqr_y'], 1, '.2g')})")
             else:
                 self.refInfo.setText("computed at the next 'Fit this point' / 'Fit all' (median over the sweep line)")
         elif mode == 2:
-            self.refInfo.setText(f"σ_eq at the reference = {np.sqrt((self.refSxSpin.value() ** 2 + self.refSySpin.value() ** 2) / 2):.3g} µm")
+            s_eq = np.sqrt((self.refSxSpin.value() ** 2 + self.refSySpin.value() ** 2) / 2)
+            self.refInfo.setText(f"σ_eq at the reference = {LEN.val(s_eq, 1, '.3g')} {LEN.u()}")
         else:
             self.refInfo.setText("")
 
@@ -6889,12 +7219,14 @@ class DualGateViewer(QtWidgets.QMainWindow):
                 data = self.store.load(path)
                 self._set_geometry(data.geom)
                 self._t, self._c, self._tz, note = point_view(self.store, data, vs)
-                off = view_offset(data.time_ns, self.store.zero_of(data, self._tz, vs.t0_ref)) if vs.align else None
+                off = (view_offset(data.time_ns, self.store.zero_of(data, self._tz, vs.t0_ref, vs.method))
+                       if vs.align else None)
                 # aligned: converted once the sweep's time zero is known (a point's own differs by a few ns)
                 if not vs.align or (off is not None and self._t0_ready):
                     self._sync_time_frame(off)
                 if vs.smooth is not None:
-                    self._c_raw = point_view(self.store, data, ViewSettings(vs.align, vs.t0_ref, vs.rebin))[1]
+                    self._c_raw = point_view(self.store, data,
+                                             ViewSettings(vs.align, vs.t0_ref, vs.rebin, method=vs.method))[1]
             except Exception as exc:
                 self._t, self._c = np.zeros(0), np.zeros((0, self.geom.num_pixels))
                 self.infoLbl.setText(f"Could not load {Path(path).name}: {exc}")
@@ -7044,8 +7376,9 @@ class DualGateViewer(QtWidgets.QMainWindow):
         paths = self.model.scan.trpl_paths() if self.model is not None else []
         if not self.alignCheck.isChecked() or not paths:
             return
-        if all(self.store.has_alignment(p) for p in paths):
-            self._sweep_t0, self._t0_ready = self.store.common_t0(paths), True
+        method = self._align_method()
+        if all(self.store.has_alignment(p, method) for p in paths):
+            self._sweep_t0, self._t0_ready = self.store.common_t0(paths, method), True
             return
         self._t0_ready = False
         store = self.store
@@ -7055,11 +7388,11 @@ class DualGateViewer(QtWidgets.QMainWindow):
                 if cancelled():
                     return "cancelled"
                 try:
-                    store.alignment(p)
+                    store.alignment(p, None, method)
                 except Exception:
                     pass
                 progress(k + 1, len(paths))
-            return store.common_t0(paths)
+            return store.common_t0(paths, method)
 
         job = self._run(work, lambda res, err: self._on_alignment_done(job, res, err),
                         lambda d, n: self.statusBar().showMessage(f"Time-zero alignment: {d}/{n} TRPL files"))
@@ -7541,7 +7874,8 @@ class DualGateViewer(QtWidgets.QMainWindow):
         st = _settings()
         st.setValue("spectral/prof_mode", int(self.lineProfCombo.currentIndex()))
         st.setValue("spectral/prof_norm", bool(self.lineProfNorm.isChecked()))
-        st.setValue("spectral/prof_r_max", float(self.lineProfRSpin.value()))
+        self._lineProfR_det = float(self.lineProfRSpin.value()) / LEN.f
+        st.setValue("spectral/prof_r_max", self._lineProfR_det)
         self._draw_line_fit()
 
     def _draw_line_fit(self) -> None:
@@ -7603,8 +7937,10 @@ class DualGateViewer(QtWidgets.QMainWindow):
             xx = np.array([w0, hi_t])
             self._lineSigLine.setData(xx + f.ref_ns, ln["s0"] + ln["slope"] * xx)
             corr = f", errors × {factor:.2f}" if factor > 1.0 + 1e-9 else ""
-            text += (f"<b>D = {ln['D']:.3g} ± {ln['D_err']:.2g} cm²/s</b> (σ² = σ₀² + 2D(t − t_ref){corr}; "
-                     f"σ₀² = {ln['s0']:.3g} µm², {ln['n']} frames; D window / σ² smoothing / flagged as in tab 3)")
+            f2 = LEN.f ** 2
+            text += (f"<b>D = {ln['D'] * f2:.3g} ± {ln['D_err'] * f2:.2g} cm²/s</b> (σ² = σ₀² + 2D(t − t_ref){corr}; "
+                     f"σ₀² = {LEN.val(ln['s0'], 2, '.3g')} {LEN.u(2)}, {ln['n']} frames; "
+                     f"D window / σ² smoothing / flagged as in tab 3)")
         if f.note:
             text += f"  [{f.note}]"
         self._line_text = text
@@ -7624,7 +7960,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
         ids, xc = line_pixels(self.geom, line, self.excluded)
         P = f.popt
         d = xc[None, :] - P[:, 1:2]                      # signed distance from each frame's fitted centre
-        R_fix = float(self.lineProfRSpin.value())
+        R_fix = self._lineProfR_det
         R = R_fix if R_fix > 0 else float(max(np.abs(d[use]).max(), 3.0 * np.sqrt(P[use, 2].max() ** 2)))
         x = np.linspace(-R, R, 241)
         z = np.full((t.size, x.size), np.nan)
@@ -7643,7 +7979,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
                 row = gauss if norm else A * gauss
             z[max(i0, r0) - r0:min(i1, r1) - r0 + 1] = row
         what = "measured counts" if measured else "fitted Gaussian"
-        mp.set_data(x, t, z, x_label=f"{self._cross_name()} − fitted centre (µm)", y_label="Time (ns)",
+        mp.set_data(x, t, z, x_label=f"{self._cross_name()} − fitted centre ({LEN.u()})", y_label="Time (ns)",
                     levels=(0.0, 1.0) if norm else None,
                     title=f"Profile along {name} ({what}{', normalized' if norm else ''})")
         if R_fix > 0:
@@ -7669,8 +8005,9 @@ class DualGateViewer(QtWidgets.QMainWindow):
             if k.size:
                 A, c, s, off = (float(v) for v in f.popt[k[0]])
                 flag = " <span style='color:#b45309'>(flagged)</span>" if f.flagged[k[0]] else ""
-                extra = (f"At t = {self._t[i]:.2f} ns: {self._cross_name()}₀ = {c:.1f} µm, <b>σ = {s:.2f} µm</b> "
-                         f"(σ² = {s * s:.4g} µm²), A = {A:.4g}, offset {off:.3g}{flag}")
+                extra = (f"At t = {self._t[i]:.2f} ns: {self._cross_name()}₀ = {LEN.val(c, 1, '.1f')} {LEN.u()}, "
+                         f"<b>σ = {LEN.val(s)} {LEN.u()}</b> (σ² = {LEN.val(s * s, 2, '.4g')} {LEN.u(2)}), "
+                         f"A = {A:.4g}, offset {off:.3g}{flag}")
             else:
                 extra = f"At t = {self._t[i]:.2f} ns: no fitted frame (before the reference or a failed fit)"
         self.lineFitLbl.setText(self._line_text + ("<br>" + extra if extra else ""))
@@ -7765,8 +8102,10 @@ class DualGateViewer(QtWidgets.QMainWindow):
         snr = f", A/σ_A = {res['snr']:.3g}" if res.get("snr") is not None and np.isfinite(res["snr"]) else ""
         self.frameFitLbl.setText(
             f"<b>2D Gaussian at t = {t:.2f} ns</b> ({res['source']}){flag}<br>"
-            f"centre ({x0:.2f}, {y0:.2f}) µm<br>σx = {sx:.2f} µm, σy = {sy:.2f} µm<br>"
-            f"<b>σ_eq = {res['sigma_eq']:.2f} µm</b> (σ_eq² = {res['sigma_eq'] ** 2:.3g} µm²)<br>"
+            f"centre ({LEN.val(x0)}, {LEN.val(y0)}) {LEN.u()}<br>"
+            f"σx = {LEN.val(sx)} {LEN.u()}, σy = {LEN.val(sy)} {LEN.u()}<br>"
+            f"<b>σ_eq = {LEN.val(res['sigma_eq'])} {LEN.u()}</b> "
+            f"(σ_eq² = {LEN.val(res['sigma_eq'] ** 2, 2, '.3g')} {LEN.u(2)})<br>"
             f"A = {A:.4g}, offset = {off:.3g}{snr}<br>"
             f"Background: {self._bg_note}<br>"
             f"Contours: 1σ (solid) and 2σ (dashed) of the fit.  Left click = select pixel, right click = "
@@ -7781,7 +8120,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
         rr = np.linspace(-rmax, rmax, 400)
         self._radCurve.setData(rr, A * np.exp(-rr ** 2 / (2.0 * res["sigma_eq"] ** 2)) + off)
         self.radialPlot.getPlotItem().setTitle(
-            f"t = {t:.2f} ns:  σ_eq = {res['sigma_eq']:.2f} µm  ({res['source']})")
+            f"t = {t:.2f} ns:  σ_eq = {LEN.val(res['sigma_eq'])} {LEN.u()}  ({res['source']})")
 
     def _fit_spans(self, f: PointDiffusion) -> np.ndarray:
         """(frames, 2) first / last bin of the current view that each fitted frame covers."""
@@ -7959,9 +8298,10 @@ class DualGateViewer(QtWidgets.QMainWindow):
             src = (f"fitted to the S-G smoothed σ² ({sg[0]} frames, order {sg[1]})" if sg is not None
                    else "fitted to the σ² points")
             corr = f"; errors × {factor:.2f} for frames correlated by the smoothing" if factor > 1.0 + 1e-9 else ""
-            s0txt = (f"σ₀² = {ln['s0']:.3g} µm² (fixed: σ²(t_ref))" if ln.get("fixed_s0") else
-                     f"σ₀² = {ln['s0']:.3g} ± {ln['s0_err']:.2g} µm²")
-            text += (f"<b>D = {ln['D']:.3g} ± {ln['D_err']:.2g} cm²/s</b> (σ² = σ₀² + 2D(t − t_ref), {src}{corr}), "
+            f2, u2 = LEN.f ** 2, LEN.u(2)
+            s0txt = (f"σ₀² = {ln['s0'] * f2:.3g} {u2} (fixed: σ²(t_ref))" if ln.get("fixed_s0") else
+                     f"σ₀² = {ln['s0'] * f2:.3g} ± {ln['s0_err'] * f2:.2g} {u2}")
+            text += (f"<b>D = {ln['D'] * f2:.3g} ± {ln['D_err'] * f2:.2g} cm²/s</b> (σ² = σ₀² + 2D(t − t_ref), {src}{corr}), "
                      f"{s0txt} ({ln['n']} frames)")
         if f.note:
             text += f"  [{f.note}]"
@@ -8003,7 +8343,8 @@ class DualGateViewer(QtWidgets.QMainWindow):
         return np.where(ok, s2s, np.nan)
 
     def _on_prof_range(self, v: float) -> None:
-        _settings().setValue("profile/r_max", float(v))
+        self._profR_det = float(v) / LEN.f
+        _settings().setValue("profile/r_max", self._profR_det)
         self._draw_profile_map()
 
     def _draw_profile_map(self) -> None:
@@ -8028,7 +8369,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
         P = f.popt
         sig2 = (P[:, 3] ** 2 + P[:, 4] ** 2) / 2.0
         dist = np.hypot(g.x_um[mask][None, :] - P[:, 1:2], g.y_um[mask][None, :] - P[:, 2:3])
-        R_fix = float(self.profRSpin.value())
+        R_fix = self._profR_det
         R = R_fix if R_fix > 0 else float(max(dist[use].max(), 3.0 * np.sqrt(sig2[use].max())))
         x = np.linspace(-R, R, 241)
         z = np.full((t.size, x.size), np.nan)
@@ -8049,7 +8390,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
                 row = gauss if norm else A * gauss
             z[max(i0, r0) - r0:min(i1, r1) - r0 + 1] = row         # a group fills every bin it covers
         what = "measured counts" if measured else "fitted Gaussian"
-        mp.set_data(x, t, z, x_label="Distance from the fitted centre (µm)", y_label="Time (ns)",
+        mp.set_data(x, t, z, x_label=f"Distance from the fitted centre ({LEN.u()})", y_label="Time (ns)",
                     levels=(0.0, 1.0) if norm else None,
                     title=f"Radial profile ({what}{', normalized each time' if norm else ''})")
         if R_fix > 0:
@@ -8456,7 +8797,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
             return
         snap = self._sigma_snap
         pts, x, xl, ctx = self._line()
-        title = "σ_eq²(t) (µm²)"
+        title = f"σ_eq²(t) ({LEN.u(2)})"
         self._dep_sig = None
         if snap is None:
             self.sigmaMap.show_message("Run 'Fit all' in tab 3 to fill this map.", title)
@@ -8510,7 +8851,7 @@ class DualGateViewer(QtWidgets.QMainWindow):
             return
         sm = f", S-G smoothed ({sg[0]} frames, order {sg[1]})" if sg is not None else ""
         self._dep_sig = pts_k
-        self.sigmaMap.set_data(x, t, z, x_label=xl, y_label="Time (ns)",
+        self.sigmaMap.set_data(x, t, z * LEN.f ** 2, x_label=xl, y_label="Time (ns)",
                                title=f"{title} — {ctx}" + (", flagged hidden" if not use_flagged else "") + sm + note)
         self._update_dep_markers()
         self._draw_picks()
